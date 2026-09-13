@@ -1,0 +1,20 @@
+# AstrBot runtime artifacts. Importing the real SDK with the plugin directory
+# as the working directory makes it drop its default config and t2i templates
+# here; they are not part of this plugin.
+data/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+dist/
+.venv/
+venv/
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db

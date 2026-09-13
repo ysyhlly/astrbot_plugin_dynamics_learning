@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Dynamics Learning</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主内容</a>
+    <div class="wrap">
+      <header class="bar">
+        <div class="brand">
+          <h1>Dynamics Learning</h1>
+          <p class="sub">ChatDynamics 的行为学习层 · 只读 · 只建议</p>
+        </div>
+        <div class="bar-actions">
+          <span id="linkLamp" class="lamp" aria-hidden="true"></span>
+          <span id="linkLabel" class="lamp-label">未连接</span>
+          <button id="btnRefresh" type="button" class="btn">刷新</button>
+          <button id="btnIngest" type="button" class="btn">导入标注</button>
+          <button id="btnAnalyze" type="button" class="btn primary">运行分析</button>
+          <button id="btnExport" type="button" class="btn">导出 JSON</button>
+        </div>
+      </header>
+
+      <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
+
+      <main id="main">
+        <section class="card" aria-labelledby="hOverview">
+          <h2 id="hOverview">学习概览</h2>
+          <div id="overview" class="grid">加载中…</div>
+          <div id="candidates" class="stack"></div>
+        </section>
+
+        <section class="card" aria-labelledby="hWindow">
+          <h2 id="hWindow">最近 7 天标注表现</h2>
+          <p class="hint">仅统计人工标注样本，不代表真实准确率。</p>
+          <div id="window" class="grid"></div>
+        </section>
+
+        <section class="card" aria-labelledby="hErrors">
+          <h2 id="hErrors">错误分布与话题候选归因</h2>
+          <div id="errors" class="table-host"></div>
+        </section>
+
+        <section class="card" aria-labelledby="hRec">
+          <h2 id="hRec">系统建议</h2>
+          <p class="hint">
+            参数建议都指向 ChatDynamics 的真实配置键，并已按单次变化上限截断。
+            标记「采纳」只写入本插件的策略记录，不会改动 ChatDynamics 配置。
+          </p>
+          <div id="recs" class="stack"></div>
+        </section>
+
+        <section class="card" aria-labelledby="hTuning">
+          <h2 id="hTuning">迭代调参（小步累计）</h2>
+          <p class="hint">
+            单步上限 ±5%，累计上限 ±15%，最多连续 3 步。每一步都在留出集上回放，
+            并按它针对的错误类型评判：累计收益 ≥1% 或目标错误相对下降 ≥10% 才采纳，
+            ≥2% 记为高置信度。任何一步核心指标回退超过 1% 会整轮回滚。
+          </p>
+          <div id="tuning" class="stack"></div>
+        </section>
+
+        <section class="card" aria-labelledby="hEval">
+          <h2 id="hEval">离线评测（baseline vs candidate）</h2>
+          <p class="hint">
+            按会话切分留出集。回放的是记录轨迹上的决策函数，不是 ChatDynamics 路由器的完整重跑。
+          </p>
+          <div id="eval" class="stack"></div>
+        </section>
+
+        <section class="card" aria-labelledby="hPolicies">
+          <h2 id="hPolicies">策略版本</h2>
+          <div id="policies" class="stack"></div>
+        </section>
+
+        <section class="card" aria-labelledby="hSamples">
+          <h2 id="hSamples">样本浏览</h2>
+          <div class="row-controls">
+            <label>任务
+              <select id="taskFilter">
+                <option value="">全部</option>
+                <option value="recipient">recipient</option>
+                <option value="topic">topic</option>
+                <option value="reply">reply</option>
+              </select>
+            </label>
+            <button id="btnSamples" type="button" class="btn">加载样本</button>
+          </div>
+          <div id="samples" class="table-host"></div>
+        </section>
+      </main>
+
+      <footer class="foot">
+        <span>Dynamics Learning v0.6.0 · Shadow Learning：只学习、只分析、只推荐。</span>
+      </footer>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,104 @@
+{
+  "learning_enabled": {
+    "description": "启用行为学习层",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不再导入与分析，已有样本与策略记录保留。本插件始终只读 ChatDynamics，不存在自动改配置的路径。"
+  },
+  "source_plugin_id": {
+    "description": "ChatDynamics 首选项标识",
+    "type": "string",
+    "default": "ysyhlly/astrbot_plugin_chat_dynamics",
+    "hint": "AstrBot 共享首选项中的作用域标识，格式为 author/name（均小写）。改了作者或插件名后需要同步修改。"
+  },
+  "learning_max_samples": {
+    "description": "样本上限",
+    "type": "int",
+    "default": 5000,
+    "hint": "按会话分片存储，超出上限时优先淘汰最久未更新的会话。范围 50~200000。"
+  },
+  "learning_store_raw_trace": {
+    "description": "保存归一化决策轨迹",
+    "type": "bool",
+    "default": true,
+    "hint": "保存无正文的决策轨迹快照，便于日后重新提取特征。关闭后只保留特征向量，体积更小但不可回溯。"
+  },
+  "learning_keep_message_text": {
+    "description": "保存消息正文",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。本插件从不在样本中保存消息正文；即使 ChatDynamics 打开了正文快照，这里也不会复制过来。"
+  },
+  "learning_min_samples": {
+    "description": "出参数建议所需最少样本",
+    "type": "int",
+    "default": 100,
+    "hint": "低于该数量的任务只出统计与诊断，不出可采纳的参数建议。最小 20。"
+  },
+  "learning_max_param_delta_ratio": {
+    "description": "单次参数变化上限",
+    "type": "float",
+    "default": 0.05,
+    "slider": { "min": 0.0, "max": 0.2, "step": 0.01 },
+    "hint": "任何建议值相对当前值的最大变化比例，默认 ±5%。这是硬上限，调大也不会超过 20%。"
+  },
+  "learning_min_evaluation_samples": {
+    "description": "出评测结论所需留出集样本",
+    "type": "int",
+    "default": 40,
+    "hint": "留出集任一任务低于该数量时结论为「样本不足」，不会判定可采纳。最小 20。"
+  },
+  "learning_min_improvement": {
+    "description": "判定可采纳所需提升",
+    "type": "float",
+    "default": 0.02,
+    "slider": { "min": 0.0, "max": 0.2, "step": 0.005 },
+    "hint": "主指标在留出集上的提升必须达到该幅度，候选才会被标记为可采纳。默认 2%。"
+  },
+  "learning_max_regression": {
+    "description": "允许的核心指标回退",
+    "type": "float",
+    "default": 0.01,
+    "slider": { "min": 0.0, "max": 0.2, "step": 0.005 },
+    "hint": "任一核心指标回退超过该幅度即拒绝候选。默认 1%，比提升门槛更严格。"
+  },
+  "learning_holdout_ratio": {
+    "description": "留出集会话占比",
+    "type": "float",
+    "default": 0.3,
+    "slider": { "min": 0.1, "max": 0.6, "step": 0.05 },
+    "hint": "按会话切分而非按样本切分，避免同一段对话同时出现在训练与验证中。"
+  },
+  "learning_rate": {
+    "description": "逻辑回归学习率",
+    "type": "float",
+    "default": 0.35,
+    "slider": { "min": 0.001, "max": 2.0, "step": 0.01 },
+    "hint": "全批量梯度下降的步长。拟合是确定性的：相同输入永远得到相同权重，这是策略可复现的前提。"
+  },
+  "learning_l2": {
+    "description": "L2 正则强度",
+    "type": "float",
+    "default": 0.02,
+    "slider": { "min": 0.0, "max": 1.0, "step": 0.005 },
+    "hint": "抑制少量样本把某个证据放到极端权重上。样本越多可越小。"
+  },
+  "learning_iterations": {
+    "description": "拟合迭代上限",
+    "type": "int",
+    "default": 600,
+    "hint": "达到上限或损失不再下降即停止。范围 20~5000。"
+  },
+  "learning_auto_analyze": {
+    "description": "定时自动导入与分析",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭，全部在控制台手动触发。开启后按下方间隔自动执行一次导入与评测；依然不会改动 ChatDynamics。"
+  },
+  "learning_auto_analyze_minutes": {
+    "description": "自动分析间隔（分钟）",
+    "type": "int",
+    "default": 360,
+    "hint": "最小 15 分钟，最大 10080 分钟（7 天）。仅在开启自动分析时生效。"
+  }
+}

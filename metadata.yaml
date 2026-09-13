@@ -1,0 +1,28 @@
+name: astrbot_plugin_dynamics_learning
+display_name: 群间 · Dynamics Learning
+short_desc: ChatDynamics 的行为学习层：把人工标注与运行结果变成可复现的样本、统计与策略建议。
+desc: |
+  Dynamics Learning 是 ChatDynamics 的附属插件，对本体的运行状态只读。
+
+  它把 ChatDynamics 已有的决策轨迹与人工标注转换成统一学习样本，分别统计话题、
+  对话对象与参与时机的误差模式，生成有界、可解释的参数建议，并用离线回放评测
+  对比 baseline 与 candidate；只有候选在留出集上胜出才标记为可采纳。
+
+  调参采用小步累计：单步 ±5%、累计 ±15%、最多 3 步，并用目标错误类型（误拆分 /
+  误合并 / 漏识别 / 误触发）判断调整是否成功，而不是只看总准确率。
+
+  Shadow Learning：只学习、只分析、只推荐，不会自动修改 ChatDynamics 的线上配置，
+  也不会写入本体的任何数据。
+
+  需要 ChatDynamics 提供 topic_annotations_v1_* 与 panel_runtime_v1 两类共享首选项；
+  话题候选集（routing.topic_candidates）记录得越完整，候选召回与错误归因越准。
+version: v0.6.0
+author: ysyhlly
+astrbot_version: ">=4.16,<5"
+tags:
+  - chat-dynamics
+  - learning
+  - shadow-learning
+  - evaluation
+  - recipient
+  - topic
