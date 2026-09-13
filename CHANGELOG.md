@@ -62,7 +62,7 @@ baseline 错      shadow_only      both_wrong
 - 契约面新增 `shadow.present` / `shadow.absent` 计数：本体对**每条**处理过的消息都记录了
   比较，但只有人工标注过的那些会成为样本，这两个计数是防止把 320 读成总体规模；
 - 新增 `GET /shadow`；控制台新增「Shadow A/B：分歧子集」卡片；
-- 10 个新配置键（`learning_shadow_*`）把门槛全部参数化。
+- 11 个新配置键（`learning_shadow_*`）列入 `_conf_schema.json`，把门槛全部参数化 —— 一个没人能移动的门槛，就是一个没人能解释为什么改它的门槛。
 
 ### 跨仓库验证
 

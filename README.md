@@ -74,6 +74,17 @@ ChatDynamics     = 决定此刻该怎么参与
 | `learning_gate_min_positive_rate` | 0.05 | 数据门槛：正类占比过低时降级为警示 |
 | `learning_gate_max_degraded_ratio` | 0.5 | 数据门槛：轨迹降级比例上限（警示） |
 | `learning_gate_max_label_age_days` | 120 | 数据门槛：标注最大年龄，超过就直接不出策略 |
+| `learning_shadow_min_samples` | 500 | Shadow 门槛：保留窗口内去重后的有效比较数 |
+| `learning_shadow_min_disagreements` | 100 | Shadow 门槛：分歧数，数量只是准入条件不是效果证据 |
+| `learning_shadow_max_regression` | 0.01 | Shadow 门槛：总体准确率回退上限 |
+| `learning_shadow_target_relative` | 0.10 | Shadow 门槛：目标错误率的相对改善 |
+| `learning_shadow_target_absolute` | 0.01 | Shadow 门槛：目标错误率的绝对改善（与上一行二者其一） |
+| `learning_shadow_relative_min_error` | 0.05 | Shadow 门槛：基线错误率低于此值不给相对改善结论 |
+| `learning_shadow_ci_floor` | -0.002 | Shadow 门槛：变化量 95% 区间下界 |
+| `learning_shadow_min_sessions` | 3 | Shadow 门槛：收益必须覆盖的会话数 |
+| `learning_shadow_min_active_hours` | 4 | Shadow 门槛：必须覆盖的活跃时段（按本体判定时间的 UTC 小时） |
+| `learning_shadow_subgroup_regression` | 0.05 | Shadow 门槛：单个分组的灾难性回退上限 |
+| `learning_shadow_subgroup_support` | 20 | Shadow 门槛：子群回退判定所需支撑 |
 | `learning_store_raw_trace` | true | 保存无正文的决策轨迹快照，便于日后重新提取特征 |
 
 ---

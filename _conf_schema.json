@@ -176,5 +176,77 @@
     "type": "int",
     "default": 120,
     "hint": "最新一条标注超过该天数时直接不出策略：群里的行为习惯可能已经变了，旧标注学到的是旧的相处方式。"
+  },
+  "learning_shadow_min_samples": {
+    "description": "Shadow 门槛：最少有效比较",
+    "type": "int",
+    "default": 500,
+    "hint": "分母是遥测保留窗口内去重后的真实比较次数，不是历史累计消息数，也不是人工标注样本数。低于该数量不出晋升结论。最小 0。"
+  },
+  "learning_shadow_min_disagreements": {
+    "description": "Shadow 门槛：最少分歧",
+    "type": "int",
+    "default": 100,
+    "hint": "分歧太少时策略只改动了极少数判定，改动的幅度还比不上噪声。数量门槛只是准入条件，不是效果证据。最小 0。"
+  },
+  "learning_shadow_max_regression": {
+    "description": "Shadow 门槛：总体回退上限",
+    "type": "float",
+    "default": 0.01,
+    "slider": { "min": 0.0, "max": 1.0, "step": 0.005 },
+    "hint": "总体准确率回退超过该值即拒绝。总体变化被绝大多数未分歧的样本稀释，因此它是必要条件，不是充分条件。"
+  },
+  "learning_shadow_target_relative": {
+    "description": "Shadow 门槛：目标相对改善",
+    "type": "float",
+    "default": 0.1,
+    "slider": { "min": 0.0, "max": 1.0, "step": 0.01 },
+    "hint": "目标指标错误率需要改善的比例，与下一条绝对改善二者满足其一即可。"
+  },
+  "learning_shadow_target_absolute": {
+    "description": "Shadow 门槛：目标绝对改善",
+    "type": "float",
+    "default": 0.01,
+    "slider": { "min": 0.0, "max": 1.0, "step": 0.005 },
+    "hint": "目标指标错误率需要改善的绝对百分点，与上一条相对改善二者满足其一即可。"
+  },
+  "learning_shadow_relative_min_error": {
+    "description": "Shadow 门槛：相对改善的基线下限",
+    "type": "float",
+    "default": 0.05,
+    "slider": { "min": 0.0, "max": 1.0, "step": 0.01 },
+    "hint": "基线错误率低于该值时不给相对改善结论：0.3% → 0% 是 100% 的相对改善，也是 0.3pp，让这种数字满足「好 10%」会让规则在语料本来就好的地方失效。"
+  },
+  "learning_shadow_ci_floor": {
+    "description": "Shadow 门槛：变化量区间下界",
+    "type": "float",
+    "default": -0.002,
+    "slider": { "min": -0.05, "max": 0.05, "step": 0.001 },
+    "hint": "主指标变化量的 95% 区间下界必须高于该值。留一点负余量是为了容忍抽样波动，而不是允许区间跨 0 被读成改善。"
+  },
+  "learning_shadow_min_sessions": {
+    "description": "Shadow 门槛：最少会话数",
+    "type": "int",
+    "default": 3,
+    "hint": "收益必须覆盖多个会话，否则可能只是某一个群的语料特征。最小 1。"
+  },
+  "learning_shadow_min_active_hours": {
+    "description": "Shadow 门槛：最少活跃时段",
+    "type": "int",
+    "default": 4,
+    "hint": "按本体的判定时间统计（UTC 小时），覆盖不到这么多个时段就拒绝：结论只来自某个时段，换到别的时段不成立。范围 1-24。"
+  },
+  "learning_shadow_subgroup_regression": {
+    "description": "Shadow 门槛：子群灾难性回退上限",
+    "type": "float",
+    "default": 0.05,
+    "slider": { "min": 0.0, "max": 1.0, "step": 0.01 },
+    "hint": "单个分组的准确率回退超过该值即拒绝，即使总体在改善：总体在涨、某一类人在变差，正是总体数字掩盖得最好的失败。"
+  },
+  "learning_shadow_subgroup_support": {
+    "description": "Shadow 门槛：子群回退判定支撑",
+    "type": "int",
+    "default": 20,
+    "hint": "回退判定只对支撑达到该数的分组生效，低于它只列名字、不给数值。最小 1。"
   }
 }
