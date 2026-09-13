@@ -13,12 +13,19 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 from .config import LearningConfig
-from .policy import PolicyCandidate
+from .policy import PolicyCandidate, can_transition, transition_error
 from .samples import LearningSample, session_hash
 
 SAMPLE_INDEX_KEY = "learning_index_v1"
 SAMPLE_KEY_PREFIX = "learning_samples_v1_"
 POLICY_KEY = "learning_policies_v1"
+# The publish contract, materialised as one key so the consumer can read a
+# single agreed artefact instead of re-deriving the shape from the policy
+# records. Two implementations of the same contract is two chances to disagree,
+# and the disagreement would only show up as a policy that silently never
+# applies.
+PUBLISHED_KEY = "learning_published_v1"
+CANDIDATE_KEY = "learning_candidate_v1"
 STATE_KEY = "learning_state_v1"
 STORE_SCHEMA_VERSION = 1
 MAX_SESSIONS_TRACKED = 2_000
@@ -207,19 +214,53 @@ class LearningStore:
         await self.save_policies(policies)
         return policies
 
-    async def update_policy_status(self, version: str, status: str) -> PolicyCandidate | None:
+    async def update_policy_status(self, version: str, status: str, *,
+                                   now: float | None = None,
+                                   reason: str = "") -> PolicyCandidate | None:
+        """Move one policy through the state machine, or refuse and say why.
+
+        The store is where the transition is checked, because it is the only
+        place that knows the *current* state. A record's own `with_status` is a
+        setter; an illegal arrow — promoting something that was never validated —
+        is refused here with the two states named, rather than stored and
+        discovered later by whoever reads the published file.
+        """
         policies = await self.load_policies()
         updated: PolicyCandidate | None = None
         result: list[PolicyCandidate] = []
         for row in policies:
             if row.version == version:
-                updated = row.with_status(status)
+                if not can_transition(row.status, status):
+                    raise ValueError(transition_error(row.status, status))
+                updated = row.with_status(status, now=now, reason=reason)
                 result.append(updated)
             else:
                 result.append(row)
         if updated is not None:
             await self.save_policies(result)
         return updated
+
+    # ---- the publish contract -------------------------------------------
+
+    async def save_candidate(self, payload: Mapping[str, Any]) -> None:
+        await self.backend.put_kv_data(CANDIDATE_KEY, dict(payload))
+
+    async def load_candidate(self) -> dict[str, Any]:
+        raw = await self.backend.get_kv_data(CANDIDATE_KEY, {})
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    async def clear_candidate(self) -> None:
+        await self.backend.delete_kv_data(CANDIDATE_KEY)
+
+    async def save_published(self, payload: Mapping[str, Any]) -> None:
+        await self.backend.put_kv_data(PUBLISHED_KEY, dict(payload))
+
+    async def load_published(self) -> dict[str, Any]:
+        raw = await self.backend.get_kv_data(PUBLISHED_KEY, {})
+        return dict(raw) if isinstance(raw, Mapping) else {}
+
+    async def clear_published(self) -> None:
+        await self.backend.delete_kv_data(PUBLISHED_KEY)
 
     # ---- run state -----------------------------------------------------
 
@@ -256,6 +297,7 @@ def index_summary(index_rows: Iterable[Mapping[str, Any]], samples: Sequence[Lea
 
 
 __all__ = [
-    "KeyValueBackend", "LearningStore", "MemoryBackend", "POLICY_KEY", "SAMPLE_INDEX_KEY",
-    "SAMPLE_KEY_PREFIX", "STATE_KEY", "STORE_SCHEMA_VERSION", "StoreStats", "index_summary",
+    "CANDIDATE_KEY", "KeyValueBackend", "LearningStore", "MemoryBackend", "POLICY_KEY", "PUBLISHED_KEY",
+    "SAMPLE_INDEX_KEY", "SAMPLE_KEY_PREFIX", "STATE_KEY", "STORE_SCHEMA_VERSION", "StoreStats",
+    "index_summary",
 ]

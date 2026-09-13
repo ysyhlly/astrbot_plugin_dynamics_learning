@@ -23,11 +23,16 @@ except ImportError as exc:  # pragma: no cover - the host runtime always has it
         "Dynamics Learning 需要在 AstrBot (>=4.16,<5) 运行时中加载，当前环境无法导入 astrbot.api。"
     ) from exc
 
+from .core.attribution import attribution_report
 from .core.config import LearningConfig, parse_learning_config
 from .core.ingest import IngestResult, collect_from_host, parse_export
-from .core.policy import BASE_POLICY
-from .core.quality import quality_report
+from .core.policy import (
+    ACTION_STATUS, ACTIONS, BASE_POLICY, candidate_payload, normalize_status, published_payload,
+)
+from .core.quality import dataset_gate, quality_report
 from .core.report import analyze, policy_rows
+from .core.shadow import evaluate_shadow, rules_from_config
+from .core.shadow_coverage import evaluate_shadow_coverage
 from .core import scope_profile
 from .core.samples import LearningSample, build_dataset, session_hash
 from .core.store import LearningStore
@@ -41,7 +46,7 @@ _MAX_SAMPLE_PAGE = 200
     PLUGIN_NAME,
     "ysyhlly",
     "群间 · Dynamics Learning",
-    "v0.7.0",
+    "v1.0.0",
     "",
 )
 class DynamicsLearningPlugin(Star):
@@ -73,6 +78,7 @@ class DynamicsLearningPlugin(Star):
         contract = state.get("last_contract_stats")
         self._last_contract = contract if isinstance(contract, dict) else {}
         self._samples = await self.store.load_samples(config=self.runtime_config())
+        await self._save_policy_offers()
         self._stop.clear()
         if self.runtime_config().auto_analyze:
             self._analysis_task = asyncio.create_task(self._auto_analysis_loop())
@@ -198,6 +204,11 @@ class DynamicsLearningPlugin(Star):
                 baseline_policy=BASE_POLICY,
                 with_evaluation=with_evaluation,
                 with_tuning=with_tuning,
+                # The host's self-reported version, when it reports one. It
+                # travels into the policy record's `target` block and from there
+                # into /published: a consumer that cannot see which version a
+                # policy was validated against has no basis for `active`.
+                host_version=str(self._last_diagnostics.get("host_version") or "") or None,
             )
             payload = _trim(result.as_dict())
             self._last_report = payload
@@ -209,8 +220,14 @@ class DynamicsLearningPlugin(Star):
             recorded = [row.candidate for row in result.tuning if row.candidate is not None]
             if not recorded and result.evaluation is not None and result.evaluation.candidate:
                 recorded = [result.evaluation.candidate]
-            for candidate in recorded:
-                await self.store.append_policy(candidate)
+            # A corpus that failed the dataset gate produces no policy record at
+            # all. Recording one as "proposed" would leave a promotion candidate
+            # sitting in the console with a version number, waiting for someone
+            # to click it — which is exactly what the gate exists to prevent.
+            if result.dataset_gate.get("ok", True):
+                for candidate in recorded:
+                    await self.store.append_policy(candidate)
+            await self._save_policy_offers()
         return self.report_payload_sync()
 
     def report_payload_sync(self) -> dict[str, Any]:
@@ -233,14 +250,14 @@ class DynamicsLearningPlugin(Star):
         policies = await self.store.load_policies()
         return {
             "plugin": PLUGIN_NAME,
-            "version": "v0.7.0",
+            "version": "v1.0.0",
             "config": config.as_dict(),
             "dataset": {
                 "samples": len(samples),
                 "sessions": len({sample.session_hash for sample in samples}),
                 "tasks": {
                     task: sum(1 for sample in samples if sample.task == task)
-                    for task in ("recipient", "topic", "reply")
+                    for task in ("recipient", "topic", "reply_admission", "reply_outcome")
                 },
             },
             "diagnostics": dict(self._last_diagnostics),
@@ -302,13 +319,68 @@ class DynamicsLearningPlugin(Star):
         samples = await self.load_samples()
         state = await self.store.load_state()
         contract = self._last_contract or state.get("last_contract_stats")
-        return quality_report(
+        payload = quality_report(
             samples,
             contract=contract if isinstance(contract, dict) else None,
-            contract_version=int(self._last_diagnostics.get("contract_version") or 0) or None,
+            reader_version=int(self._last_diagnostics.get("reader_version") or 0) or None,
             ingest_at=_as_float(state.get("last_ingest_at")),
             min_samples=config.min_samples_for_evaluation,
         )
+        # The gate travels with quality, not with the report: it is a statement
+        # about the corpus, and a reader has to be able to see it before running
+        # an analysis that would produce nothing.
+        payload["dataset_gate"] = dataset_gate(
+            samples, config=config,
+            contract=contract if isinstance(contract, dict) else None)
+        return payload
+
+    async def attribution_payload(self, *, examples: int = 8) -> dict[str, Any]:
+        """The error attribution chain, computed from the stored samples.
+
+        Recomputed on every request rather than read out of the last analysis:
+        the chain is a pure function of the samples, and a page that showed a
+        stale table beside live sample counts would be the one place a reader
+        could not tell which batch it described.
+        """
+        config = self.runtime_config()
+        return attribution_report(
+            await self.load_samples(),
+            min_messages=config.min_samples_for_evaluation,
+            min_samples=config.min_samples_for_evaluation,
+            examples=max(1, min(50, examples)),
+        )
+
+    async def shadow_payload(self) -> dict[str, Any]:
+        """The shadow A/B result, recomputed live from the stored samples.
+
+        Live rather than read out of the last analysis for the same reason the
+        attribution table is: it is a pure function of the samples, and a page
+        showing a stale verdict beside live counts is the one place a reader
+        cannot tell which batch it describes.
+        """
+        config = self.runtime_config()
+        result = evaluate_shadow(await self.load_samples(),
+                                 rules=rules_from_config(config),
+                                 min_samples=config.gate_min_samples)
+        result["operational"] = await self.operational_shadow_payload()
+        return result
+
+    async def operational_shadow_payload(self, *, sp_module: Any = None) -> dict[str, Any]:
+        """Read the host's bounded comparison log, without creating labelled samples."""
+        payload = None
+        status = "unavailable"
+        try:
+            if sp_module is None:
+                from astrbot.core import sp as sp_module
+            payload = await sp_module.get_async(
+                scope="plugin", scope_id=self.runtime_config().source_plugin_id,
+                key="shadow_telemetry_v1", default=None)
+            status = "ok" if payload is not None else "missing"
+        except Exception as exc:
+            logger.warning("[DynamicsLearning] telemetry read failed type=%s", type(exc).__name__)
+        result = evaluate_shadow_coverage(payload)
+        result["source_status"] = status
+        return result
 
     async def scopes_payload(self) -> dict[str, Any]:
         """Every reviewed scope, one row each, already ranked for the list view."""
@@ -332,17 +404,59 @@ class DynamicsLearningPlugin(Star):
 
     async def policies_payload(self) -> dict[str, Any]:
         policies = await self.store.load_policies()
+        counts: dict[str, int] = {}
+        for row in policies:
+            key = normalize_status(row.status)
+            counts[key] = counts.get(key, 0) + 1
+        published = published_payload(policies)
         return {"total": len(policies), "rows": policy_rows(policies),
-                "note": "策略记录只是建议与结论，不会改动 ChatDynamics 配置。"}
+                "status_counts": counts,
+                # The published face travels with the records so the page can
+                # show what was offered to the host next to what this plugin
+                # decided, instead of leaving a reader to join two requests.
+                "published": published["policies"],
+                "note": "策略记录只是建议与结论，不会改动 ChatDynamics 配置；"
+                        "只有 promoted 的记录会出现在 /published。"}
 
     async def update_policy(self, version: str, action: str) -> dict[str, Any]:
-        status = {"accept": "accepted", "ignore": "rejected",
-                  "reopen": "candidate", "rollback": "rolled_back"}[action]
-        updated = await self.store.update_policy_status(version, status)
+        """Move one policy record through the state machine.
+
+        This writes a record inside this plugin and nothing else. The published
+        file is a *description* of what was decided here; adopting it remains
+        ChatDynamics' decision.
+        """
+        status = ACTION_STATUS.get(action)
+        if status is None:
+            raise ValueError(f"未知操作 {action}；支持：{'/'.join(ACTIONS)}")
+        updated = await self.store.update_policy_status(
+            version, status, reason=f"控制台操作 {action}")
         if updated is None:
             raise ValueError(f"找不到策略版本 {version}")
+        # The publish contract is materialised on every state change, so the
+        # consumer always finds the current answer in one key rather than a
+        # snapshot from whenever an endpoint last happened to be called.
+        await self._save_policy_offers()
         return {"version": updated.version, "status": updated.status,
+                "status_label": updated.label,
                 "note": "已更新本插件的策略记录；ChatDynamics 配置未发生任何变化。"}
+
+    async def _save_policy_offers(self) -> None:
+        policies = await self.store.load_policies()
+        await self.store.save_published(published_payload(policies))
+        await self.store.save_candidate(candidate_payload(policies))
+
+    async def candidate_payload(self) -> dict[str, Any]:
+        """Read-only validated/shadow/promoted offers for shadow consumers."""
+        return candidate_payload(await self.store.load_policies())
+
+    async def published_payload(self) -> dict[str, Any]:
+        """The read-only offer for ChatDynamics: promoted policies only.
+
+        Computed live from the policy records — the stored copy is written by
+        the callers that change those records, never read back here, so a stale
+        key can never be served as if it were current.
+        """
+        return published_payload(await self.store.load_policies())
 
     async def export_payload(self) -> dict[str, Any]:
         samples = await self.load_samples()
@@ -351,6 +465,8 @@ class DynamicsLearningPlugin(Star):
             "schema": "dynamics_learning_export_v1",
             "exported_at": time.time(),
             "samples": [row.as_dict(include_trace=False) for row in samples],
+            "published": published_payload(policies)["policies"],
+            "shadow": await self.shadow_payload(),
             "report": self._last_report,
             "policies": policy_rows(policies),
             "diagnostics": dict(self._last_diagnostics),
@@ -360,6 +476,8 @@ class DynamicsLearningPlugin(Star):
         async with self._lock:
             removed = await self.store.clear_samples()
             await self.store.save_policies([])
+            await self.store.clear_published()
+            await self.store.clear_candidate()
             await self.store.save_state({})
             self._samples = []
             self._last_report = None
@@ -420,4 +538,4 @@ def _trim(payload: dict[str, Any]) -> dict[str, Any]:
     return walk(payload)
 
 
-__all__ = ["PLUGIN_NAME", "DynamicsLearningPlugin", "resolve_session_digest"]
+__all__ = ["PLUGIN_NAME", "DynamicsLearningPlugin", "resolve_session_digest", "attribution_report"]

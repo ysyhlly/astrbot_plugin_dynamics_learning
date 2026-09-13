@@ -100,5 +100,81 @@
     "type": "int",
     "default": 360,
     "hint": "最小 15 分钟，最大 10080 分钟（7 天）。仅在开启自动分析时生效。"
+  },
+  "learning_forward_holdout_ratio": {
+    "description": "前向留出集占比",
+    "type": "float",
+    "default": 0.25,
+    "slider": { "min": 0.05, "max": 0.6, "step": 0.05 },
+    "hint": "按标注时间切分：旧时间段训练，新时间段前向验证。与按会话切分是两个问题：前者问「换到没见过的会话还成立吗」，后者问「换到更晚的数据还成立吗」。"
+  },
+  "learning_require_forward": {
+    "description": "要求前向验证通过",
+    "type": "bool",
+    "default": true,
+    "hint": "开启时，只有会话留出集与前向留出集都通过的候选才标记为已验证。关闭后结论只基于会话留出集，报告里会写明这一点。"
+  },
+  "learning_bootstrap_iterations": {
+    "description": "置信区间重采样次数",
+    "type": "int",
+    "default": 600,
+    "hint": "按会话成对重采样，给出主指标变化量的 95% 区间。设为 0 可关闭区间计算（不推荐：区间跨 0 时应当降低推荐等级）。"
+  },
+  "learning_bootstrap_seed": {
+    "description": "重采样随机种子",
+    "type": "int",
+    "default": 7,
+    "hint": "固定种子保证同一批数据每次都得到同一个区间；换了种子结果会变，策略记录就不再可复现。"
+  },
+  "learning_bootstrap_alpha": {
+    "description": "区间显著性水平",
+    "type": "float",
+    "default": 0.05,
+    "slider": { "min": 0.001, "max": 0.5, "step": 0.005 },
+    "hint": "0.05 对应 95% 置信区间。调小会得到更宽的区间，更难判定可采纳。"
+  },
+  "learning_require_ci": {
+    "description": "要求置信区间不跨 0",
+    "type": "bool",
+    "default": true,
+    "hint": "开启时，主指标变化量的区间如果跨过 0，就判定为「无法与噪声区分」，不给可采纳结论。"
+  },
+  "learning_group_min_support": {
+    "description": "分组诊断最少支撑",
+    "type": "int",
+    "default": 12,
+    "hint": "会话分层诊断里，低于该支撑的分组只列名字、不给数值。分组诊断只报告，不会产生本地策略。"
+  },
+  "learning_gate_min_samples": {
+    "description": "数据门槛：最少样本",
+    "type": "int",
+    "default": 60,
+    "hint": "低于该数量的语料直接不出策略，只出统计与诊断。样本太少时任何指标都只是噪声。最小 20。"
+  },
+  "learning_gate_min_sessions": {
+    "description": "数据门槛：最少会话",
+    "type": "int",
+    "default": 4,
+    "hint": "会话太少就切不出不共享会话的留出集，评测无法进行，因此在这里就拦下来。"
+  },
+  "learning_gate_min_positive_rate": {
+    "description": "数据门槛：最少正类占比",
+    "type": "float",
+    "default": 0.05,
+    "slider": { "min": 0.0, "max": 0.5, "step": 0.01 },
+    "hint": "正类比例过低时 F1 的分子恒为 0，阈值移动只会改变分母。低于该值时给出警示并降低推荐可信度。"
+  },
+  "learning_gate_max_degraded_ratio": {
+    "description": "数据门槛：轨迹降级比例上限",
+    "type": "float",
+    "default": 0.5,
+    "slider": { "min": 0.0, "max": 1.0, "step": 0.05 },
+    "hint": "决策轨迹降级的样本占比超过该值时给出警示：说明本体写入的字段与读取契约不一致，先对齐契约。"
+  },
+  "learning_gate_max_label_age_days": {
+    "description": "数据门槛：标注最大年龄（天）",
+    "type": "int",
+    "default": 120,
+    "hint": "最新一条标注超过该天数时直接不出策略：群里的行为习惯可能已经变了，旧标注学到的是旧的相处方式。"
   }
 }

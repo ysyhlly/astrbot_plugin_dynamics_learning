@@ -17,7 +17,7 @@ def test_parses_the_host_schema_two_shape():
         participation_score=0.35, participation_level="hover",
         recipient_confidence=0.8,
     ))
-    assert trace.contract_version == 2
+    assert trace.trace_schema_version == 2
     assert trace.topic_id == "t1"
     assert trace.topic_confidence == 0.66
     assert trace.bot_targeted is True

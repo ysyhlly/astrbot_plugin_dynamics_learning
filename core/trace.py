@@ -1,21 +1,82 @@
 """Read-only normalisation of a ChatDynamics routing decision trace.
 
 The host stores `decision_trace` snapshots built by
-`astrbot_plugin_chat_dynamics.core.routing_trace.build_routing_trace`
-(schema 2). That snapshot is already a field-allowlisted copy, so this module
-never has to strip message text: it only has to be defensive about shape.
+`astrbot_plugin_chat_dynamics.core.routing_trace.build_routing_trace`. Those
+snapshots are already field-allowlisted copies, so this module never has to
+strip message text: it only has to be defensive about shape **and about
+version**, because the host is upgraded independently of this plugin.
 
-Contract version 2 mirrors:
-  routing_schema_version, participation.{evidence, family_contributions,
-  contribution_total}, recipient, topic, identity, state, mode, weights_version.
+Two readers and one normalisation layer, because "read whatever is there" and
+"know what the record could not say" are different jobs:
+
+```text
+read_schema_v2   routing_schema_version == 2
+read_schema_v3   routing_schema_version == 3
+normalize_trace  dispatch on the recorded version, then fill the gaps
+```
+
+Both readers produce the same `DecisionTrace`. What they cannot produce is
+recorded the same way:
+
+| fact | schema 2 | schema 3 |
+| --- | --- | --- |
+| participation evidence | yes | yes |
+| topic candidates | list of `[score, id]` | structured, with per-candidate evidence |
+| selected topic | `routing.selected_topic` (optional) | required |
+| final outcome | **never** | `outcome.{final_outcome, delivered, suppression_reason}` |
+
+So a schema 2 trace is marked, not silently filled in:
+
+* `outcome_unavailable` — nothing was recorded about whether anything was sent;
+* `candidate_evidence_partial` — the candidate set may be there, the evidence
+  behind each candidate is not.
+
+The marker is derived from the **source schema as well as the payload**: a row
+that says schema 2 can never be promoted to `full` candidate evidence no matter
+what keys an older writer happened to leave behind, because the version is the
+host's own statement about what it wrote.
+
+`trace_schema_version` is therefore the schema the trace is *expressed in* — the
+source schema after normalisation — and not a constant. Re-emitting schema 2 for
+a schema 2 row is what lets a stored sample round-trip byte-compatibly through
+:func:`parse_decision_trace` and :meth:`DecisionTrace.to_contract`.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
-TRACE_CONTRACT_VERSION = 2
+from .candidates import CandidateRecord, parse_candidates
+from .outcome import EMPTY as OUTCOME_EMPTY, FinalOutcome, parse_outcome
+
+# ---- the two protocol versions, named so they can never be confused -----
+#
+#   trace_schema_version    ChatDynamics -> decision trace -> Dynamics Learning
+#                           (the host's own `decision_trace.routing_schema_version`)
+#   policy_contract_version Dynamics Learning -> /published -> ChatDynamics
+#                           (see `core/policy.POLICY_CONTRACT_VERSION`)
+#
+# They move independently, and this module only owns the first one. A change to
+# this plugin's readers, API or UI must never move the trace schema: that number
+# describes what *ChatDynamics* writes, and only ChatDynamics can change it.
+#
+# The host trace layout the reader understands.
+SCHEMA_V2 = 2
+SCHEMA_V3 = 3
+SUPPORTED_SCHEMAS = (SCHEMA_V2, SCHEMA_V3)
+# What the host writes today. The reader accepts both, so a host that has not
+# been upgraded yet is read, counted and marked — never guessed at.
+LATEST_TRACE_SCHEMA = SCHEMA_V3
+LEGACY_SCHEMA = SCHEMA_V2
+
+# The key the shadow block travels under, inside the trace.
+SHADOW_KEY = "shadow"
+
+# How much of the per-candidate evidence the host actually recorded.
+CANDIDATE_EVIDENCE_FULL = "full"
+CANDIDATE_EVIDENCE_PARTIAL = "partial"
+CANDIDATE_EVIDENCE_NONE = "none"
 
 # Mirrors astrbot_plugin_chat_dynamics.core.participation_policy.EVIDENCE_CODES.
 EVIDENCE_CODES = frozenset({
@@ -88,10 +149,94 @@ class EvidenceFact:
 
 
 @dataclass(frozen=True)
+class ShadowDecision:
+    """What a shadow policy *would* have decided, recorded beside what was done.
+
+    Phase one of a shadow A/B run: the runtime keeps the baseline behaviour and
+    the policy's admission decision is computed next to it, so the two can be
+    compared against a human label later. Nothing here changes behaviour — it is
+    the other half of a comparison whose first half is `participation.level`.
+
+    `changed` is the field the whole evaluation is built on. When ninety-five
+    percent of decisions are identical, an overall accuracy delta averages the
+    policy's effect away; the only place its effect exists is the subset where
+    the two decisions differ, and this flag is what selects it.
+    """
+
+    recorded: bool = False
+    policy_id: str = ""
+    baseline_threshold: float | None = None
+    shadow_threshold: float | None = None
+    baseline_reply: bool = False
+    shadow_reply: bool = False
+    changed: bool = False
+    score: float | None = None
+    baseline_margin: float | None = None
+    shadow_margin: float | None = None
+    # Why the two agreed, when they did: `structural` (the evidence decided it,
+    # no threshold involved), `early_return` (no prior bot message), or
+    # `ambient` (the score was compared). An empty string for a disagreement.
+    reason: str = ""
+    recorded_at: float = 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "recorded": self.recorded,
+            "policy_id": self.policy_id,
+            "baseline_threshold": self.baseline_threshold,
+            "shadow_threshold": self.shadow_threshold,
+            "baseline_reply": self.baseline_reply,
+            "shadow_reply": self.shadow_reply,
+            "changed": self.changed,
+            "score": self.score,
+            "baseline_margin": self.baseline_margin,
+            "shadow_margin": self.shadow_margin,
+            "reason": self.reason,
+            "recorded_at": self.recorded_at,
+        }
+
+
+SHADOW_EMPTY = ShadowDecision()
+
+
+def parse_shadow(raw: Any) -> ShadowDecision:
+    """Read a shadow block. Never raises; anything unreadable stays unrecorded."""
+    if not isinstance(raw, Mapping):
+        return SHADOW_EMPTY
+    policy_id = _text(raw.get("policy_id"), 64)
+    if not policy_id:
+        # A block with no policy id cannot be attributed to a policy, and an
+        # unattributable row in a comparison table is worse than a missing one.
+        return SHADOW_EMPTY
+    baseline = raw.get("baseline_reply")
+    shadow = raw.get("shadow_reply")
+    if not isinstance(baseline, bool) or not isinstance(shadow, bool):
+        return SHADOW_EMPTY
+    return ShadowDecision(
+        recorded=True,
+        policy_id=policy_id,
+        baseline_threshold=_optional_finite(raw.get("baseline_threshold")),
+        shadow_threshold=_optional_finite(raw.get("shadow_threshold")),
+        baseline_reply=baseline,
+        shadow_reply=shadow,
+        changed=bool(raw.get("changed")) or baseline != shadow,
+        score=_optional_finite(raw.get("score")),
+        baseline_margin=_optional_finite(raw.get("baseline_margin")),
+        shadow_margin=_optional_finite(raw.get("shadow_margin")),
+        reason=_text(raw.get("reason"), 32),
+        recorded_at=_finite(raw.get("recorded_at")),
+    )
+
+
+@dataclass(frozen=True)
 class DecisionTrace:
     """A frozen, JSON-safe view of one routing decision."""
 
-    contract_version: int = TRACE_CONTRACT_VERSION
+    # The schema this trace is expressed in — the host's `routing_schema_version`
+    # after normalisation. A trace built in-process (not read from a host record)
+    # has no schema 3 facts, so it defaults to the older schema rather than
+    # claiming an outcome it was never told.
+    trace_schema_version: int = LEGACY_SCHEMA
     trace_version: int = 1
     mode: str = "legacy"
     weights_version: str = "default"
@@ -123,10 +268,66 @@ class DecisionTrace:
     family_contributions: Mapping[str, float] = field(default_factory=dict)
     contribution_total: float = 0.0
 
+    # Schema 3: the candidate set with the host's own per-candidate evidence,
+    # and which topic it finally selected.
+    topic_candidates: tuple[CandidateRecord, ...] = ()
+    topic_candidates_recorded: bool = False
+    selected_topic: str = ""
+    # Schema 3: where the turn finally ended up (sent / suppressed / failed).
+    # Stays `EMPTY` — recorded=False — for every schema 2 row, which is a
+    # statement about the record, not about the message.
+    outcome: FinalOutcome = OUTCOME_EMPTY
+    # Schema 3: what a shadow policy would have decided, when one was being
+    # observed. `recorded=False` on every row from a run without a shadow
+    # policy, which is not a disagreement of zero — it is the absence of a
+    # comparison.
+    shadow: ShadowDecision = SHADOW_EMPTY
+    # The version the host wrote (0 when absent or unreadable). Distinct from
+    # `trace_schema_version`, which is the schema this trace is expressed in
+    # after normalisation: a v1 row is *expressed* as v2 while `source_schema`
+    # keeps saying 1, or 0.
+    source_schema: int = 0
+
     ledger_entries: int = 0
     degraded: bool = False
 
     # ---- derived views -------------------------------------------------
+
+    @property
+    def candidate_evidence(self) -> str:
+        """How complete the per-candidate evidence is: full / partial / none.
+
+        `full` requires both a schema 3 source and an evidence map on every
+        parsed candidate. A schema 2 row cannot reach it even if a writer left
+        evidence-shaped keys behind: the version is the host's own statement
+        about what it recorded, and it outranks a guess made from key names.
+        """
+        if not self.topic_candidates_recorded:
+            return CANDIDATE_EVIDENCE_NONE
+        if self.source_schema < SCHEMA_V3 or self.trace_schema_version < SCHEMA_V3:
+            return CANDIDATE_EVIDENCE_PARTIAL
+        if self.topic_candidates and all(row.evidence for row in self.topic_candidates):
+            return CANDIDATE_EVIDENCE_FULL
+        return CANDIDATE_EVIDENCE_PARTIAL
+
+    @property
+    def candidate_evidence_partial(self) -> bool:
+        """True whenever the candidate evidence is not fully available.
+
+        Named as the plan names it. A row with `none` is *more* degraded than
+        one with `partial`, so this flag is true for both — the three-valued
+        :attr:`candidate_evidence` is what tells them apart.
+        """
+        return self.candidate_evidence != CANDIDATE_EVIDENCE_FULL
+
+    @property
+    def outcome_unavailable(self) -> bool:
+        """No final outcome was recorded: schema 2's signature, not a negative."""
+        return not self.outcome.recorded
+
+    @property
+    def shadow_recorded(self) -> bool:
+        return self.shadow.recorded
 
     @property
     def codes(self) -> frozenset[str]:
@@ -164,13 +365,17 @@ class DecisionTrace:
     def to_contract(self) -> dict[str, Any]:
         """The nested shape the host writes, so storage round-trips losslessly.
 
-        Emitting the host's schema-2 layout rather than a private one means a
-        stored sample can be fed straight back through
-        :func:`parse_decision_trace`, and a future host schema change has exactly
-        one place to adapt.
+        The layout is the host's, not a private one, so a stored sample can be
+        fed straight back through :func:`parse_decision_trace` — and the schema
+        written back is the schema that was read, so a schema 2 row stays a
+        schema 2 row instead of silently acquiring fields the host never wrote.
+
+        The schema 3 sections are emitted **only when they carry a fact**:
+        an empty `routing`/`outcome` block would be indistinguishable, after a
+        round trip, from a host that looked and recorded nothing.
         """
-        return {
-            "routing_schema_version": self.contract_version,
+        payload: dict[str, Any] = {
+            "trace_schema_version": self.trace_schema_version,
             "trace_version": self.trace_version,
             "mode": self.mode,
             "weights_version": self.weights_version,
@@ -206,6 +411,25 @@ class DecisionTrace:
             "ledger_entries": self.ledger_entries,
             "learning_degraded": self.degraded,
         }
+        if self.topic_candidates_recorded or self.selected_topic:
+            routing: dict[str, Any] = {"selected_topic": self.selected_topic}
+            if self.topic_candidates_recorded:
+                routing["topic_candidates"] = [row.as_dict() for row in self.topic_candidates]
+            payload["routing"] = routing
+        if self.outcome.recorded:
+            payload["outcome"] = {
+                "final_outcome": self.outcome.value,
+                "delivered": self.outcome.delivered,
+                "suppression_reason": self.outcome.suppression_reason,
+                "stage": self.outcome.stage,
+            }
+        if self.shadow.recorded:
+            block = self.shadow.as_dict()
+            block.pop("recorded", None)
+            payload["shadow"] = block
+        if self.source_schema:
+            payload["source_schema"] = self.source_schema
+        return payload
 
 
 def _parse_evidence(value: Any) -> tuple[tuple[EvidenceFact, ...], bool]:
@@ -257,15 +481,132 @@ def _parse_families(value: Any) -> dict[str, float]:
     return result
 
 
-def parse_decision_trace(raw: Any) -> DecisionTrace:
-    """Normalise a stored trace. Never raises; malformed input yields `degraded`."""
+# The key the schema number travels under, newest first.
+#
+# `routing_schema_version` was the original name and it said the wrong thing:
+# the number describes the whole *trace* (recipient, topic, participation and —
+# from schema 3 — the outcome), not the routing section alone. ChatDynamics
+# writes `trace_schema_version` from v1.6.2; the old key is still read so every
+# annotation stored before that keeps its meaning instead of reading as
+# "unrecorded".
+SCHEMA_KEYS = ("trace_schema_version", "routing_schema_version")
+
+
+def declared_schema_value(raw: Any) -> Any:
+    """The raw schema value a mapping declares, under either key."""
+    if not isinstance(raw, Mapping):
+        return None
+    for key in SCHEMA_KEYS:
+        if key in raw:
+            return raw[key]
+    return None
+
+
+def _read_schema(raw: Mapping[str, Any]) -> int:
+    """The version the host wrote, or 0 when it did not say.
+
+    A string version is **not** coerced: `"2"` is a different record from `2`,
+    and guessing which one a writer meant is how a version check stops meaning
+    anything. It is reported as unreadable instead.
+    """
+    value = declared_schema_value(raw)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value
+
+
+def _read_candidates(raw: Mapping[str, Any]) -> tuple[tuple[CandidateRecord, ...], bool]:
+    """The candidate set, plus whether the field was there at all.
+
+    `topic_candidates` is schema 3's key; `candidates` is the older alias the
+    host writes into `record["routing"]`. An absent key returns
+    `(recorded=False)` even though the payload is empty, because "the host
+    looked and proposed nothing" is a candidate-generation miss while "the host
+    recorded nothing" is not evidence of anything (see `core/candidates.py`).
+    """
+    routing = _section(raw, "routing")
+    if "topic_candidates" in routing:
+        parsed = parse_candidates(routing.get("topic_candidates"))
+    elif "candidates" in routing:
+        parsed = parse_candidates(routing.get("candidates"))
+    else:
+        return (), False
+    return parsed.items, parsed.recorded
+
+
+def _read_outcome(raw: Mapping[str, Any]) -> FinalOutcome:
+    return parse_outcome(raw, _section(raw, "routing"))
+
+
+def _read_shadow(raw: Mapping[str, Any]) -> ShadowDecision:
+    return parse_shadow(raw.get(SHADOW_KEY))
+
+
+def read_schema_v2(raw: Any) -> DecisionTrace:
+    """Read a schema 2 trace: everything except the final outcome.
+
+    Schema 2 is not "worse data" — it is data with a **documented hole**. The
+    participation evidence, the scores and the topic decision are all there and
+    are all replayable; what it cannot answer is whether anything was sent. So
+    the reader fills in what is present and leaves `outcome` empty rather than
+    defaulting it, which is what makes `outcome_unavailable` a fact instead of
+    an assumption.
+    """
+    return _read_common(raw, source_schema=SCHEMA_V2, trace_schema_version=SCHEMA_V2)
+
+
+def read_schema_v3(raw: Any) -> DecisionTrace:
+    """Read a schema 3 trace: schema 2 plus candidates, selection and outcome."""
+    return _read_common(raw, source_schema=SCHEMA_V3, trace_schema_version=SCHEMA_V3)
+
+
+def normalize_trace(raw: Any) -> DecisionTrace:
+    """Dispatch on the recorded version and normalise to a `DecisionTrace`.
+
+    Version handling, stated once:
+
+    ```text
+    2        -> schema 2 field set
+    3        -> schema 3 field set
+    absent   -> schema 2 field set, degraded  (a pre-versioning writer)
+    anything -> schema 2 field set, degraded  (an unknown future, or a typo)
+    ```
+
+    Both readers consume the self-describing `routing` and `outcome` blocks
+    wherever they appear, because their keys name themselves: an `outcome` block
+    is a fact the host wrote, and refusing to read it because the version moved
+    would lose it. What the version gates is the **evidence level**, not the
+    field set: `full` candidate evidence requires a record that *declares*
+    schema 3, so key names can never promote an older record to a completeness it
+    never claimed.
+
+    An unrecognised version therefore degrades loudly and keeps reading. The
+    degradation is the finding — a host that ships schema 4 should see this
+    plugin report "unreadable version 4" rather than silently produce schema 2
+    numbers that look fine.
+    """
     if not isinstance(raw, Mapping):
         return DecisionTrace(degraded=True)
-    degraded = False
+    schema = _read_schema(raw)
+    if schema == SCHEMA_V3:
+        return read_schema_v3(raw)
+    return read_schema_v2(raw)
 
-    schema = raw.get("routing_schema_version")
-    if schema is not None and schema != TRACE_CONTRACT_VERSION:
-        degraded = True
+
+def parse_decision_trace(raw: Any) -> DecisionTrace:
+    """Normalise a stored trace. Never raises; malformed input yields `degraded`."""
+    return normalize_trace(raw)
+
+
+def _read_common(raw: Any, *, source_schema: int, trace_schema_version: int) -> DecisionTrace:
+    if not isinstance(raw, Mapping):
+        return DecisionTrace(degraded=True)
+    recorded = _read_schema(raw)
+    # An absent version is *legacy*, not malformed: pre-versioning writers left
+    # no statement either way, and `source_schema=0` already carries that fact.
+    # Only a version that contradicts the reader we were asked to use is a
+    # degradation.
+    degraded = recorded not in (0, source_schema)
     if raw.get("learning_degraded") is True:
         degraded = True
 
@@ -307,8 +648,15 @@ def parse_decision_trace(raw: Any) -> DecisionTrace:
     }
 
     trace_version = raw.get("trace_version")
+    candidates, candidates_recorded = _read_candidates(raw)
     return DecisionTrace(
-        contract_version=TRACE_CONTRACT_VERSION,
+        trace_schema_version=trace_schema_version,
+        source_schema=recorded,
+        topic_candidates=candidates,
+        topic_candidates_recorded=candidates_recorded,
+        selected_topic=_text(_section(raw, "routing").get("selected_topic")),
+        outcome=_read_outcome(raw),
+        shadow=_read_shadow(raw),
         trace_version=trace_version if isinstance(trace_version, int) and not isinstance(trace_version, bool) else 1,
         mode=_text(raw.get("mode"), 32) or "legacy",
         weights_version=_text(raw.get("weights_version"), 64) or "default",
@@ -348,14 +696,44 @@ def known_topic_label(value: Any) -> bool:
 
 
 def trace_from_sample_record(record: Mapping[str, Any]) -> DecisionTrace:
-    """Convenience: pull the trace out of a stored annotation record."""
+    """Read one stored annotation record as a single decision.
+
+    The host splits the same decision across two places: `decision_trace` holds
+    the evidence and the participation score, `routing` holds the candidate set
+    and the selection. Reading only the nested snapshot would lose the candidate
+    set on every schema 2 row, which is precisely the half the attribution chain
+    needs, so the record is read as one fact.
+
+    A field the trace already carries is **never** overwritten. The frozen
+    snapshot is the more specific record of what the router saw; the enclosing
+    record is the fallback for a host that writes a fact one level up.
+    """
     if not isinstance(record, Mapping):
         return DecisionTrace(degraded=True)
-    trace = record.get("decision_trace")
-    if trace is None:
+    raw_trace = record.get("decision_trace")
+    if raw_trace is None:
         # Very old records stored the raw routing mapping instead.
         return parse_legacy_routing(record.get("routing"))
-    return parse_decision_trace(trace)
+    trace = parse_decision_trace(raw_trace)
+    routing = _section(record, "routing")
+    changes: dict[str, Any] = {}
+    if not trace.topic_candidates_recorded:
+        candidates, recorded = _read_candidates(record)
+        if recorded:
+            changes["topic_candidates"] = candidates
+            changes["topic_candidates_recorded"] = True
+    if not trace.selected_topic:
+        selected = _text(routing.get("selected_topic"))
+        if selected:
+            changes["selected_topic"] = selected
+    if not trace.outcome.recorded:
+        # The outcome is written after the snapshot was frozen, so it is
+        # normally one level up — the trace is checked first only so that a host
+        # which *does* freeze it wins over a stale copy beside it.
+        fallback = parse_outcome(routing, record)
+        if fallback.recorded:
+            changes["outcome"] = fallback
+    return replace(trace, **changes) if changes else trace
 
 
 def parse_legacy_routing(raw: Any) -> DecisionTrace:
@@ -367,8 +745,13 @@ def parse_legacy_routing(raw: Any) -> DecisionTrace:
     """
     if not isinstance(raw, Mapping):
         return DecisionTrace(degraded=True)
+    candidates, candidates_recorded = _read_candidates({"routing": raw})
     return DecisionTrace(
         degraded=True,
+        source_schema=0,
+        topic_candidates=candidates,
+        topic_candidates_recorded=candidates_recorded,
+        selected_topic=_text(raw.get("selected_topic")),
         topic_id=_text(raw.get("topic_id")),
         topic_confidence=_finite(raw.get("topic_confidence")),
         topic_ambiguous=_flag(raw.get("topic_ambiguous")) or _flag(raw.get("ambiguous")),

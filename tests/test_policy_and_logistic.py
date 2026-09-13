@@ -117,8 +117,12 @@ def test_policy_candidate_round_trips_and_rejects_junk_status():
     assert restored.version == candidate.version
     assert PolicyCandidate.from_dict({"version": ""}) is None
     assert PolicyCandidate.from_dict(None) is None
-    assert candidate.with_status("nonsense").status == "candidate"
-    assert candidate.with_status("accepted").status == "accepted"
+    assert candidate.with_status("nonsense").status == "proposed"
+    assert candidate.with_status("validated").status == "validated"
+    # A v0.7 row said "accepted" for what is now "validated": the old word meant
+    # the evaluator's verdict, and it was never promoted to the host.
+    legacy = PolicyCandidate.from_dict({**candidate.as_dict(), "status": "accepted"})
+    assert legacy is not None and legacy.status == "validated"
 
 
 def test_sweep_values_stay_inside_the_host_slider():

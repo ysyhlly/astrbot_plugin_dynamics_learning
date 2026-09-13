@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Any, Iterable, Mapping, Sequence
 
-from .samples import LearningSample, TASK_RECIPIENT, TASK_REPLY, TASK_TOPIC
+from .samples import (
+    LearningSample, TASK_RECIPIENT, TASK_REPLY_ADMISSION, TASK_REPLY_OUTCOME, TASK_TOPIC,
+)
 from .trace import known_topic_label
 
 SAMPLE_NOTE = "仅统计人工标注样本，不代表真实准确率"
@@ -205,11 +207,20 @@ def task_report(samples: Sequence[LearningSample]) -> dict[str, Any]:
         report["recipient"]["confusion"] = binary_report(binary_counts(
             (sample.predicted == "bot", sample.expected == "bot") for sample in recipients))
         report["recipient"]["error_types"] = error_distribution(recipients)
-    replies = [s for s in samples if s.task == TASK_REPLY]
-    if replies:
-        report["reply"] = binary_report(binary_counts(
-            (sample.predicted == "reply", sample.expected == "reply") for sample in replies))
-        report["reply"]["note"] = "路由准入判定（strong/其他），不是最终是否发送"
+    admissions = [s for s in samples if s.task == TASK_REPLY_ADMISSION]
+    if admissions:
+        report["reply_admission"] = binary_report(binary_counts(
+            (sample.predicted == "reply", sample.expected == "reply") for sample in admissions))
+        report["reply_admission"]["note"] = (
+            "回复准入：预测目标是 participation.level == strong，"
+            "回答「该不该进入回复流程」，不是最终是否发送")
+    outcomes = [s for s in samples if s.task == TASK_REPLY_OUTCOME]
+    if outcomes:
+        report["reply_outcome"] = binary_report(binary_counts(
+            (sample.predicted == "reply", sample.expected == "reply") for sample in outcomes))
+        report["reply_outcome"]["note"] = (
+            "最终发送结果：预测目标是 schema 3 记录的 outcome.delivered，"
+            "回答「最终是否真的发出去了」；被门禁压制计入这里，不计入回复准入")
     topics = [s for s in samples if s.task == TASK_TOPIC]
     if topics:
         grouped: dict[str, list[tuple[str, str]]] = {}

@@ -9,7 +9,7 @@ the baseline is not degenerate.
 from __future__ import annotations
 
 import random
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 # Kept for the ladders that need a score ladder rather than an evidence draw.
 SCORE_LADDER_NOTE = "ladder batches only carry recipient/reply supervision"
@@ -454,3 +454,103 @@ def export_payload(rows: Iterable[tuple[str, dict[str, Any]]]) -> dict[str, Any]
         grouped.setdefault(session, []).append(record)
     return {"sessions": [{"session_key": key, "records": value}
                          for key, value in grouped.items()]}
+
+
+# ---- schema 3 fixtures ---------------------------------------------------
+
+ROUTING_SCHEMA_VERSION_V3 = 3
+
+
+def candidate(topic_id, score, *, rank=None, evidence=None):
+    """One structured candidate in the schema 3 shape."""
+    row = {"topic_id": topic_id, "final_score": round(float(score), 6)}
+    if rank is not None:
+        row["rank"] = rank
+    if evidence is not None:
+        row["evidence"] = {key: round(float(value), 6) for key, value in evidence.items()}
+    return row
+
+
+def outcome_block(value=None, *, delivered=None, reason="", stage=""):
+    """A schema 3 outcome block, carrying only the fields the caller wrote."""
+    block = {}
+    if value is not None:
+        block["final_outcome"] = value
+    if delivered is not None:
+        block["delivered"] = delivered
+    if reason:
+        block["suppression_reason"] = reason
+    if stage:
+        block["stage"] = stage
+    return block
+
+
+def shadow_block(*, policy_id="policy_v3", baseline_reply=False, shadow_reply=True,
+                 baseline_threshold=0.70, shadow_threshold=0.67, score=0.68,
+                 reason="ambient", recorded_at=1000.0):
+    """One shadow comparison, in the shape the host records."""
+    return {
+        "policy_id": policy_id,
+        "baseline_threshold": baseline_threshold,
+        "shadow_threshold": shadow_threshold,
+        "baseline_reply": baseline_reply,
+        "shadow_reply": shadow_reply,
+        "changed": bool(baseline_reply) != bool(shadow_reply),
+        "score": score,
+        "baseline_margin": round(score - baseline_threshold, 6),
+        "shadow_margin": round(score - shadow_threshold, 6),
+        "reason": reason,
+        "recorded_at": recorded_at,
+    }
+
+
+def shadow_record(msg_id, *, expected_reply, shadow, annotated_at=1000.0,
+                  level=None, selected_topic="", outcome=None):
+    """A message carrying a reply label and a recorded shadow comparison."""
+    trace = make_trace_v3(
+        outcome=outcome, selected_topic=selected_topic,
+        participation_level=(level or ("strong" if shadow["baseline_reply"] else "weak")),
+        participation_score=shadow["score"],
+    )
+    trace["shadow"] = dict(shadow)
+    return make_record(msg_id, trace=trace, predicted_topic="UNKNOWN", expected_topic="UNKNOWN",
+                       expected_reply=expected_reply, annotated_at=annotated_at)
+
+
+def make_trace_v3(*, candidates=None, selected_topic="", outcome=None, shadow=None, **kwargs):
+    """A schema 3 trace: every schema 2 field, plus routing and outcome."""
+    trace = make_trace(**kwargs)
+    trace["routing_schema_version"] = ROUTING_SCHEMA_VERSION_V3
+    routing = {"selected_topic": selected_topic or trace["topic"]["topic_id"]}
+    if candidates is not None:
+        routing["topic_candidates"] = [
+            dict(row) if isinstance(row, Mapping) else row for row in candidates]
+    trace["routing"] = routing
+    if outcome is not None:
+        trace["outcome"] = outcome
+    if shadow is not None:
+        trace["shadow"] = dict(shadow)
+    return trace
+
+
+def delivered_record(msg_id, *, expected_reply=True, annotated_at=1000.0, **kwargs):
+    """A message that was admitted and then actually sent."""
+    trace = make_trace_v3(
+        outcome=outcome_block("delivered", delivered=True, stage="delivery"),
+        participation_level="strong" if expected_reply else "weak",
+        participation_score=0.8 if expected_reply else 0.2,
+        **kwargs)
+    return make_record(msg_id, trace=trace, predicted_topic="UNKNOWN", expected_topic="UNKNOWN",
+                       expected_reply=expected_reply, annotated_at=annotated_at)
+
+
+def suppressed_record(msg_id, *, reason="asleep_ambient", expected_reply=True,
+                      annotated_at=1000.0, **kwargs):
+    """Admitted, then stopped by the gate — the case schema 2 read as a miss."""
+    trace = make_trace_v3(
+        outcome=outcome_block("suppressed", delivered=False, reason=reason, stage="gate"),
+        participation_level="strong",
+        participation_score=0.8,
+        **kwargs)
+    return make_record(msg_id, trace=trace, predicted_topic="UNKNOWN", expected_topic="UNKNOWN",
+                       expected_reply=expected_reply, annotated_at=annotated_at)

@@ -158,7 +158,7 @@ def test_sample_schema_version_is_persisted_not_just_declared():
 
     payload = sample.as_dict()
 
-    assert SAMPLE_SCHEMA_VERSION == 2
+    assert SAMPLE_SCHEMA_VERSION == 3
     assert payload["sample_schema_version"] == SAMPLE_SCHEMA_VERSION
     assert payload["scope_hash"] == payload["session_hash"]
 

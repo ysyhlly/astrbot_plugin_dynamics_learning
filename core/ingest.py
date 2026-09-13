@@ -22,6 +22,14 @@ raw, and they are made to satisfy an accounting identity so the health report
 cannot quietly lose rows.
 
 This module never writes to the host plugin.
+
+Two protocol versions live on either side of this module and are deliberately
+*not* the same number (see `core/trace.py`):
+
+    trace_schema_version       what the host writes   (routing_schema_version)
+    policy_contract_version    what this plugin publishes (core/policy.py)
+
+`READER_VERSION` is neither: it is this plugin's own reader revision.
 """
 from __future__ import annotations
 
@@ -38,7 +46,21 @@ from .samples import session_hash
 ANNOTATION_KEY_PREFIX = "topic_annotations_v1_"
 RUNTIME_KEY = "panel_runtime_v1"
 RUNTIME_VERSION = 1
-CONTRACT_VERSION = 3
+# ---- the two protocol versions, named so they can never be confused -----
+#
+#   trace_schema_version    ChatDynamics -> decision trace -> Dynamics Learning
+#   policy_contract_version Dynamics Learning -> /published -> ChatDynamics
+#
+# `READER_VERSION` is neither of them. It is this plugin's own reader/API
+# revision, and it answers exactly one question: "was this snapshot taken by a
+# reader that could already see field X, or by one that had never heard of it?"
+# Conflating that with the host's trace schema is what made the old name
+# (`contract_version`) dangerous — one word meant both, so a reader upgrade
+# looked like a host contract change.
+#
+# Reset to 1 at v0.9.0, when the two were separated. The history lives in
+# CHANGELOG.md, not in the number.
+READER_VERSION = 1
 MAX_RECORDS_PER_SESSION = 2_000
 
 _ANNOTATION_KEY = re.compile(r"^topic_annotations_v1_[0-9a-f]{64}$")
@@ -83,6 +105,37 @@ def _preference_pairs(rows: Any) -> list[tuple[str, Any]]:
             value = value.get("val")
         pairs.append((key, value))
     return pairs
+
+
+# Keys the host may use to report its own software version in the runtime
+# snapshot. Read from several names because the field does not exist yet: this
+# is the *forward* half of the version contract, and a host that starts writing
+# any of them is immediately usable.
+HOST_VERSION_KEYS = ("plugin_version", "host_version", "chat_dynamics_version",
+                     "version_name")
+
+
+def _runtime_host_version(payload: Any) -> str:
+    """The host's self-reported version, or "" when it does not report one.
+
+    The result is never inferred. Learning cannot know which ChatDynamics built
+    a trace it was handed, so an absent field stays absent — and a policy
+    published without a host version says so, rather than implying a match that
+    was never established.
+    """
+    if not isinstance(payload, Mapping):
+        return ""
+    for key in HOST_VERSION_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:64]
+    meta = payload.get("meta")
+    if isinstance(meta, Mapping):
+        for key in HOST_VERSION_KEYS:
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:64]
+    return ""
 
 
 def _runtime_sessions(payload: Any) -> list[dict[str, Any]]:
@@ -177,7 +230,9 @@ def parse_preferences(rows: Any) -> IngestResult:
     stats.observe_sessions(result.sessions, used)
     result.contract = stats
     result.diagnostics = {
-        "contract_version": CONTRACT_VERSION,
+        "reader_version": READER_VERSION,
+        "trace_schema_versions": dict(stats.routing_schema_versions),
+        "host_version": _runtime_host_version(runtime_payload),
         "runtime_present": runtime_payload is not None,
         "runtime_sessions": len(sessions),
         "annotation_keys": stats.annotation_keys,
@@ -260,7 +315,8 @@ def parse_export(payload: Any) -> IngestResult:
     stats.observe_sessions(result.sessions, used)
     result.contract = stats
     result.diagnostics = {
-        "contract_version": CONTRACT_VERSION,
+        "reader_version": READER_VERSION,
+        "trace_schema_versions": dict(stats.routing_schema_versions),
         "source": "export",
         "runtime_sessions": len(result.sessions),
         "records": len(result.annotations),
@@ -323,7 +379,8 @@ def digest_of(session_key: str) -> str:
 
 
 __all__ = [
-    "ANNOTATION_KEY_PREFIX", "CONTRACT_VERSION", "IngestResult", "REASON_BAD_SHAPE",
+    "ANNOTATION_KEY_PREFIX", "HOST_VERSION_KEYS", "READER_VERSION", "IngestResult",
+    "REASON_BAD_SHAPE",
     "REASON_MISSING_ID", "REASON_NOT_SERIALISABLE", "REASON_OK", "REASON_TOO_LARGE", "RUNTIME_KEY",
     "clean_record", "collect_from_host", "digest_of", "merge_results", "parse_export",
     "parse_preferences",

@@ -39,11 +39,20 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
+from . import outcome as outcome_module
 from .candidates import CandidateObservation, candidate_recall
+from .config import LearningConfig
 from .metrics import SAMPLE_NOTE, ratio, rounded
-from .samples import TASK_RECIPIENT, TASK_REPLY, TASK_TOPIC, LearningSample
+from .samples import (
+    TASK_RECIPIENT, TASK_REPLY_ADMISSION, TASK_REPLY_OUTCOME, TASK_TOPIC, LearningSample,
+)
 from .scope import SCOPE_SOURCE_SESSION_UMO_EQUAL, SCOPE_SOURCE_SESSION_UMO_MISMATCH, resolve_scope
 from .topic_learner import candidate_observations, pair_rows, replay_can_move
+from .trace import (
+    CANDIDATE_EVIDENCE_FULL, CANDIDATE_EVIDENCE_NONE, CANDIDATE_EVIDENCE_PARTIAL,
+    LATEST_TRACE_SCHEMA, SUPPORTED_SCHEMAS as SUPPORTED_TRACE_SCHEMAS, declared_schema_value,
+    trace_from_sample_record,
+)
 
 # ---- status vocabulary -------------------------------------------------
 
@@ -73,6 +82,7 @@ CAPABILITY_TOPIC_THRESHOLD_REPLAY = "topic_threshold_replay"
 CAPABILITY_REPLY_ADMISSION_REPLAY = "reply_admission_replay"
 CAPABILITY_SCOPE_IDENTITY = "scope_identity"
 CAPABILITY_FINAL_REPLY_OUTCOME = "final_reply_outcome"
+CAPABILITY_CANDIDATE_EVIDENCE = "candidate_evidence"
 
 DEFINITION_RECIPIENT_REPLAY = (
     "定向阈值回放：这条样本的判定确实由记录下来的加性分数决定，"
@@ -87,14 +97,21 @@ DEFINITION_SCOPE_IDENTITY = "作用域身份：样本能否归到一个稳定的
 DEFINITION_FINAL_REPLY_OUTCOME = (
     "最终发送结果：这条消息最后到底有没有被回复出去（不是路由准入，是真实发送）"
 )
+DEFINITION_CANDIDATE_EVIDENCE = (
+    "候选逐条证据：每个候选话题是否带有本体记录的分项得分（语义/回复边/参与者重叠…）"
+)
 
 SCOPE_LEVEL_NOTE = (
     "本体契约没有提供跨会话的群身份，因此作用域层级是会话："
     "一个会话就是一个作用域，画像最多只能做到这个粒度。"
 )
 REPLY_LEVEL_NOTE = (
-    "本体的最终发送决策（should_reply）恒为 null，这里回放的是路由准入判定 "
-    "level == strong，不是「最终是否回复」"
+    "回复准入回放的是路由准入判定 level == strong，不是「最终是否回复」；"
+    "最终发送结果单独作为 final_reply_outcome 一行报告"
+)
+OUTCOME_LEVEL_NOTE = (
+    "最终发送结果不可回放：门禁（作息/降温/媒体）、生成与平台发送都不在记录轨迹里，"
+    "所以它只作为事实报告，不参与任何阈值回放"
 )
 TIMESTAMP_NOTE = "样本时间戳是人工标注时刻（annotated_at），不是消息发生时间"
 
@@ -215,7 +232,7 @@ def recipient_replay(samples: Sequence[LearningSample], *,
 def reply_admission_replay(samples: Sequence[LearningSample], *,
                            min_samples: int = MIN_CAPABILITY_SAMPLES) -> CapabilityHealth:
     """Reply health, with the standing reminder that this is not the final send."""
-    rows = [sample for sample in samples if sample.task == TASK_REPLY]
+    rows = [sample for sample in samples if sample.task == TASK_REPLY_ADMISSION]
     counts = _replay_split(rows)
     reasons = _replay_reasons(counts)
     reasons.append(REPLY_LEVEL_NOTE)
@@ -311,39 +328,74 @@ def scope_identity(samples: Sequence[LearningSample], *,
 
 def final_reply_outcome(samples: Sequence[LearningSample], *,
                         min_samples: int = MIN_CAPABILITY_SAMPLES) -> CapabilityHealth:
-    """The capability the host contract cannot offer, stated as a row.
+    """Can the corpus say whether the bot actually sent anything?
 
-    ChatDynamics keeps `participation.should_reply` null on every record, so no
-    sample knows whether the bot actually sent anything. Showing that as a
-    permanently unsupported row — rather than an error, or silence — is the point
-    of a capability matrix: the gap is a fact about the data, and it becomes an
-    ordinary working capability the day the host records the field.
+    The denominator is every message a human left a reply label on, and the
+    numerator is the subset where the host also recorded a final outcome. That
+    is the honest pairing: "should have replied" without "did it" is exactly the
+    schema 2 gap, and stating it as a row — rather than as an error, or as
+    silence — is what turns the gap into an ordinary working capability the day
+    the host starts writing `outcome`.
     """
-    rows = [sample for sample in samples if sample.task == TASK_REPLY]
-    recorded = sum(1 for sample in rows if _should_reply_recorded(sample))
-    reasons = []
+    labelled = [sample for sample in samples if sample.task == TASK_REPLY_ADMISSION]
+    recorded = sum(1 for sample in labelled if sample.outcome.recorded)
+    stages: dict[str, int] = {}
+    reasons: list[str] = []
+    for sample in labelled:
+        found = sample.outcome
+        if found.recorded and not found.is_delivered:
+            stages[found.stage] = stages.get(found.stage, 0) + 1
     if not recorded:
-        reasons.append("本体把 participation.should_reply 恒置为 null："
-                       "没有任何样本记录过最终是否发送，这个能力在当前契约下不可用")
-    return _health(CAPABILITY_FINAL_REPLY_OUTCOME, recorded, len(rows),
+        reasons.append("没有任何标注记录过最终发送结果：schema 2 的 decision_trace 里"
+                       "没有 outcome 字段，本体也没有写 participation.should_reply，"
+                       "因此在这个契约下该能力不可用")
+    elif recorded < len(labelled):
+        reasons.append(f"{len(labelled) - recorded} 条回复标注没有对应的最终结果记录，"
+                       "它们只能按路由准入解释")
+    reasons.append(OUTCOME_LEVEL_NOTE)
+    return _health(CAPABILITY_FINAL_REPLY_OUTCOME, recorded, len(labelled),
                    definition=DEFINITION_FINAL_REPLY_OUTCOME, reasons=reasons,
-                   detail={"recorded": recorded, "total": len(rows)},
+                   detail={"recorded": recorded, "total": len(labelled),
+                           "not_delivered_by_stage": dict(sorted(stages.items()))},
                    min_samples=min_samples)
 
 
-def _should_reply_recorded(sample: LearningSample) -> bool:
-    trace = sample.trace if isinstance(sample.trace, Mapping) else {}
-    participation = trace.get("participation")
-    if isinstance(participation, Mapping) and isinstance(participation.get("should_reply"), bool):
-        return True
-    summary = trace.get("evidence_summary")
-    flagged = summary.get("should_reply") if isinstance(summary, Mapping) else None
-    return isinstance(flagged, bool)
+def candidate_evidence(samples: Sequence[LearningSample], *,
+                       min_samples: int = MIN_CAPABILITY_SAMPLES) -> CapabilityHealth:
+    """Whether each candidate topic carries the host's own per-candidate scores.
+
+    The candidate *list* is enough to tell a generation miss from a ranking
+    mistake. It is not enough to answer the next question — "which scoring term
+    put the wrong one first" — and that is what per-candidate evidence is for.
+    Schema 2 recorded pairs of `[score, topic_id]`, so the level is `partial`
+    there by construction, and saying so keeps the reader from reading a flat
+    "candidates are recorded" as "the ranking is explainable".
+    """
+    rows = [sample for sample in samples if sample.task == TASK_TOPIC]
+    levels: dict[str, int] = dict.fromkeys(
+        (CANDIDATE_EVIDENCE_FULL, CANDIDATE_EVIDENCE_PARTIAL, CANDIDATE_EVIDENCE_NONE), 0)
+    for sample in rows:
+        levels[sample.candidate_evidence] = levels.get(sample.candidate_evidence, 0) + 1
+    eligible = levels[CANDIDATE_EVIDENCE_FULL]
+    reasons: list[str] = []
+    if rows and not eligible:
+        reasons.append(
+            f"{levels[CANDIDATE_EVIDENCE_PARTIAL]} 条话题标注只有候选列表、没有逐条候选证据"
+            "（schema 2 只记 [score, topic_id]）：可以区分候选生成与排序错误，"
+            "但无法回答「是哪个分项把错的候选排到了前面」")
+    if levels[CANDIDATE_EVIDENCE_NONE]:
+        reasons.append(f"{levels[CANDIDATE_EVIDENCE_NONE]} 条话题标注根本没有候选集，"
+                       "连候选生成与排序都无法区分")
+    if not rows:
+        reasons.append("还没有话题标注样本。")
+    return _health(CAPABILITY_CANDIDATE_EVIDENCE, eligible, len(rows),
+                   definition=DEFINITION_CANDIDATE_EVIDENCE, reasons=reasons,
+                   detail=dict(levels), min_samples=min_samples)
 
 
 CAPABILITY_BUILDERS = (
     recipient_replay, topic_attribution, topic_threshold_replay,
-    reply_admission_replay, scope_identity, final_reply_outcome,
+    reply_admission_replay, scope_identity, final_reply_outcome, candidate_evidence,
 )
 
 
@@ -372,8 +424,19 @@ def dataset_health(samples: Sequence[LearningSample]) -> dict[str, Any]:
         "scopes": len({sample.scope_hash for sample in samples}),
         "scope_level": "session",
         "tasks": {task: sum(1 for sample in samples if sample.task == task)
-                  for task in (TASK_RECIPIENT, TASK_TOPIC, TASK_REPLY)},
+                  for task in (TASK_RECIPIENT, TASK_TOPIC, TASK_REPLY_ADMISSION,
+                               TASK_REPLY_OUTCOME)},
         "degraded_traces": sum(1 for sample in samples if _degraded(sample)),
+        # The two plan markers, counted on the sample plane as well as the
+        # contract plane: the same record can be readable and still unable to
+        # answer these two questions, and a reader needs the count next to the
+        # capability rows it explains.
+        "outcome_unavailable": sum(1 for sample in samples if sample.outcome_unavailable),
+        "candidate_evidence": {
+            level: sum(1 for sample in samples if sample.candidate_evidence == level)
+            for level in (CANDIDATE_EVIDENCE_FULL, CANDIDATE_EVIDENCE_PARTIAL,
+                          CANDIDATE_EVIDENCE_NONE)
+        },
         "first_timestamp": min(timestamps, default=None),
         "last_timestamp": max(timestamps, default=None),
         "timestamp_semantics": "annotated_at",
@@ -398,10 +461,13 @@ _COUNTER_FIELDS = (
     "annotation_keys", "unreadable_keys", "annotations_seen", "annotations_kept",
     "malformed", "oversized", "unknown_session", "truncated", "decision_trace_present",
     "decision_trace_absent", "topic_candidates_missing", "topic_candidates_empty",
-    "topic_candidates_nonempty", "contribution_total_present", "contribution_total_absent",
+    "topic_candidates_nonempty", "outcome_present", "outcome_absent",
+    "shadow_present", "shadow_absent",
+    "contribution_total_present", "contribution_total_absent",
     "contribution_total_unknown", "sessions", "distinct_group_id_sessions",
 )
-_COUNTER_MAPS = ("annotation_schema_versions", "routing_schema_versions", "scope_sources")
+_COUNTER_MAPS = ("annotation_schema_versions", "routing_schema_versions", "scope_sources",
+                 "suppression_reasons", "candidate_evidence_levels")
 
 
 def _version_bucket(value: Any) -> str:
@@ -462,6 +528,22 @@ class RawContractStats:
     topic_candidates_missing: int = 0
     topic_candidates_empty: int = 0
     topic_candidates_nonempty: int = 0
+    # Schema 3's two questions, counted while the record is still raw. The
+    # sample layer stores its own copy of both (`candidate_evidence`,
+    # `outcome`), so these counters exist to answer a different question: what
+    # did the *host* write, before any of this plugin's reading is involved.
+    candidate_evidence_levels: dict[str, int] = field(default_factory=dict)
+
+    outcome_present: int = 0
+    outcome_absent: int = 0
+    suppression_reasons: dict[str, int] = field(default_factory=dict)
+    # The shadow decision is recorded by the host for every turn it processes,
+    # but only turns a human labelled become samples. Counting it on the raw
+    # plane is what lets the report say "the host recorded 4,000 comparisons and
+    # 320 of them are in the corpus" instead of letting 320 be read as the
+    # population.
+    shadow_present: int = 0
+    shadow_absent: int = 0
 
     contribution_total_present: int = 0
     contribution_total_absent: int = 0
@@ -491,9 +573,20 @@ class RawContractStats:
         else:
             self.decision_trace_present += 1
             _bump(self.routing_schema_versions,
-                  _version_bucket(trace.get("routing_schema_version")))
+                  _version_bucket(declared_schema_value(trace)))
             self._observe_participation(trace.get("participation"))
-        self._observe_topic_candidates(raw.get("routing"))
+        self._observe_topic_candidates(raw)
+        # The two schema 3 facts are read through the *same* reader the sample
+        # layer uses, so the contract plane and the sample plane cannot disagree
+        # about what counts as "recorded": a second implementation here would be
+        # a second answer to the same question.
+        observed = trace_from_sample_record(raw)
+        if observed.shadow.recorded:
+            self.shadow_present += 1
+        else:
+            self.shadow_absent += 1
+        _bump(self.candidate_evidence_levels, observed.candidate_evidence)
+        self._observe_outcome(observed.outcome)
 
     def _observe_participation(self, participation: Any) -> None:
         value = (participation.get("contribution_total")
@@ -505,14 +598,38 @@ class RawContractStats:
             return
         self.contribution_total_present += 1
 
-    def _observe_topic_candidates(self, routing: Any) -> None:
-        raw = routing.get("topic_candidates") if isinstance(routing, Mapping) else None
+    def _observe_outcome(self, found: Any) -> None:
+        """Count the final outcome once per record, wherever the host put it."""
+        if not isinstance(found, outcome_module.FinalOutcome) or not found.recorded:
+            self.outcome_absent += 1
+            return
+        self.outcome_present += 1
+        if found.suppression_reason:
+            _bump(self.suppression_reasons, found.suppression_reason)
+
+    def _observe_topic_candidates(self, record: Mapping[str, Any]) -> None:
+        """Count the candidate field's presence, in either location.
+
+        Schema 2 writes it into `record["routing"]`, schema 3 into
+        `decision_trace["routing"]`; the *presence* question is the same one
+        either way, so both are checked before calling it missing.
+        """
+        trace = record.get("decision_trace")
+        raw = None
+        for container in (record.get("routing"), trace.get("routing")
+                          if isinstance(trace, Mapping) else None):
+            if not isinstance(container, Mapping):
+                continue
+            candidate = container.get("topic_candidates")
+            if not isinstance(candidate, list):
+                candidate = container.get("candidates")
+            if isinstance(candidate, list):
+                raw = candidate
+                break
         if not isinstance(raw, list):
             # Present but unreadable is not evidence that the host looked and
             # found nothing, so it counts as missing — the reading
             # `candidates.parse_candidates` also gives it.
-            raw = routing.get("candidates") if isinstance(routing, Mapping) else None
-        if not isinstance(raw, list):
             self.topic_candidates_missing += 1
         elif raw:
             self.topic_candidates_nonempty += 1
@@ -559,6 +676,17 @@ class RawContractStats:
                 "empty": self.topic_candidates_empty,
                 "nonempty": self.topic_candidates_nonempty,
             },
+            "candidate_evidence": {
+                level: self.candidate_evidence_levels.get(level, 0)
+                for level in (CANDIDATE_EVIDENCE_FULL, CANDIDATE_EVIDENCE_PARTIAL,
+                              CANDIDATE_EVIDENCE_NONE)
+            },
+            "outcome": {
+                "present": self.outcome_present,
+                "absent": self.outcome_absent,
+                "suppression_reasons": dict(self.suppression_reasons),
+            },
+            "shadow": {"present": self.shadow_present, "absent": self.shadow_absent},
             "contribution_total": {
                 "present": self.contribution_total_present,
                 "absent": self.contribution_total_absent,
@@ -594,6 +722,31 @@ def contract_findings(contract: Mapping[str, Any] | None) -> list[str]:
         if missing:
             findings.append(f"{missing}/{total} 条记录的 routing.topic_candidates 字段缺失，"
                             "这部分样本无法区分候选生成与排序错误")
+    evidence = contract.get("candidate_evidence")
+    if isinstance(evidence, Mapping):
+        partial = int(evidence.get(CANDIDATE_EVIDENCE_PARTIAL) or 0)
+        none = int(evidence.get(CANDIDATE_EVIDENCE_NONE) or 0)
+        if partial:
+            findings.append(f"{partial} 条记录的候选集只有分数没有分项证据"
+                            "（schema 2 的 [score, topic_id] 形式），"
+                            "候选生成与排序可以区分，但排序原因不可解释")
+        if none:
+            findings.append(f"{none} 条记录完全没有候选集字段")
+    outcome = contract.get("outcome")
+    if isinstance(outcome, Mapping):
+        present = int(outcome.get("present") or 0)
+        absent = int(outcome.get("absent") or 0)
+        if absent:
+            findings.append(
+                f"{absent} 条记录没有最终发送结果（schema 2 不写 outcome）："
+                "在这些记录上，「该回但被作息压掉」与「该回而路由没回」是同一条记录，"
+                "只能按路由准入解释")
+        if present:
+            reasons = outcome.get("suppression_reasons")
+            rendered = "、".join(f"{key}×{value}" for key, value in
+                                 sorted(dict(reasons or {}).items())[:6])
+            findings.append(f"{present} 条记录带最终结果"
+                            + (f"，压制原因：{rendered}" if rendered else ""))
     totals = contract.get("contribution_total")
     if isinstance(totals, Mapping):
         absent_scores = int(totals.get("absent") or 0)
@@ -611,11 +764,42 @@ def contract_findings(contract: Mapping[str, Any] | None) -> list[str]:
 QUALITY_SCHEMA_VERSION = 1
 
 
+def trace_schema_block(samples: Sequence[LearningSample],
+                       contract: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Which trace schemas the host writes, and which ones this reader knows.
+
+    Reported as its own block because it is the *host's* number. A reader
+    upgrade must never move it, and a host upgrade must never be inferred from a
+    reader's version — the two are separate protocols and the whole point of
+    naming them is that neither can be read off the other.
+    """
+    observed: dict[str, int] = {}
+    for sample in samples:
+        trace = sample.trace if isinstance(sample.trace, Mapping) else {}
+        declared = declared_schema_value(trace)
+        key = str(declared) if declared is not None else "missing"
+        observed[key] = observed.get(key, 0) + 1
+    if isinstance(contract, Mapping) and not observed:
+        # Fall back to the raw plane when the sample plane carries no version at
+        # all (an empty dataset), so the block still describes what was imported.
+        raw = contract.get("routing_schema_versions")
+        if isinstance(raw, Mapping):
+            observed = {str(key): int(value) for key, value in raw.items()}
+    known = {str(schema) for schema in SUPPORTED_TRACE_SCHEMAS}
+    return {
+        "supported": list(SUPPORTED_TRACE_SCHEMAS),
+        "latest": LATEST_TRACE_SCHEMA,
+        "observed": dict(sorted(observed.items())),
+        "unreadable": sorted(key for key in observed
+                             if key not in known and key != "missing"),
+    }
+
+
 def quality_report(
     samples: Sequence[LearningSample],
     *,
     contract: Mapping[str, Any] | None = None,
-    contract_version: int | None = None,
+    reader_version: int | None = None,
     ingest_at: float | None = None,
     min_samples: int = MIN_CAPABILITY_SAMPLES,
     now: float | None = None,
@@ -630,9 +814,12 @@ def quality_report(
     found = capabilities(samples, min_samples=min_samples)
     return {
         "quality_schema_version": QUALITY_SCHEMA_VERSION,
-        # The *read* contract this snapshot was taken under, so a reader can tell
-        # "the host never wrote this field" from "we were not reading it yet".
-        "contract_version": contract_version,
+        # This plugin's own reader revision, so a reader can tell "the host never
+        # wrote this field" from "we were not reading it yet". Deliberately not
+        # called a contract version: the host's trace schema lives in the
+        # `trace` block, and one word for both is how they get confused.
+        "reader_version": reader_version,
+        "trace": trace_schema_block(samples, contract),
         "generated_at": stamp,
         "dataset": dataset_health(samples),
         "capabilities": {name: row.as_dict() for name, row in found.items()},
@@ -644,9 +831,167 @@ def quality_report(
             SAMPLE_NOTE,
             SCOPE_LEVEL_NOTE,
             TIMESTAMP_NOTE,
+            OUTCOME_LEVEL_NOTE,
             "契约面来自最近一次导入的原始记录，样本面每次请求实时重算；两者计数口径不同"
             "（去重、样本上限、每会话截断），不应相互对齐。",
         ],
+    }
+
+
+# ---- the dataset gate ---------------------------------------------------
+#
+# Everything above describes the corpus. This decides whether a policy may be
+# offered from it at all, and it is deliberately a *pre*-learning check: a
+# recommendation produced from a corpus that cannot support it is worse than no
+# recommendation, because it arrives with the same confident formatting.
+
+GATE_OK = "ok"
+GATE_WARN = "warn"
+GATE_BLOCK = "block"
+
+GATE_MIN_POSITIVE_NOTE = ("正类比例过低时，F1 的分子几乎恒为 0，"
+                          "任何阈值移动都只会改变分母")
+
+# Checks that stop a policy, and checks that only qualify one. The split matters:
+# sparse candidate evidence makes the *topic* direction unusable and says nothing
+# about whether the recipient direction is sound, so it is reported and does not
+# veto a recommendation it cannot speak to.
+GATE_BLOCKING = ("samples", "sessions", "label_age")
+GATE_QUALIFYING = ("balance", "degraded", "candidate_coverage", "outcome_coverage")
+
+
+def _gate_row(name: str, status: str, detail: str, *,
+              value: Any = None, threshold: Any = None) -> dict[str, Any]:
+    return {"name": name, "status": status, "detail": detail,
+            "value": value, "threshold": threshold, "blocking": name in GATE_BLOCKING}
+
+
+def _positive_rate(rows: Sequence[LearningSample]) -> float | None:
+    if not rows:
+        return None
+    positives = sum(1 for row in rows if row.expected in ("reply", "bot"))
+    return positives / len(rows)
+
+
+def dataset_gate(
+    samples: Sequence[LearningSample],
+    *,
+    config: LearningConfig | None = None,
+    contract: Mapping[str, Any] | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Whether this corpus is good enough to learn from, and where it is not.
+
+    Stated as a list of named checks rather than one score, because the fixes
+    differ: too few labels, too few conversations, a label set that is almost
+    entirely negative, and a corpus annotated months ago that no longer
+    describes the group are four different problems.
+    """
+    settings = config or LearningConfig()
+    stamp = now if now is not None else time.time()
+    rows = list(samples)
+    checks: list[dict[str, Any]] = []
+
+    total = len(rows)
+    checks.append(_gate_row(
+        "samples", GATE_OK if total >= settings.gate_min_samples else GATE_BLOCK,
+        f"标注样本 {total} 条（门槛 {settings.gate_min_samples}）："
+        + ("足够开始学习。" if total >= settings.gate_min_samples
+           else "样本不足时任何指标都只是噪声，先继续标注。"),
+        value=total, threshold=settings.gate_min_samples))
+
+    sessions = len({row.session_hash for row in rows})
+    checks.append(_gate_row(
+        "sessions", GATE_OK if sessions >= settings.gate_min_sessions else GATE_BLOCK,
+        f"会话 {sessions} 个（门槛 {settings.gate_min_sessions}）："
+        + ("可以切出会话留出集。" if sessions >= settings.gate_min_sessions
+           else "会话太少，切不出不共享会话的留出集，评测无法进行。"),
+        value=sessions, threshold=settings.gate_min_sessions))
+
+    balance_rows: list[str] = []
+    balance_status = GATE_OK
+    for task in (TASK_RECIPIENT, TASK_REPLY_ADMISSION, TASK_REPLY_OUTCOME):
+        subset = [row for row in rows if row.task == task]
+        rate = _positive_rate(subset)
+        if rate is None:
+            continue
+        if min(rate, 1.0 - rate) < settings.gate_min_positive_rate:
+            balance_status = GATE_WARN
+            balance_rows.append(f"{task} 正类占比 {rate:.1%}")
+    checks.append(_gate_row(
+        "balance", balance_status,
+        ("；".join(balance_rows) + "。" + GATE_MIN_POSITIVE_NOTE) if balance_rows
+        else "各任务的正负样本比例都在可用区间内。"))
+
+    degraded = sum(1 for row in rows if _degraded(row))
+    ratio = (degraded / total) if total else 0.0
+    checks.append(_gate_row(
+        "degraded", GATE_OK if ratio <= settings.gate_max_degraded_ratio else GATE_WARN,
+        f"{degraded}/{total} 条样本的决策轨迹降级（门槛 {settings.gate_max_degraded_ratio:.0%}）："
+        + ("证据可回放。" if ratio <= settings.gate_max_degraded_ratio
+           else "降级过多说明本体写入的字段与读取契约不一致，先对齐契约。"),
+        value=round(ratio, 4), threshold=settings.gate_max_degraded_ratio))
+
+    topic_rows = [row for row in rows if row.task == TASK_TOPIC]
+    recorded = sum(1 for row in topic_rows if row.topic_candidates_recorded)
+    coverage = (recorded / len(topic_rows)) if topic_rows else None
+    checks.append(_gate_row(
+        "candidate_coverage",
+        GATE_WARN if (coverage is not None and coverage < 0.7) else GATE_OK,
+        (f"{recorded}/{len(topic_rows)} 条话题标注记录了候选集（{coverage:.1%}）："
+         + ("可以区分候选生成与排序错误。" if coverage >= 0.7
+            else "覆盖率偏低，放宽阈值的回放只是下界，话题方向的可信度随之下降。"))
+        if coverage is not None else "没有话题标注，候选覆盖无从统计。",
+        value=round(coverage, 4) if coverage is not None else None, threshold=0.7))
+
+    labelled = [row for row in rows if row.task == TASK_REPLY_ADMISSION]
+    outcomes = sum(1 for row in labelled if row.outcome.recorded)
+    outcome_coverage = (outcomes / len(labelled)) if labelled else None
+    checks.append(_gate_row(
+        "outcome_coverage",
+        GATE_WARN if (outcome_coverage is not None and outcome_coverage < 0.5) else GATE_OK,
+        (f"{outcomes}/{len(labelled)} 条回复标注记录了最终发送结果（{outcome_coverage:.1%}）："
+         + ("门禁压制与真正的漏回复可以分开。" if outcome_coverage >= 0.5
+            else "缺少最终结果，回复层只能按路由准入解释，门禁压制会被算成路由错误。"))
+        if outcome_coverage is not None else "没有回复标注，最终结果覆盖无从统计。",
+        value=round(outcome_coverage, 4) if outcome_coverage is not None else None,
+        threshold=0.5))
+
+    timestamps = [row.timestamp for row in rows if row.timestamp]
+    age_days = ((stamp - max(timestamps)) / 86_400.0) if timestamps else None
+    checks.append(_gate_row(
+        "label_age",
+        GATE_OK if (age_days is not None
+                    and age_days <= settings.gate_max_label_age_days) else GATE_BLOCK,
+        (f"最新一条标注在 {age_days:.1f} 天前"
+         + ("（门槛 {:.0f} 天）。".format(settings.gate_max_label_age_days)
+            if age_days <= settings.gate_max_label_age_days
+            else "，超过 {} 天：群里的行为习惯可能已经变了，"
+                 "先补一段新标注再学习。".format(settings.gate_max_label_age_days)))
+        if age_days is not None else "没有任何带时间戳的标注。",
+        value=round(age_days, 2) if age_days is not None else None,
+        threshold=settings.gate_max_label_age_days))
+
+    versions: dict[str, int] = {}
+    for row in rows:
+        trace = row.trace if isinstance(row.trace, Mapping) else {}
+        declared = declared_schema_value(trace)
+        key = str(declared) if declared is not None else "missing"
+        versions[key] = versions.get(key, 0) + 1
+    checks.append(_gate_row(
+        "schema", GATE_OK,
+        "schema 分布：" + ("、".join(f"{key}×{value}" for key, value in sorted(versions.items()))
+                           or "无"),
+        value=versions))
+
+    blocked = [row["name"] for row in checks if row["blocking"] and row["status"] == GATE_BLOCK]
+    return {
+        "ok": not blocked,
+        "checks": checks,
+        "blocked_by": blocked,
+        "contract_available": bool(contract),
+        "summary": ("数据可以支撑学习。" if not blocked
+                    else "数据不满足学习门槛（" + "、".join(blocked) + "），本次不出策略。"),
     }
 
 
@@ -654,8 +999,8 @@ def _blocked_lines(found: Mapping[str, CapabilityHealth]) -> list[str]:
     """Plain sentences naming what the corpus currently cannot support."""
     lines: list[str] = []
     for name in (CAPABILITY_TOPIC_ATTRIBUTION, CAPABILITY_TOPIC_THRESHOLD_REPLAY,
-                 CAPABILITY_RECIPIENT_REPLAY, CAPABILITY_REPLY_ADMISSION_REPLAY,
-                 CAPABILITY_FINAL_REPLY_OUTCOME):
+                 CAPABILITY_CANDIDATE_EVIDENCE, CAPABILITY_RECIPIENT_REPLAY,
+                 CAPABILITY_REPLY_ADMISSION_REPLAY, CAPABILITY_FINAL_REPLY_OUTCOME):
         row = found.get(name)
         if row is None or row.status in (STATUS_OK, STATUS_INSUFFICIENT):
             continue
@@ -673,14 +1018,15 @@ def _blocked_lines(found: Mapping[str, CapabilityHealth]) -> list[str]:
 
 
 __all__ = [
-    "CAPABILITY_BUILDERS", "CAPABILITY_FINAL_REPLY_OUTCOME", "CAPABILITY_RECIPIENT_REPLAY",
-    "CAPABILITY_REPLY_ADMISSION_REPLAY", "CAPABILITY_SCOPE_IDENTITY", "CAPABILITY_TOPIC_ATTRIBUTION",
-    "CAPABILITY_TOPIC_THRESHOLD_REPLAY", "COVERAGE_OK", "CapabilityHealth",
-    "DEFINITION_FINAL_REPLY_OUTCOME",
-    "MIN_CAPABILITY_SAMPLES", "PLANE_CONTRACT", "PLANE_SAMPLE", "QUALITY_SCHEMA_VERSION",
-    "RawContractStats", "SCOPE_LEVEL_NOTE", "STATUS_INSUFFICIENT", "STATUS_LABEL", "STATUS_OK",
-    "STATUS_UNSUPPORTED", "STATUS_WARNING", "TIMESTAMP_NOTE", "capabilities",
-    "contract_findings", "dataset_health", "final_reply_outcome", "quality_report",
-    "recipient_replay", "reply_admission_replay", "scope_identity", "topic_attribution",
-    "topic_threshold_replay",
+    "CAPABILITY_BUILDERS", "CAPABILITY_CANDIDATE_EVIDENCE", "CAPABILITY_FINAL_REPLY_OUTCOME",
+    "GATE_BLOCK", "GATE_BLOCKING", "GATE_OK", "GATE_QUALIFYING", "GATE_WARN", "dataset_gate",
+    "CAPABILITY_RECIPIENT_REPLAY", "CAPABILITY_REPLY_ADMISSION_REPLAY", "CAPABILITY_SCOPE_IDENTITY",
+    "CAPABILITY_TOPIC_ATTRIBUTION", "CAPABILITY_TOPIC_THRESHOLD_REPLAY", "COVERAGE_OK",
+    "CapabilityHealth", "DEFINITION_CANDIDATE_EVIDENCE", "DEFINITION_FINAL_REPLY_OUTCOME",
+    "MIN_CAPABILITY_SAMPLES", "OUTCOME_LEVEL_NOTE", "PLANE_CONTRACT", "PLANE_SAMPLE",
+    "QUALITY_SCHEMA_VERSION", "RawContractStats", "SCOPE_LEVEL_NOTE", "STATUS_INSUFFICIENT",
+    "STATUS_LABEL", "STATUS_OK", "STATUS_UNSUPPORTED", "STATUS_WARNING", "TIMESTAMP_NOTE",
+    "candidate_evidence", "capabilities", "contract_findings", "dataset_health",
+    "final_reply_outcome", "quality_report", "recipient_replay", "reply_admission_replay",
+    "scope_identity", "topic_attribution", "topic_threshold_replay", "trace_schema_block",
 ]

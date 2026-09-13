@@ -4,11 +4,27 @@ One sample answers exactly one supervised question about one message. The point
 of the format is that it stores **features, not just outcomes**: a wrong label
 is only useful later if the evidence that produced it was preserved.
 
-Three tasks are produced from a single ChatDynamics annotation record:
+Four tasks are produced from a single ChatDynamics annotation record:
 
-* `recipient`  - was the bot the addressee?          (features: ambient evidence)
-* `topic`      - which topic does the message belong to? (features: topic scores)
-* `reply`      - did the host admit a reply?           (features: same score, other cut)
+* `recipient`        - was the bot the addressee? (features: ambient evidence)
+* `topic`            - which topic does the message belong to? (features: topic scores)
+* `reply_admission`  - did the host admit a reply? (features: same score, other cut)
+* `reply_outcome`    - did anything actually get sent? (features: schema 3 outcome)
+
+The last two exist because they are **not the same question**, and collapsing
+them made the learner count the same non-event twice:
+
+```text
+admitted, 作息/降温 把发送压掉   -> admission correct, outcome negative
+admitted, 生成超时               -> admission correct, outcome negative
+not admitted                     -> admission negative
+```
+
+The first two are identical under schema 2, which recorded no outcome at all, so
+every one of them used to read as a plain "missed_reply" — a router failure that
+the router did not commit. Schema 3 records the outcome, so `reply_outcome`
+exists only for rows that actually carry one; with schema 2 data it produces no
+samples at all rather than a column of invented negatives.
 
 The predicted value is always something the host actually recorded. It is never
 re-derived from a different source, so a sample can be replayed later.
@@ -21,24 +37,39 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
-from . import candidates as candidates_module
-from .candidates import (
-    CandidateRecord, parse_candidates, parse_topic_candidates, records_to_payload,
-)
+from . import buckets, candidates as candidates_module
+from .candidates import CandidateRecord, parse_topic_candidates, records_to_payload
 from .config import LearningConfig
 from .features import FEATURE_SCHEMA_VERSION, build_features, feature_summary
+from .outcome import (
+    EMPTY as OUTCOME_EMPTY, STAGE_ADMISSION, STAGE_DELIVERY, STAGE_GATE, STAGE_GENERATION,
+    FinalOutcome, parse_outcome,
+)
+from .trace import parse_shadow
 from .scope import SCOPE_SOURCE_SESSION, LearningScope, resolve_scope, session_hash
-from .trace import LEVELS, known_topic_label, trace_from_sample_record
+from .trace import (
+    LEVELS, ShadowDecision, SHADOW_EMPTY, known_topic_label, trace_from_sample_record,
+)
 
 # 2 adds the scope fields. They are additive and optional, so a schema 1 row
 # still loads; the version is persisted per row so a future change can be read
 # off the data instead of guessed from which fields happen to be present.
-SAMPLE_SCHEMA_VERSION = 2
+# 3 splits `reply` into admission and outcome, and stores the schema 3 facts
+# (candidate evidence level, final outcome) unconditionally.
+SAMPLE_SCHEMA_VERSION = 3
 
 TASK_RECIPIENT = "recipient"
 TASK_TOPIC = "topic"
-TASK_REPLY = "reply"
-TASKS = (TASK_RECIPIENT, TASK_TOPIC, TASK_REPLY)
+TASK_REPLY_ADMISSION = "reply_admission"
+TASK_REPLY_OUTCOME = "reply_outcome"
+# The single `reply` task this plugin shipped before schema 3. It was always
+# the *admission* question — the docstrings and the console both said so — so it
+# maps onto the admission task rather than being dropped or re-scored.
+TASK_REPLY_LEGACY = "reply"
+TASK_REPLY = TASK_REPLY_ADMISSION
+TASK_ALIASES = {TASK_REPLY_LEGACY: TASK_REPLY_ADMISSION}
+TASKS = (TASK_RECIPIENT, TASK_TOPIC, TASK_REPLY_ADMISSION, TASK_REPLY_OUTCOME)
+REPLY_TASKS = (TASK_REPLY_ADMISSION, TASK_REPLY_OUTCOME)
 
 SOURCE_MANUAL_REPLAY = "manual_replay"
 SOURCE_RUNTIME_OUTCOME = "runtime_outcome"
@@ -51,27 +82,16 @@ NEW_TOPIC = "NEW"
 UNASSIGNED = ""  # the host recorded no committed topic for this message
 MAX_TOPIC_CANDIDATES = candidates_module.MAX_CANDIDATES
 
-
-def _topic_candidates(record: Mapping[str, Any]) -> tuple[list[dict[str, Any]], bool]:
-    """Ranked candidates, plus whether the host recorded the field at all.
-
-    Both facts matter and only one of them survives the payload. An **empty
-    list** means the host looked and proposed nothing, which is a genuine
-    candidate-generation miss; a **missing field** means it recorded nothing, so
-    whether the right topic was offered simply is not knowable. Returning the
-    payload alone would merge the two and blame generation for both.
-
-    Accepts both the legacy `[[score, topic_id], ...]` pairs and the structured
-    `[{topic_id, final_score, evidence, rank}, ...]` form.
-    """
-    routing = record.get("routing")
-    if not isinstance(routing, Mapping):
-        return [], False
-    raw = routing.get("topic_candidates")
-    if not isinstance(raw, list):
-        raw = routing.get("candidates")
-    parsed = parse_candidates(raw)
-    return records_to_payload(parsed.items), parsed.recorded
+# The parts of the trace payload that are **facts about the host's record**
+# rather than a copy of it: which fields it wrote, what it finally did, and the
+# evidence codes it used. They are small, and nothing else can reconstruct them,
+# so they are persisted even when `store_raw_trace` is off — a reply-outcome
+# sample whose outcome was dropped on the way to disk would read back as
+# "unavailable" and quietly disappear from the next analysis.
+FACT_KEYS = (
+    "outcome", "shadow", "topic_candidates", "topic_candidates_recorded", "candidate_evidence",
+    "selected_topic", "source_schema", "contribution_total_recorded", "evidence_summary",
+)
 
 
 def _contribution_total_recorded(record: Mapping[str, Any]) -> bool:
@@ -129,7 +149,17 @@ def _legacy_contribution_total_recorded(trace: Mapping[str, Any]) -> bool:
     return False
 
 
-def _selected_topic(record: Mapping[str, Any]) -> str:
+def _selected_topic(record: Mapping[str, Any], trace: Any) -> str:
+    """What the host finally committed this message to.
+
+    Schema 3 records `routing.selected_topic` explicitly. Before it, the only
+    witness was the decision the host froze into the record, so a missing
+    explicit selection falls back to `predicted_topic` — and to the empty
+    "unassigned" marker, never to a guess.
+    """
+    selected = trace.selected_topic
+    if isinstance(selected, str) and selected:
+        return selected
     routing = record.get("routing")
     if isinstance(routing, Mapping):
         selected = routing.get("selected_topic")
@@ -193,8 +223,62 @@ class LearningSample:
 
     @property
     def topic_candidates(self) -> tuple[CandidateRecord, ...]:
-        raw = self.trace.get("topic_candidates") if isinstance(self.trace, Mapping) else None
+        """Ranked candidates, from the flat key the sample layer always writes.
+
+        The nested `routing.topic_candidates` copy is the fallback for a row
+        written by a version that stored only the raw trace. Preference order is
+        by *guarantee*, not by freshness: the flat key is present whether or not
+        `store_raw_trace` was on, so it is the one a reader can rely on.
+        """
+        if not isinstance(self.trace, Mapping):
+            return ()
+        raw = self.trace.get("topic_candidates")
+        if not isinstance(raw, list):
+            routing = self.trace.get("routing")
+            raw = routing.get("topic_candidates") if isinstance(routing, Mapping) else None
         return parse_topic_candidates(raw)
+
+    @property
+    def candidate_evidence(self) -> str:
+        """`full` / `partial` / `none` — how complete the candidate evidence is.
+
+        Stored as a flat marker (like `topic_candidates_recorded`) because the
+        distinction is destroyed by any round trip that keeps only the payload:
+        a schema 2 candidate list and a schema 3 one look the same once the
+        version field has been normalised away.
+        """
+        marked = self.trace.get("candidate_evidence") if isinstance(self.trace, Mapping) else None
+        if isinstance(marked, str):
+            return marked
+        return "partial" if self.topic_candidates_recorded else "none"
+
+    @property
+    def outcome(self) -> FinalOutcome:
+        """The final outcome, or `EMPTY` when the host recorded none."""
+        if not isinstance(self.trace, Mapping):
+            return OUTCOME_EMPTY
+        return parse_outcome(self.trace)
+
+    @property
+    def outcome_unavailable(self) -> bool:
+        return not self.outcome.recorded
+
+    @property
+    def shadow(self) -> ShadowDecision:
+        """What a shadow policy would have decided, or `SHADOW_EMPTY`.
+
+        Read from the sample's own payload, which every sample of a message
+        carries — the comparison belongs to the turn, not to one task's view of
+        it, and a row that only landed on the admission sample would vanish
+        whenever the reply label was the one the annotator skipped.
+        """
+        if not isinstance(self.trace, Mapping):
+            return SHADOW_EMPTY
+        return parse_shadow(self.trace.get("shadow"))
+
+    @property
+    def shadow_recorded(self) -> bool:
+        return self.shadow.recorded
 
     @property
     def topic_candidates_recorded(self) -> bool:
@@ -253,8 +337,8 @@ class LearningSample:
             "scope_source": self.scope_source,
             "group_hint_hash": self.group_hint_hash,
         }
-        if include_trace:
-            payload["trace"] = dict(self.trace)
+        payload["trace"] = (dict(self.trace) if include_trace
+                            else {key: self.trace[key] for key in FACT_KEYS if key in self.trace})
         return payload
 
     @classmethod
@@ -262,6 +346,11 @@ class LearningSample:
         if not isinstance(raw, Mapping):
             return None
         task = raw.get("task")
+        # A schema 2 row stored `reply`; that task was always the admission
+        # question, so it loads as `reply_admission` instead of being rejected.
+        # The stored `sample_id` is kept as-is: re-deriving it from the new task
+        # name would silently re-key every row written before schema 3.
+        task = TASK_ALIASES.get(task, task) if isinstance(task, str) else task
         if task not in TASKS:
             return None
         session_key = raw.get("session_key")
@@ -334,6 +423,31 @@ def _error_label(explicit: Any, predicted: str, expected: str, *,
     return wrong
 
 
+def _outcome_error_label(outcome: FinalOutcome, predicted: str, expected: str) -> str:
+    """Name a missing reply by the stage that actually stopped it.
+
+    Admission errors and outcome errors share the "expected reply, none came"
+    shape, and naming both `missed_reply` is what made a 作息压制 look like a
+    router failure. So the stage decides the label, and an unrecognised stage
+    falls back to the honest `missed_reply` rather than to a bucket the host
+    never named.
+    """
+    if predicted == expected:
+        return "correct"
+    if expected != REPLY:
+        return "premature_reply"
+    return {
+        STAGE_GATE: buckets.GATE_SUPPRESSION,
+        STAGE_GENERATION: buckets.GENERATION_FAILURE,
+        STAGE_DELIVERY: buckets.DELIVERY_FAILURE,
+        # Nothing was ever sent because the flow was never entered: the
+        # admission cut is the cause, and that is a router decision.
+        STAGE_ADMISSION: buckets.PARTICIPATION_ERROR,
+        # An unrecognised stage is reported as unattributable rather than
+        # guessed into the nearest bucket.
+    }.get(outcome.stage, buckets.UNATTRIBUTABLE)
+
+
 def samples_from_annotation(
     record: Mapping[str, Any],
     session_key: str,
@@ -371,9 +485,22 @@ def samples_from_annotation(
              error_type: str, extra: Mapping[str, Any] | None = None) -> LearningSample:
         payload: dict[str, Any] = dict(trace_payload)
         payload["evidence_summary"] = summary
-        # Stored even when the raw trace is not: it is a fact about the host's
-        # record, not part of the trace snapshot.
+        # The next four are facts about the host's record, not part of the trace
+        # snapshot, so every sample of a message carries them: the attribution
+        # chain reads a message through whichever of its samples exist, and a
+        # fact that only landed on the topic sample would vanish whenever the
+        # topic label was the one the annotator skipped.
         payload["contribution_total_recorded"] = score_recorded
+        payload["candidate_evidence"] = trace.candidate_evidence
+        payload["source_schema"] = trace.source_schema
+        if trace.outcome.recorded:
+            payload["outcome"] = trace.outcome.as_dict()
+        if trace.shadow.recorded:
+            # Carried on every sample of the message, like the outcome: the
+            # comparison is between two decisions about one turn, and reading it
+            # through whichever sample happens to exist must give the same answer.
+            payload["shadow"] = {key: value for key, value in trace.shadow.as_dict().items()
+                                 if key != "recorded"}
         payload.update(extra or {})
         return LearningSample(
             sample_id=sample_identifier(session_key, msg_id, task),
@@ -417,28 +544,44 @@ def samples_from_annotation(
     expected_topic = _topic_label(record.get("expected_topic"), msg_id)
     if expected_topic is not None:
         predicted_topic = _topic_label(record.get("predicted_topic"), msg_id) or UNASSIGNED
-        candidates_payload, candidates_recorded = _topic_candidates(record)
         produced.append(make(
             TASK_TOPIC, predicted_topic, expected_topic, trace.topic_confidence,
             str(record.get("error_type") or "unknown")[:64],
-            {"topic_candidates": candidates_payload,
-             "topic_candidates_recorded": candidates_recorded,
-             "selected_topic": _selected_topic(record)},
+            {"topic_candidates": records_to_payload(trace.topic_candidates),
+             "topic_candidates_recorded": trace.topic_candidates_recorded,
+             "selected_topic": _selected_topic(record, trace)},
         ))
 
     # --- reply admission ------------------------------------------------
+    # "Should this message enter the reply flow?" The prediction is the host's
+    # own routing admission cut. Under schema 2 that is all there was, which is
+    # why this task used to be called plain `reply`.
     expected_reply = record.get("expected_reply")
     if isinstance(expected_reply, bool):
-        # The host never recorded a final send decision (should_reply stays
-        # null), so the honest replay target is its routing admission cut.
         predicted_reply = REPLY if trace.participation_level == "strong" else SILENT
         expected_reply_label = REPLY if expected_reply else SILENT
         produced.append(make(
-            TASK_REPLY, predicted_reply, expected_reply_label,
+            TASK_REPLY_ADMISSION, predicted_reply, expected_reply_label,
             float(trace.participation_score or 0.0),
             _error_label(None, predicted_reply, expected_reply_label,
                          missed="missed_reply", false_positive="premature_reply",
                          wrong="wrong_reply"),
+        ))
+
+    # --- reply outcome ---------------------------------------------------
+    # "Did anything actually get sent?" Produced **only** when the host recorded
+    # an outcome. Schema 2 never did, so this task is empty for schema 2 data
+    # rather than full of invented `silent` labels — the missing outcome is the
+    # reason the two layers exist, not a label to guess.
+    if isinstance(expected_reply, bool) and trace.outcome.recorded:
+        outcome = trace.outcome
+        expected_reply_label = REPLY if expected_reply else SILENT
+        predicted_outcome = REPLY if outcome.is_delivered else SILENT
+        produced.append(make(
+            TASK_REPLY_OUTCOME, predicted_outcome, expected_reply_label,
+            float(trace.participation_score or 0.0),
+            _outcome_error_label(outcome, predicted_outcome, expected_reply_label),
+            {"reply_outcome": outcome.as_dict()},
         ))
     return produced
 
@@ -481,10 +624,11 @@ def sessions_of(samples: Sequence[LearningSample]) -> dict[str, list[LearningSam
 
 
 __all__ = [
-    "BOT", "CandidateRecord", "MAX_TOPIC_CANDIDATES", "NEW_TOPIC", "OTHER", "REPLY",
-    "SAMPLE_SCHEMA_VERSION",
-    "SILENT", "SOURCE_MANUAL_REPLAY", "SOURCE_RUNTIME_OUTCOME", "TASKS", "TASK_RECIPIENT",
-    "TASK_REPLY", "TASK_TOPIC", "UNASSIGNED", "LearningSample", "build_dataset", "by_task",
-    "sample_identifier", "samples_from_annotation", "session_hash", "sessions_of",
+    "BOT", "CandidateRecord", "FACT_KEYS", "MAX_TOPIC_CANDIDATES", "NEW_TOPIC", "OTHER", "REPLY",
+    "REPLY_TASKS", "SAMPLE_SCHEMA_VERSION",
+    "SILENT", "SOURCE_MANUAL_REPLAY", "SOURCE_RUNTIME_OUTCOME", "TASKS", "TASK_ALIASES",
+    "TASK_RECIPIENT", "TASK_REPLY", "TASK_REPLY_ADMISSION", "TASK_REPLY_LEGACY",
+    "TASK_REPLY_OUTCOME", "TASK_TOPIC", "UNASSIGNED", "LearningSample", "build_dataset",
+    "by_task", "sample_identifier", "samples_from_annotation", "session_hash", "sessions_of",
     "FEATURE_SCHEMA_VERSION",
 ]

@@ -11,6 +11,7 @@ import json
 import logging
 from typing import Any, Dict
 
+from .policy import ACTIONS
 from .web_compat import error_response, json_response, query_value, request_json
 
 logger = logging.getLogger("astrbot_plugin_dynamics_learning.web_api")
@@ -18,7 +19,10 @@ logger = logging.getLogger("astrbot_plugin_dynamics_learning.web_api")
 PLUGIN_NAME = "astrbot_plugin_dynamics_learning"
 _MAX_BODY_BYTES = 4 * 1024 * 1024
 _MAX_PAGE_SIZE = 200
-_ALLOWED_ACTIONS = ("accept", "ignore", "reopen", "rollback")
+# The state machine's actions, imported rather than restated: a second list here
+# would be a second vocabulary, and the page would offer buttons the store
+# refuses.
+_ALLOWED_ACTIONS = ACTIONS
 
 
 def _json_ok(data: Any):
@@ -89,6 +93,10 @@ class LearningWebAPI:
             ("overview", self.overview, ["GET"], "学习层状态、数据面与最近一次分析"),
             ("samples", self.samples, ["GET"], "分页查看学习样本（不含正文）"),
             ("quality", self.quality, ["GET"], "数据契约健康度：能力矩阵与原始记录统计"),
+            ("attribution", self.attribution, ["GET"],
+             "错误归因链：每条消息归入唯一一层（收件人/候选生成/排序/参与准入/门禁/生成/发送）"),
+            ("shadow", self.shadow, ["GET"],
+             "shadow A/B：分歧子集对比、置信区间与进入 active 的门槛"),
             ("scopes", self.scopes, ["GET"], "作用域列表：被检查样本量与主要问题（当前作用域=会话）"),
             ("scope", self.scope, ["GET"], "单个作用域画像：被检查样本、leave-one-out 基线与偏差"),
             ("ingest", self.ingest, ["POST"], "从 ChatDynamics 只读导入标注，或导入导出文件"),
@@ -96,6 +104,9 @@ class LearningWebAPI:
             ("report", self.report, ["GET"], "最近一次分析结果"),
             ("policies", self.policies, ["GET"], "策略候选与版本记录"),
             ("policy", self.policy, ["POST"], "标记采纳/忽略/回滚策略记录"),
+            ("candidate", self.candidate, ["GET"], "Read-only candidates for shadow consumers"),
+            ("published", self.published, ["GET"],
+             "只读发布面：已采纳（promoted）的策略，供 ChatDynamics 决定是否采用"),
             ("export", self.export, ["GET"], "导出样本、报告与策略记录 JSON"),
             ("reset", self.reset, ["POST"], "清空本插件的样本与报告（不可逆）"),
         ]
@@ -150,6 +161,21 @@ class LearningWebAPI:
         except Exception as exc:
             logger.error("[DynamicsLearning] quality failed type=%s", type(exc).__name__)
             return _json_err("读取数据契约健康度失败", 500)
+
+    async def attribution(self):
+        try:
+            return _json_ok(await self.plugin.attribution_payload(
+                examples=_query_int("examples", 8, 1, 50)))
+        except Exception as exc:
+            logger.error("[DynamicsLearning] attribution failed type=%s", type(exc).__name__)
+            return _json_err("读取错误归因链失败", 500)
+
+    async def shadow(self):
+        try:
+            return _json_ok(await self.plugin.shadow_payload())
+        except Exception as exc:
+            logger.error("[DynamicsLearning] shadow failed type=%s", type(exc).__name__)
+            return _json_err("读取 shadow A/B 结果失败", 500)
 
     async def scopes(self):
         try:
@@ -234,6 +260,20 @@ class LearningWebAPI:
         except Exception as exc:
             logger.error("[DynamicsLearning] policy failed type=%s", type(exc).__name__)
             return _json_err("更新策略记录失败", 500)
+
+    async def candidate(self):
+        try:
+            return _json_ok(await self.plugin.candidate_payload())
+        except Exception as exc:
+            logger.error("[DynamicsLearning] candidate failed type=%s", type(exc).__name__)
+            return _json_err("读取候选策略失败", 500)
+
+    async def published(self):
+        try:
+            return _json_ok(await self.plugin.published_payload())
+        except Exception as exc:
+            logger.error("[DynamicsLearning] published failed type=%s", type(exc).__name__)
+            return _json_err("读取已发布策略失败", 500)
 
     async def export(self):
         try:

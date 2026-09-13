@@ -44,9 +44,10 @@ from .evaluator import (
 )
 from .metrics import ErrorRate
 from .policy import (
-    BASE_POLICY, PolicyCandidate, candidate_from, clamp_cumulative, drift_from,
-    normalize_policy, policy_deltas, target_error_for,
+    BASE_POLICY, STATUS_PROPOSED, STATUS_VALIDATED, PolicyCandidate, candidate_from,
+    clamp_cumulative, drift_from, normalize_policy, policy_deltas, target_error_for,
 )
+from .recommendation import confidence_for
 from .samples import TASK_RECIPIENT, TASK_TOPIC, LearningSample
 
 TASK_PRIMARY_ERROR = {TASK_RECIPIENT: "missed_bot", TASK_TOPIC: "fragmentation"}
@@ -476,7 +477,11 @@ def _finalise(run: TuneRun, samples: Sequence[LearningSample], config: LearningC
         return run
     if abs(sum(run.final_policy.values()) - sum(baseline.values())) < 1e-9:
         return run
-    status = "accepted" if run.promoted else "candidate"
+    # `validated`, never `promoted`: a tuning run proves a holdout improvement.
+    # The shadow stage — publishing the policy beside live behaviour and watching
+    # it — is a different kind of evidence, and this plugin cannot produce it.
+    status = STATUS_VALIDATED if run.promoted else STATUS_PROPOSED
+    last = run.steps[-1] if run.steps else None
     candidate = candidate_from(
         run.final_policy, baseline=baseline, source="iterative_tuning",
         rationale=(f"{run.task} 迭代调参：{run.adopted_steps} 步采纳，"
@@ -489,7 +494,26 @@ def _finalise(run: TuneRun, samples: Sequence[LearningSample], config: LearningC
         },
         existing_versions=existing_versions, now=now,
     )
-    run.candidate = candidate.with_status(status)
+    run.candidate = candidate.with_fields(
+        status=status,
+        target_error=(last.target_error if last is not None else "") or "",
+        collateral_regressions=tuple(
+            name for name, row in ((last.collateral or {}).items() if last else ())
+            if isinstance(row, Mapping) and row.get("is_target") is False
+            and row.get("improved") is False),
+        confidence=confidence_for(run.rules.max_steps and run.adopted_steps or 0,
+                                  min_samples=1),
+        holdout_result={
+            "decision": run.decision,
+            "primary_metric": run.primary_metric,
+            "adopted_steps": run.adopted_steps,
+            "cumulative_delta": (last.cumulative_delta if last is not None else None),
+            "target_error_cumulative": (last.target_error_cumulative
+                                        if last is not None else None),
+            "steps": [step.as_dict() for step in run.steps],
+        },
+    ).with_status(status, now=now if now is not None else candidate.created_at,
+                  reason=run.stop_reason or run.decision)
     return run
 
 

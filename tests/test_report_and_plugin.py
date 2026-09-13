@@ -1,13 +1,16 @@
 """The analysis snapshot and the plugin surface end to end."""
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from astrbot_plugin_dynamics_learning.core.config import LearningConfig, parse_learning_config
-from astrbot_plugin_dynamics_learning.core.policy import BASE_POLICY
+from astrbot_plugin_dynamics_learning.core.policy import BASE_POLICY, STATUS_PROMOTED
 from astrbot_plugin_dynamics_learning.core.recommendation import KIND_CONFIG_PARAM
 from astrbot_plugin_dynamics_learning.core.report import analyze, dataset_summary, error_breakdown, overview
-from astrbot_plugin_dynamics_learning.core.samples import build_dataset
+from astrbot_plugin_dynamics_learning.core.samples import TASKS, build_dataset
+from astrbot_plugin_dynamics_learning.core.store import PUBLISHED_KEY
 
 from .factories import ambient_record, annotated_sessions, export_payload
 
@@ -42,7 +45,7 @@ def test_overview_reports_undefined_accuracy_for_an_absent_task():
 def test_error_breakdown_groups_by_task():
     samples = _samples()
     breakdown = error_breakdown(samples)
-    assert set(breakdown) <= {"recipient", "topic", "reply"}
+    assert set(breakdown) <= set(TASKS), "每个错误桶都必须属于一个已知任务"
     for counts in breakdown.values():
         assert all(isinstance(value, int) for value in counts.values())
 
@@ -149,7 +152,10 @@ def test_config_parsing_is_total_over_host_shapes():
 
 @pytest.mark.asyncio
 async def test_plugin_ingests_an_export_then_reports(plugin):
-    rows = annotated_sessions(sessions=14, per_session=16)
+    # Dated "now" on purpose: the dataset gate blocks a corpus whose newest label
+    # is older than gate_max_label_age_days, and a fixture timestamped in 1970 is
+    # exactly that case.
+    rows = annotated_sessions(sessions=14, per_session=16, start=time.time() - 3600)
     result = await plugin.ingest(source="export", payload=export_payload(rows))
     assert result["imported_samples"] > 0
     assert result["sessions"] == 14
@@ -174,8 +180,15 @@ async def test_plugin_ingests_an_export_then_reports(plugin):
     # fallback, so the same adjustment is never recorded twice.
     assert all(row["source"] == "iterative_tuning" for row in policies["rows"])
     version = policies["rows"][0]["version"]
+    # Promotion is a separate arrow from validation, and the store refuses to
+    # skip it: a policy that has not been through "validated" cannot be offered
+    # to the host.
+    await plugin.update_policy(version, "validate")
     updated = await plugin.update_policy(version, "accept")
-    assert updated["status"] == "accepted"
+    assert updated["status"] == "promoted"
+    published = await plugin.published_payload()
+    assert [row["policy_id"] for row in published["policies"]] == [version]
+    assert published["policies"][0]["shadow_observed"] is False
     assert "未发生任何变化" in updated["note"]
     with pytest.raises(ValueError):
         await plugin.update_policy("policy_v999", "accept")
@@ -239,6 +252,39 @@ async def test_plugin_reports_a_missing_host_without_raising(plugin, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_the_publish_contract_is_materialised_for_the_consumer(plugin):
+    """ChatDynamics reads one key; the producer writes it on every state change.
+
+    Two implementations of the same contract is two chances to disagree, and the
+    disagreement would surface as a policy that silently never applies.
+    """
+    rows = annotated_sessions(sessions=4, per_session=6, start=time.time() - 3600)
+    await plugin.ingest(source="export", payload=export_payload(rows))
+    await plugin.run_analysis()
+
+    stored = await plugin.store.load_published()
+    assert stored["policy_contract_version"] == 1
+    assert isinstance(stored["policies"], list)
+
+    policies = await plugin.store.load_policies()
+    if policies:
+        version = policies[0].version
+        await plugin.update_policy(version, "validate")
+        await plugin.update_policy(version, "accept")
+        stored = await plugin.store.load_published()
+        assert [row["policy_id"] for row in stored["policies"]] == [version]
+        assert stored["policies"][0]["state"] == STATUS_PROMOTED
+        assert set(stored["policies"][0]) >= {"source", "target", "params", "state"}
+        assert set(stored["policies"][0]["source"]) == {
+            "trace_schema_version", "trace_schema_versions", "dataset_fingerprint",
+            "learning_version"}
+
+    await plugin.reset_storage()
+    assert await plugin.store.load_published() == {}
+    assert PUBLISHED_KEY not in plugin._kv
+
+
+@pytest.mark.asyncio
 async def test_plugin_never_writes_outside_its_own_learning_keys(plugin):
     """The read-only guarantee, asserted against every key the plugin writes."""
     writes: list[str] = []
@@ -250,9 +296,11 @@ async def test_plugin_never_writes_outside_its_own_learning_keys(plugin):
 
     plugin.put_kv_data = recording  # type: ignore[method-assign]
     await plugin.ingest(source="export", payload=export_payload(
-        annotated_sessions(sessions=4, per_session=6)))
+        annotated_sessions(sessions=4, per_session=6, start=time.time() - 3600)))
     await plugin.run_analysis()
-    await plugin.update_policy((await plugin.policies_payload())["rows"][0]["version"], "accept")
+    version = (await plugin.policies_payload())["rows"][0]["version"]
+    await plugin.update_policy(version, "validate")
+    await plugin.update_policy(version, "accept")
     await plugin.reset_storage()
 
     assert writes, "the run must have exercised the write path"
@@ -272,6 +320,8 @@ async def test_plugin_registers_every_endpoint_once(plugin):
         "/astrbot_plugin_dynamics_learning/overview",
         "/astrbot_plugin_dynamics_learning/samples",
         "/astrbot_plugin_dynamics_learning/quality",
+        "/astrbot_plugin_dynamics_learning/attribution",
+        "/astrbot_plugin_dynamics_learning/shadow",
         "/astrbot_plugin_dynamics_learning/scopes",
         "/astrbot_plugin_dynamics_learning/scope",
         "/astrbot_plugin_dynamics_learning/ingest",
@@ -279,12 +329,14 @@ async def test_plugin_registers_every_endpoint_once(plugin):
         "/astrbot_plugin_dynamics_learning/report",
         "/astrbot_plugin_dynamics_learning/policies",
         "/astrbot_plugin_dynamics_learning/policy",
+        "/astrbot_plugin_dynamics_learning/published",
+        "/astrbot_plugin_dynamics_learning/candidate",
         "/astrbot_plugin_dynamics_learning/export",
         "/astrbot_plugin_dynamics_learning/reset",
     }
     assert plugin.web.registered is True
     plugin.web.register()
-    assert len(plugin.context.routes) == 12
+    assert len(plugin.context.routes) == 16
 
 
 def test_the_page_only_calls_endpoints_the_plugin_registers(plugin):
@@ -349,3 +401,28 @@ async def test_auto_analysis_stays_off_unless_enabled(plugin):
 def test_base_policy_is_exposed_for_the_evaluator():
     assert BASE_POLICY["strong_addressivity_threshold"] == 0.70
     assert BASE_POLICY["topic_commit_threshold"] == 0.58
+
+
+@pytest.mark.asyncio
+async def test_shadow_candidate_is_available_before_promotion_and_withdrawn(plugin):
+    from astrbot_plugin_dynamics_learning.core.policy import candidate_from
+    from astrbot_plugin_dynamics_learning.core.store import CANDIDATE_KEY
+
+    row = candidate_from({"strong_addressivity_threshold": 0.67})
+    await plugin.store.append_policy(row)
+    await plugin.update_policy(row.version, "validate")
+    candidate = await plugin.store.load_candidate()
+    assert candidate["policies"][0]["state"] == "validated"
+    assert candidate["policies"][0]["eligible_modes"] == ["shadow"]
+    assert (await plugin.published_payload())["policies"] == []
+    await plugin.update_policy(row.version, "shadow")
+    assert (await plugin.candidate_payload())["policies"][0]["state"] == "shadow"
+    assert (await plugin.store.load_published())["policies"] == []
+    await plugin.update_policy(row.version, "accept")
+    assert (await plugin.store.load_published())["policies"][0]["state"] == "promoted"
+    assert (await plugin.store.load_candidate())["policies"][0]["state"] == "promoted"
+    await plugin.update_policy(row.version, "rollback")
+    assert (await plugin.store.load_candidate())["policies"] == []
+    assert (await plugin.store.load_published())["policies"] == []
+    await plugin.reset_storage()
+    assert CANDIDATE_KEY not in plugin._kv

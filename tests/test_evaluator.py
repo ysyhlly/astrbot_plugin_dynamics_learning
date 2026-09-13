@@ -59,7 +59,7 @@ def test_a_learnable_batch_produces_an_accepted_candidate():
     report = evaluate_dataset(samples)
     assert report.verdict == VERDICT_ACCEPTED, report.reasons
     assert report.candidate is not None
-    assert report.candidate.status == "candidate"
+    assert report.candidate.status == "validated"
     recipient = report.tasks["recipient"]
     assert recipient.deltas["accuracy"]["delta"] >= 0.02
     assert recipient.fitted["calibrated_on"] == "train"

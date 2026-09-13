@@ -76,7 +76,7 @@ def test_two_small_steps_promote_together():
     assert cumulative >= TuneRules().promote_improvement
     assert cumulative < TuneRules().strong_improvement
     assert run.candidate is not None
-    assert run.candidate.status == "accepted"
+    assert run.candidate.status == "validated"
     assert run.high_confidence is False
 
 
@@ -99,7 +99,7 @@ def test_a_two_percent_gain_is_flagged_high_confidence():
     assert run.high_confidence is True
     assert run.adopted_steps == 1
     assert run.candidate is not None
-    assert run.candidate.status == "accepted"
+    assert run.candidate.status == "validated"
     assert run.as_dict()["decision_label"] == "强采纳（高置信度）"
 
 
@@ -113,7 +113,7 @@ def test_a_plateau_stops_after_two_weak_steps_and_keeps_the_candidate():
         assert step.step_delta is not None
         assert step.step_delta < TuneRules().marginal_stall
     assert run.candidate is not None
-    assert run.candidate.status == "candidate"
+    assert run.candidate.status == "proposed"
 
 
 def test_a_guard_break_rolls_the_whole_run_back():

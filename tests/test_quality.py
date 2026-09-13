@@ -11,12 +11,15 @@ import pytest
 from astrbot_plugin_dynamics_learning.core import ingest as ingest_module
 from astrbot_plugin_dynamics_learning.core.ingest import parse_export, parse_preferences
 from astrbot_plugin_dynamics_learning.core.quality import (
-    CAPABILITY_RECIPIENT_REPLAY, CAPABILITY_SCOPE_IDENTITY, CAPABILITY_TOPIC_ATTRIBUTION,
+    CAPABILITY_CANDIDATE_EVIDENCE, CAPABILITY_RECIPIENT_REPLAY, CAPABILITY_SCOPE_IDENTITY,
+    CAPABILITY_TOPIC_ATTRIBUTION,
     CAPABILITY_TOPIC_THRESHOLD_REPLAY, STATUS_INSUFFICIENT, STATUS_OK, STATUS_UNSUPPORTED,
     STATUS_WARNING, capabilities, contract_findings, quality_report, recipient_replay,
     scope_identity, topic_attribution, topic_threshold_replay,
 )
-from astrbot_plugin_dynamics_learning.core.samples import TASK_RECIPIENT, build_dataset, session_hash
+from astrbot_plugin_dynamics_learning.core.samples import (
+    TASK_RECIPIENT, TASK_REPLY_ADMISSION, build_dataset, session_hash,
+)
 
 from .factories import export_payload, make_record, make_trace, topic_record
 
@@ -133,9 +136,14 @@ def test_schema_versions_are_counted_before_normalisation_erases_them():
 
     samples = build_dataset(result.annotations, session_meta=result.sessions)
     assert samples
-    # Every stored trace claims schema 2 — which is exactly why the raw plane,
-    # and not the sample plane, has to answer this question.
-    assert {sample.trace["routing_schema_version"] for sample in samples} == {2}
+    # Stored traces now round-trip the schema they were read under (v0.9.0), so
+    # the sample plane no longer flattens everything to one number. The raw
+    # plane remains the authority on *what the host wrote*: the v1 row above is
+    # re-expressed as schema 2 and says so via `source_schema`.
+    assert {sample.trace["trace_schema_version"] for sample in samples} == {2}
+    # 0 means "the record declared nothing": the trace without a decision_trace
+    # at all, which is a statement about the writer, not about the schema.
+    assert {sample.trace["source_schema"] for sample in samples} == {0, 1, 2}
 
 
 def test_a_missing_additive_total_is_counted_before_it_becomes_zero():
@@ -336,7 +344,7 @@ def test_capabilities_cover_every_registered_entry():
     assert set(found) == {
         CAPABILITY_RECIPIENT_REPLAY, CAPABILITY_TOPIC_ATTRIBUTION,
         CAPABILITY_TOPIC_THRESHOLD_REPLAY, "reply_admission_replay", CAPABILITY_SCOPE_IDENTITY,
-        "final_reply_outcome",
+        "final_reply_outcome", CAPABILITY_CANDIDATE_EVIDENCE,
     }
     assert all(row.as_dict()["status_label"] for row in found.values())
 
@@ -348,7 +356,7 @@ def test_the_final_send_outcome_is_unsupported_by_contract():
     from astrbot_plugin_dynamics_learning.core.quality import final_reply_outcome
 
     samples = _recipient_batch(total=3, eligible=3)
-    rows = [sample for sample in samples if sample.task == "reply"]
+    rows = [sample for sample in samples if sample.task == TASK_REPLY_ADMISSION]
 
     health = final_reply_outcome(samples, min_samples=1)
 
@@ -356,7 +364,7 @@ def test_the_final_send_outcome_is_unsupported_by_contract():
     assert health.status == STATUS_UNSUPPORTED
     assert health.eligible == 0
     assert health.total == len(rows)
-    assert any("should_reply" in reason for reason in health.reasons)
+    assert any("最终发送结果" in reason for reason in health.reasons)
 
 
 def test_quality_report_without_an_import_says_so():

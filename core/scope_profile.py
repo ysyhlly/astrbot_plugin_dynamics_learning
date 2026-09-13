@@ -39,13 +39,16 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from . import buckets
 from .candidates import summarise as summarise_candidates
 from .metrics import SAMPLE_NOTE, error_distribution, ratio, rounded, topic_pair_metrics
 from .policy import (
     ERROR_FALSE_BOT, ERROR_FRAGMENTATION, ERROR_MISSED_BOT, ERROR_MISSED_REPLY,
     ERROR_PREMATURE_REPLY, ERROR_WRONG_MERGE,
 )
-from .samples import TASK_RECIPIENT, TASK_REPLY, TASK_TOPIC, LearningSample
+from .samples import (
+    TASK_RECIPIENT, TASK_REPLY_ADMISSION, TASK_REPLY_OUTCOME, TASK_TOPIC, LearningSample,
+)
 from .scope import SCOPE_LABEL_CHARS, SCOPE_SPANS_SESSIONS
 from .topic_learner import candidate_observations
 from .trace import known_topic_label
@@ -104,13 +107,21 @@ SELECTION_HIGH = 0.90
 RECOMMENDED_CANDIDATE_GENERATION = "topic_candidate_generation"
 RECOMMENDED_RANKING = "topic_ranking_or_scoring"
 
+# Which task's samples carry each error kind. The reply chain is deliberately
+# two entries: an admission error ("should this have been answered?") and an
+# outcome event ("it was answered, but 作息压掉了") are counted over different
+# populations, and giving them one denominator would divide a gate decision by a
+# routing decision.
 KIND_TASK = {
     ERROR_MISSED_BOT: TASK_RECIPIENT,
     ERROR_FALSE_BOT: TASK_RECIPIENT,
-    ERROR_MISSED_REPLY: TASK_REPLY,
-    ERROR_PREMATURE_REPLY: TASK_REPLY,
+    ERROR_MISSED_REPLY: TASK_REPLY_ADMISSION,
+    ERROR_PREMATURE_REPLY: TASK_REPLY_ADMISSION,
     ERROR_FRAGMENTATION: TASK_TOPIC,
     ERROR_WRONG_MERGE: TASK_TOPIC,
+    buckets.GATE_SUPPRESSION: TASK_REPLY_OUTCOME,
+    buckets.GENERATION_FAILURE: TASK_REPLY_OUTCOME,
+    buckets.DELIVERY_FAILURE: TASK_REPLY_OUTCOME,
 }
 
 KIND_LABEL = {
@@ -120,12 +131,20 @@ KIND_LABEL = {
     ERROR_PREMATURE_REPLY: "抢话",
     ERROR_FRAGMENTATION: "话题误拆分",
     ERROR_WRONG_MERGE: "话题误合并",
+    buckets.GATE_SUPPRESSION: "门禁压制（非路由错误）",
+    buckets.GENERATION_FAILURE: "生成失败（非路由错误）",
+    buckets.DELIVERY_FAILURE: "发送失败（非路由错误）",
 }
 
-KIND_ORDER = (
-    ERROR_MISSED_BOT, ERROR_FALSE_BOT, ERROR_MISSED_REPLY, ERROR_PREMATURE_REPLY,
-    ERROR_FRAGMENTATION, ERROR_WRONG_MERGE,
-)
+# Which of the kinds a policy could actually move. The scope view uses this to
+# keep "this group is mostly silent because of 作息" from reading as "this group
+# is where the router is worst".
+MODEL_KINDS = (ERROR_MISSED_BOT, ERROR_FALSE_BOT, ERROR_MISSED_REPLY,
+               ERROR_PREMATURE_REPLY, ERROR_FRAGMENTATION, ERROR_WRONG_MERGE)
+SYSTEM_KINDS = (buckets.GATE_SUPPRESSION, buckets.GENERATION_FAILURE,
+                buckets.DELIVERY_FAILURE)
+
+KIND_ORDER = (*MODEL_KINDS, *SYSTEM_KINDS)
 
 REVIEW_NOTE = "仅统计人工标注（被检查过）的样本，不代表该作用域的真实错误率"
 SCOPE_LEVEL_NOTE = "作用域层级是会话：本体契约没有提供跨会话的群身份"
@@ -163,14 +182,19 @@ def rate_counts(rows: Sequence[LearningSample]) -> dict[str, Support]:
     """
     counts = empty_counts()
     recipient = [row for row in rows if row.task == TASK_RECIPIENT]
-    reply = [row for row in rows if row.task == TASK_REPLY]
+    admission = [row for row in rows if row.task == TASK_REPLY_ADMISSION]
+    outcome = [row for row in rows if row.task == TASK_REPLY_OUTCOME]
     topic = [row for row in rows if row.task == TASK_TOPIC]
 
     for kind in (ERROR_MISSED_BOT, ERROR_FALSE_BOT):
         counts[kind] = Support(sum(1 for row in recipient if row.error_type == kind),
                                len(recipient))
     for kind in (ERROR_MISSED_REPLY, ERROR_PREMATURE_REPLY):
-        counts[kind] = Support(sum(1 for row in reply if row.error_type == kind), len(reply))
+        counts[kind] = Support(sum(1 for row in admission if row.error_type == kind),
+                               len(admission))
+    for kind in SYSTEM_KINDS:
+        counts[kind] = Support(sum(1 for row in outcome if row.error_type == kind),
+                               len(outcome))
 
     pairs = topic_pairs(topic)
     metrics = topic_pair_metrics(pairs)
@@ -382,6 +406,7 @@ class ScopeReviewProfile:
     recipient: dict[str, Any] = field(default_factory=dict)
     topic: dict[str, Any] = field(default_factory=dict)
     reply: dict[str, Any] = field(default_factory=dict)
+    outcome: dict[str, Any] = field(default_factory=dict)
     candidate_metrics: dict[str, Any] = field(default_factory=dict)
     confidence: str = CONFIDENCE_INSUFFICIENT
     confidence_reason: str = ""
@@ -406,6 +431,7 @@ class ScopeReviewProfile:
             "recipient": dict(self.recipient),
             "topic": dict(self.topic),
             "reply": dict(self.reply),
+            "outcome": dict(self.outcome),
             "candidate_metrics": dict(self.candidate_metrics),
             "confidence": self.confidence,
             "confidence_label": CONFIDENCE_LABEL.get(self.confidence, self.confidence),
@@ -417,7 +443,8 @@ class ScopeReviewProfile:
 def build_profile(scope_hash: str, rows: Sequence[LearningSample]) -> ScopeReviewProfile:
     """The review layer: what was looked at here, and what went wrong inside it."""
     recipient = [row for row in rows if row.task == TASK_RECIPIENT]
-    reply = [row for row in rows if row.task == TASK_REPLY]
+    admission = [row for row in rows if row.task == TASK_REPLY_ADMISSION]
+    outcome = [row for row in rows if row.task == TASK_REPLY_OUTCOME]
     topic = [row for row in rows if row.task == TASK_TOPIC]
     sessions = len({row.session_hash for row in rows})
     days = annotation_days(rows)
@@ -432,7 +459,8 @@ def build_profile(scope_hash: str, rows: Sequence[LearningSample]) -> ScopeRevie
         days=days,
         first_timestamp=min(timestamps, default=None),
         last_timestamp=max(timestamps, default=None),
-        tasks={TASK_RECIPIENT: len(recipient), TASK_TOPIC: len(topic), TASK_REPLY: len(reply)},
+        tasks={TASK_RECIPIENT: len(recipient), TASK_TOPIC: len(topic),
+               TASK_REPLY_ADMISSION: len(admission), TASK_REPLY_OUTCOME: len(outcome)},
         error_counts=error_distribution(rows),
         recipient={
             "samples": len(recipient),
@@ -446,10 +474,25 @@ def build_profile(scope_hash: str, rows: Sequence[LearningSample]) -> ScopeRevie
             "error_types": error_distribution(topic),
         },
         reply={
-            "samples": len(reply),
-            "missed_reply": sum(1 for row in reply if row.error_type == ERROR_MISSED_REPLY),
-            "premature_reply": sum(1 for row in reply if row.error_type == ERROR_PREMATURE_REPLY),
-            "error_types": error_distribution(reply),
+            "samples": len(admission),
+            "missed_reply": sum(1 for row in admission
+                                if row.error_type == ERROR_MISSED_REPLY),
+            "premature_reply": sum(1 for row in admission
+                                   if row.error_type == ERROR_PREMATURE_REPLY),
+            "error_types": error_distribution(admission),
+            "note": "回复准入：判定目标是 level == strong，不是最终是否发送",
+        },
+        outcome={
+            "samples": len(outcome),
+            "delivered": sum(1 for row in outcome if row.predicted == "reply"),
+            "suppressed": sum(1 for row in outcome
+                              if row.error_type == buckets.GATE_SUPPRESSION),
+            "generation_failed": sum(1 for row in outcome
+                                     if row.error_type == buckets.GENERATION_FAILURE),
+            "delivery_failed": sum(1 for row in outcome
+                                   if row.error_type == buckets.DELIVERY_FAILURE),
+            "error_types": error_distribution(outcome),
+            "unavailable": not outcome,
         },
         candidate_metrics=summarise_candidates(candidate_observations(topic)),
         confidence=confidence,

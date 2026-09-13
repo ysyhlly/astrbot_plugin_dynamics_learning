@@ -12,16 +12,24 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
+from .attribution import attribution_report
 from .autotune import DECISION_LABEL, TuneRules, TuneRun, run_all as run_tuning
 from .config import LearningConfig
-from .evaluator import EvaluationReport, VERDICT_ACCEPTED, evaluate_dataset
+from .evaluator import (
+    VERDICT_ACCEPTED, EvaluationReport, evaluate_dataset, forward_evaluation, promotion_check,
+)
+from .policy import STATUS_PROPOSED, STATUS_VALIDATED
 from .metrics import SAMPLE_NOTE, within_window
+from .quality import dataset_gate
 from .policy import PolicyCandidate, drift_from
 from .recipient_learner import RecipientLearning, learn as learn_recipient
 from .recommendation import (
     CONFIDENCE_INSUFFICIENT, KIND_CONFIG_PARAM, Recommendation,
 )
-from .samples import TASK_RECIPIENT, TASK_REPLY, TASK_TOPIC, LearningSample
+from .samples import (
+    TASK_RECIPIENT, TASK_REPLY_ADMISSION, TASK_REPLY_OUTCOME, TASK_TOPIC, LearningSample,
+)
+from .shadow import evaluate_shadow, rules_from_config
 from .topic_learner import TopicLearning, learn as learn_topic
 
 OVERVIEW_WINDOW_DAYS = 7
@@ -47,7 +55,19 @@ class AnalysisResult:
     topic: TopicLearning = field(default_factory=TopicLearning)
     recommendations: list[Recommendation] = field(default_factory=list)
     evaluation: EvaluationReport | None = None
+    # The time-ordered holdout, and the combined verdict that gates promotion.
+    forward: EvaluationReport | None = None
+    promotion: dict[str, Any] = field(default_factory=dict)
+    # The pre-learning gate: whether a policy may be offered from this corpus.
+    dataset_gate: dict[str, Any] = field(default_factory=dict)
+    # The shadow A/B result: what a policy's decisions say about it, measured on
+    # the turns where it disagreed with the baseline.
+    shadow: dict[str, Any] = field(default_factory=dict)
     tuning: list[TuneRun] = field(default_factory=list)
+    # The message-level chain. Reported before the per-task numbers because it is
+    # the only part that answers "which layer should change", and it is derived
+    # from the same samples those numbers come from.
+    attribution: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -64,14 +84,22 @@ class AnalysisResult:
             "topic": self.topic.as_dict(),
             "recommendations": [row.as_dict() for row in self.recommendations],
             "evaluation": self.evaluation.as_dict() if self.evaluation else None,
+            "forward": self.forward.as_dict() if self.forward else None,
+            "promotion": dict(self.promotion),
+            "dataset_gate": dict(self.dataset_gate),
+            "shadow": dict(self.shadow),
             "tuning": [row.as_dict() for row in self.tuning],
+            "attribution": dict(self.attribution),
             "notes": list(self.notes),
         }
 
 
+ANALYSED_TASKS = (TASK_RECIPIENT, TASK_TOPIC, TASK_REPLY_ADMISSION, TASK_REPLY_OUTCOME)
+
+
 def dataset_summary(samples: Sequence[LearningSample]) -> dict[str, Any]:
     tasks = {task: sum(1 for sample in samples if sample.task == task)
-             for task in (TASK_RECIPIENT, TASK_TOPIC, TASK_REPLY)}
+             for task in ANALYSED_TASKS}
     return {
         "samples": len(samples),
         "sessions": len({sample.session_hash for sample in samples}),
@@ -93,7 +121,7 @@ def overview(samples: Sequence[LearningSample], *, now: float) -> dict[str, Any]
     summary: dict[str, Any] = {"window_days": OVERVIEW_WINDOW_DAYS,
                                "samples_in_window": len(recent),
                                "samples_total": len(samples)}
-    for task in (TASK_RECIPIENT, TASK_TOPIC, TASK_REPLY):
+    for task in ANALYSED_TASKS:
         rows = [sample for sample in recent if sample.task == task]
         if not rows:
             summary[task] = {"total": 0, "accuracy": None, "note": SAMPLE_NOTE}
@@ -168,21 +196,37 @@ def analyze(
     with_tuning: bool = True,
     rules: TuneRules | None = None,
     now: float | None = None,
+    host_version: str | None = None,
 ) -> AnalysisResult:
     config = config or LearningConfig()
     stamp = now if now is not None else time.time()
     result = AnalysisResult(generated_at=stamp)
+    result.dataset_gate = dataset_gate(samples, config=config, now=stamp)
+    result.shadow = evaluate_shadow(samples, rules=rules_from_config(config),
+                                    min_samples=config.gate_min_samples)
     result.dataset = dataset_summary(samples)
     result.overview = overview(samples, now=stamp)
     result.errors = error_breakdown(samples)
+    result.attribution = attribution_report(samples, min_samples=config.min_samples_for_evaluation)
     result.recipient = learn_recipient(samples, config=config)
     result.topic = learn_topic(samples, config=config)
 
     evaluation: EvaluationReport | None = None
+    forward: EvaluationReport | None = None
     if with_evaluation:
         evaluation = evaluate_dataset(samples, config=config, baseline_policy=baseline_policy,
-                                      existing_versions=existing_versions, now=stamp)
+                                      existing_versions=existing_versions, now=stamp,
+                                      host_version=host_version)
         result.evaluation = evaluation
+        if config.require_forward_validation:
+            forward = forward_evaluation(samples, config=config, baseline_policy=baseline_policy,
+                                         existing_versions=existing_versions, now=stamp,
+                                         host_version=host_version)
+            result.forward = forward
+        check = promotion_check(evaluation, forward, config=config)
+        result.promotion = check.as_dict()
+        if check.reasons:
+            result.notes.append("采纳门槛：" + check.reasons[0])
     verdict = evaluation.verdict if evaluation is not None else None
 
     # Tuning runs first: it is what decides promotion, and its verdict is what
@@ -194,6 +238,26 @@ def analyze(
             label = DECISION_LABEL.get(tuning.decision, tuning.decision)
             suffix = f"（{tuning.adopted_steps} 步采纳）" if tuning.adopted_steps else ""
             result.notes.append(f"{tuning.task} 迭代调参结论：{label}{suffix}；{tuning.stop_reason}")
+        # The tuning runs only saw the session holdout. A candidate they marked
+        # validated still has to clear the forward holdout and the interval, so
+        # the combination is applied *after* them rather than inside each run —
+        # one gate, one answer, and no way for two runs to disagree about it.
+        gate = result.promotion or {}
+        if gate.get("verdict") != VERDICT_ACCEPTED:
+            reason = (gate.get("reasons") or ["未通过采纳门槛"])[0]
+            for tuning in result.tuning:
+                if tuning.candidate is None:
+                    continue
+                if tuning.candidate.status != STATUS_VALIDATED:
+                    continue
+                tuning.candidate = tuning.candidate.with_status(
+                    STATUS_PROPOSED, now=stamp, reason=reason[:200])
+            if result.evaluation is not None and result.evaluation.candidate is not None \
+                    and result.evaluation.candidate.status == STATUS_VALIDATED:
+                result.evaluation.candidate = result.evaluation.candidate.with_status(
+                    STATUS_PROPOSED, now=stamp, reason=reason[:200])
+            if result.tuning:
+                result.notes.append("迭代结论本可采纳，但整体门槛未通过：" + reason)
         promoted = result.promoted_runs
         if promoted:
             result.notes.append(
@@ -215,11 +279,43 @@ def analyze(
                     tuning_by_task.get(owner) if owner is not None else None))
             else:
                 proposals.append(recommendation)
-    result.recommendations = proposals
+    if not result.dataset_gate.get("ok", True):
+        # The gate runs *before* the recommendations are handed out, and its
+        # effect is to make every parameter proposal non-actionable. The numbers
+        # stay visible — a reader still needs to see why the corpus was judged
+        # insufficient — but nothing here can be adopted from them.
+        blocked_by = result.dataset_gate.get("blocked_by") or []
+        result.recommendations = [
+            replace(row, confidence=CONFIDENCE_INSUFFICIENT,
+                    evidence={**dict(row.evidence), "dataset_gate": "blocked",
+                              "dataset_gate_checks": blocked_by})
+            for row in proposals
+        ]
+        result.notes.append("数据门槛未通过（" + "、".join(blocked_by)
+                            + "）：本次只出统计与诊断，不出可采纳的策略。")
+        for tuning in result.tuning:
+            if tuning.candidate is not None:
+                tuning.candidate = tuning.candidate.with_status(
+                    STATUS_PROPOSED, now=stamp, reason="数据门槛未通过")
+    else:
+        result.recommendations = proposals
     if not samples:
         result.notes.append("还没有学习样本。先在 ChatDynamics 回放页做人工标注，再回来执行导入。")
     result.notes.extend(result.recipient.notes[:2])
     result.notes.extend(result.topic.notes[:2])
+    result.notes.extend(result.attribution.get("notes", [])[:2])
+    shadow_gate = (result.shadow or {}).get("gate") or {}
+    if result.shadow.get("rows"):
+        result.notes.append(
+            "shadow A/B：" +
+            ("达到进入 active 的门槛。" if shadow_gate.get("ok")
+             else "未达进入 active 的门槛（" + "、".join(shadow_gate.get("blocked_by") or [])
+                  + "）。"))
+    if result.forward is not None:
+        result.notes.append(
+            "前向验证（按标注时间切分）：" +
+            ("通过。" if result.forward.verdict == VERDICT_ACCEPTED
+             else (result.forward.reasons[0] if result.forward.reasons else "未通过。")))
     return result
 
 
@@ -229,6 +325,6 @@ def policy_rows(policies: Sequence[PolicyCandidate]) -> list[dict[str, Any]]:
 
 
 __all__ = [
-    "OVERVIEW_WINDOW_DAYS", "AnalysisResult", "TuneRules", "TuneRun", "analyze", "dataset_summary",
-    "error_breakdown", "overview", "policy_rows",
+    "ANALYSED_TASKS", "OVERVIEW_WINDOW_DAYS", "AnalysisResult", "TuneRules", "TuneRun", "analyze",
+    "dataset_summary", "error_breakdown", "overview", "policy_rows",
 ]

@@ -109,7 +109,7 @@ async def test_store_round_trips_samples_and_index_rows():
     restored = await store.load_samples()
     assert [row.sample_id for row in restored] == [row.sample_id for row in rows]
     assert restored[0].features == rows[0].features
-    assert restored[0].trace.get("routing_schema_version") == 2
+    assert restored[0].trace.get("trace_schema_version") == 2
     assert len(await store.index_rows()) == 1
 
 
@@ -132,11 +132,17 @@ async def test_policies_are_versioned_and_immutable_by_copy():
     store = LearningStore(backend)
     candidate = candidate_from({"topic_commit_threshold": 0.62})
     await store.append_policy(candidate)
-    assert (await store.load_policies())[0].status == "candidate"
-    updated = await store.update_policy_status(candidate.version, "accepted")
-    assert updated is not None and updated.status == "accepted"
-    assert (await store.load_policies())[0].status == "accepted"
-    assert await store.update_policy_status("policy_v99", "accepted") is None
+    assert (await store.load_policies())[0].status == "proposed"
+    # promoted is two arrows away from proposed, and the store refuses to skip.
+    with pytest.raises(ValueError):
+        await store.update_policy_status(candidate.version, "promoted")
+    updated = await store.update_policy_status(candidate.version, "validated")
+    assert updated is not None and updated.status == "validated"
+    assert (await store.load_policies())[0].status == "validated"
+    promoted = await store.update_policy_status(candidate.version, "promoted")
+    assert promoted is not None and promoted.status == "promoted"
+    assert promoted.status_history[-1]["to"] == "promoted"
+    assert await store.update_policy_status("policy_v99", "validated") is None
     assert POLICY_KEY in backend.data
 
 
