@@ -510,9 +510,11 @@ def _read_schema(raw: Mapping[str, Any]) -> int:
     anything. It is reported as unreadable instead.
     """
     value = declared_schema_value(raw)
-    if isinstance(value, bool) or not isinstance(value, int):
-        return 0
-    return value
+    # `bool` is an `int` subclass, and JSON `true` is not version 1. The
+    # positive form is also what narrows `Any` to `int` for the type checker.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return 0
 
 
 def _read_candidates(raw: Mapping[str, Any]) -> tuple[tuple[CandidateRecord, ...], bool]:
