@@ -4,23 +4,32 @@ short_desc: ChatDynamics 的行为学习层：把人工标注与运行结果变�
 desc: |
   Dynamics Learning 是 ChatDynamics 的附属插件，对本体的运行状态只读。
 
-  它把 ChatDynamics 已有的决策轨迹与人工标注转换成统一学习样本，分别统计话题、
-  对话对象与参与时机的误差模式，生成有界、可解释的参数建议，并用离线回放评测
-  对比 baseline 与 candidate；只有候选在留出集上胜出才标记为可采纳。
+  它把 ChatDynamics 已有的决策轨迹与人工标注转换成统一学习样本，把每条被标注
+  的消息归入唯一一层（收件人 / 候选生成 / 排序 / 参与准入 / 门禁 / 生成 / 发送），
+  生成有界、可解释的参数建议，并用会话留出集 + 时间前向留出集双重评测。
+
+  回复学习分成两层：回复准入（level == strong，该不该进入回复流程）与最终发送
+  （schema 3 的 outcome.delivered，最后有没有真的发出去）。被作息 / 降温 / 媒体
+  压掉的发送因此不再被算成「路由漏回复」——那不是路由的决定。
 
   调参采用小步累计：单步 ±5%、累计 ±15%、最多 3 步，并用目标错误类型（误拆分 /
-  误合并 / 漏识别 / 误触发）判断调整是否成功，而不是只看总准确率。
+  误合并 / 漏识别 / 误触发）判断调整是否成功，而不是只看总准确率。提升要给出
+  按会话重采样的 95% 置信区间；区间跨 0 就不给可采纳结论。
 
   Shadow Learning：只学习、只分析、只推荐，不会自动修改 ChatDynamics 的线上配置，
-  也不会写入本体的任何数据。
+  也不会写入本体的任何数据。策略记录走 proposed -> validated -> shadow -> promoted
+  状态机，只有 promoted 会出现在 /published，是否采用由本体决定。
 
-  控制台分两个视图：总览（样本、契约健康度、建议、调参与评测）与会话画像
-  （逐个会话看「被人工检查过的样本里系统经常错在哪里」，用 leave-one-out 基线对比）。
+  控制台分两个视图：总览（数据门槛、契约健康度、错误归因链、建议、调参与评测）
+  与会话画像（逐个会话看「被人工检查过的样本里系统经常错在哪里」，用
+  leave-one-out 基线对比）。
 
-  需要 ChatDynamics 提供 topic_annotations_v1_* 与 panel_runtime_v1 两类共享首选项；
-  话题候选集（routing.topic_candidates）记录得越完整，候选召回与错误归因越准。
+  需要 ChatDynamics 提供 topic_annotations_v1_* 与 panel_runtime_v1 两类共享首选项。
+  本体写 schema 3 决策轨迹（topic_candidates / selected_topic / outcome）时，
+  候选逐条证据与最终发送结果才可用；schema 2 记录会被明确标成
+  outcome_unavailable 与 candidate_evidence_partial，不会假装有这些字段。
   画像的作用域当前等于会话：本体契约没有提供跨会话的群身份。
-version: v0.7.0
+version: v1.0.0
 author: ysyhlly
 astrbot_version: ">=4.16,<5"
 tags:

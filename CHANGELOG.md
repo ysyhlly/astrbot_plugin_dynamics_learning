@@ -1,5 +1,237 @@
 # Changelog
 
+## v1.0.0 — Shadow A/B：分歧子集评估与进入 active 的门槛
+
+- 独立 candidate API/KV 提供 validated/shadow 策略用于真实影子观察，published 仍只提供 promoted。
+- 增加 Operational Shadow Coverage：读取独立无正文 telemetry，去重后按策略、本体版本、原因、会话与时段统计，保留窗口分母与人工标签收益分开显示。
+
+这一版把闭环补上：本体在 `shadow` 模式下**不改行为**，但每条消息会同时算出
+「baseline 会怎么判」与「策略会怎么判」，学习层据此回答唯一值得问的问题 ——
+**策略在它影响的那些样本上，是不是比 baseline 更对。**
+
+### 为什么不是看总体准确率
+
+阈值动几个百分点时 95% 以上的判定完全一样，所以总体变化是策略效果被稀释之后的结果：
+
+```text
+10,000 条，分歧 320 条
+总体变化   +0.5pp     同样的 320 条，摊到 10,000 条上
+子集变化  +15.9pp     它在真正被影响的样本上的效果
+```
+
+新增 `core/shadow.py`：`shadow_rows`（按**消息**分组，不是按样本 —— 一条消息最多产出四个样本，
+按样本读会把同一次比较最多算四遍）、`disagreement_table`、`evaluate_shadow`。
+
+### 配对表是四格划分，而且会自报守恒
+
+```text
+                 shadow 对        shadow 错
+baseline 对      both_correct     baseline_only    ← 策略的代价
+baseline 错      shadow_only      both_wrong
+                 ↑ 策略的收益
+```
+
+两个非对角格正好就是分歧子集，因此 `changed == baseline_only + shadow_only` 恒成立。
+`balanced` 字段自报这个恒等式，测试也钉住它 —— 一张加不起来的表会让所有从它推出来的
+数字失去意义。写这一版时发现第一版实现把 `both_correct` / `both_wrong` 算在**分歧子集**
+上，而二元判定下那两格在分歧子集里恒为 0：现在它们算在全部带标签消息上，是真正的划分。
+
+### 进入 active 的门槛
+
+八项检查，每项都自报测量值（只报失败的门槛读不出「没有失败」和「什么都没跑」的区别）：
+样本量、分歧量、总体回退、目标改善、区间下界、会话数、活跃时段、子群灾难性回退，
+外加一条 `net_gain > 0`。
+
+`net_gain` 单独成一条，是因为「赢的没输的多」是最难被总体数字发现的失败：40 条赢、
+60 条输、9,900 条两边都对时，总体只动 −0.2pp，轻松通过 1% 的回退上限。
+
+相对错误率那一支加了一个下限：基线错误率低于 5% 时不给相对改善——0.3% → 0% 是 100% 的
+相对改善，也是 0.3pp，让这种数字满足「好 10%」会让规则在语料本来就好的地方失效。
+
+### 活跃时段用决策时间，不是标注时间
+
+`shadow.recorded_at` 是本体做判定时的墙钟时间；样本时间戳是**人工标注**的时刻。
+一个晚上集中复查一周的消息，按标注时间会被算成同一个时段。
+
+### 契约与接口
+
+- schema 3 轨迹新增 `shadow` 段（`policy_id` / 两个阈值 / 两个判定 / `changed` /
+  `score` / 两侧 margin / `reason`）；`reason` 说明两边为什么一致
+  （`structural` / `early_return` / `ambient`）；
+- `EntityTrace.shadow` 与 `LearningSample.shadow`，与其他 schema 3 事实一样写在每条样本上；
+- 契约面新增 `shadow.present` / `shadow.absent` 计数：本体对**每条**处理过的消息都记录了
+  比较，但只有人工标注过的那些会成为样本，这两个计数是防止把 320 读成总体规模；
+- 新增 `GET /shadow`；控制台新增「Shadow A/B：分歧子集」卡片；
+- 10 个新配置键（`learning_shadow_*`）把门槛全部参数化。
+
+### 跨仓库验证
+
+`tests/test_cross_repo_contract.py` 新增两条：本体算出的 shadow 判定经真实
+`build_routing_trace` 冻结、被学习层读成一次分歧；以及结构化轮次在两边都被认成
+「同一判定」（`reason=structural`、`changed=false`）—— 两边的 admission 规则必须是同一件事，
+否则分歧子集在契约两侧会是两个不同的集合。
+
+## v0.9.0 — 归因链、双层回复与前向验证
+
+这一版回答的问题从「还能算什么指标」变成「**该改哪一层**」。计划里把 Learning 侧拆成
+v0.7.0（Outcome Learning）与 v0.8.0（Forward Validation + Confidence）两步；本仓库的
+v0.7.0 已经是会话画像，因此两项合并在 v0.9.0 交付。
+
+### P0-1 支持 ChatDynamics schema v3
+
+`core/trace.py` 现在有两个 reader 加一层归一化，而不是「有什么读什么」：
+
+| reader | 触发条件 |
+| --- | --- |
+| `read_schema_v2` | `trace_schema_version == 2` |
+| `read_schema_v3` | `trace_schema_version == 3` |
+| `normalize_trace` | 按记录的版本分发；版本缺失或不认识时按 schema 2 字段集读取并置 `degraded` |
+
+新版正式消费 `routing.topic_candidates`（含逐条 `evidence`）、`routing.selected_topic`
+与 `outcome.{final_outcome, delivered, suppression_reason, stage}`。两条规则：
+
+1. **自描述字段照读。** `routing` / `outcome` 的键名本身说明含义，即使版本号没跟上也会
+   被读取 —— 丢掉本体真写过的事实比版本不符更糟；
+2. **版本决定证据等级。** 只有声明 schema 3 的记录才可能达到 `candidate_evidence = full`。
+
+写回时写的是**读到的那个版本**，所以 schema 2 样本往返后仍是 schema 2，不会凭空长出
+本体没写过的字段。
+
+### P0-2 两个显式降级标记
+
+schema 2 记录被明确标成 `outcome_unavailable` 与 `candidate_evidence_partial`，
+而不是静默留空。`candidate_evidence` 是三值（`full` / `partial` / `none`）：
+`none` 比 `partial` 更降级（连候选集都没有），两者都让 partial 标记为真。
+
+抑制原因是**开放词表**：本体新增一个 `reason_code` 时不会被归进「门禁压制」，而是记成
+`unknown` 并计数 —— 加一个原因应当表现为一个未分类的码，而不是一次静默的门禁压制。
+
+### P0-3 回复学习拆成两层
+
+| 任务 | 预测目标 | 回答 |
+| --- | --- | --- |
+| `reply_admission` | `participation.level == strong` | 该不该进入回复流程 |
+| `reply_outcome` | `outcome.delivered` | 最后到底有没有发出去 |
+
+拆开的原因是一个具体的误判：**准入正确但被作息 / 降温压掉的发送，以前和真正的路由漏回复
+长得一模一样**，因为 schema 2 里根本没有最终结果。现在：
+
+- 没有结果就**不产生** `reply_outcome` 样本（schema 2 数据下该任务为空，而不是一列编出来的
+  `silent`）；
+- 最终发送层**不可回放**：门禁、生成与平台发送都不在轨迹里，它只报告事实，不参与阈值回放
+  与可采纳结论；
+- 同名错误不再复用：准入层漏回复叫 `missed_reply`，发送层漏发送叫 `undelivered_reply`。
+
+旧样本的 `task == "reply"` 按准入任务加载（它一直都是准入问题），`sample_id` 保持不变。
+
+### P0-4 完整错误归因链
+
+`core/attribution.py`：每条**被标注的消息**归入唯一一格，合计等于语料规模。
+
+    recipient_error / topic_candidate_miss / topic_ranking_error / participation_error
+    gate_suppression / generation_failure / delivery_failure / unattributable / ok
+
+三条硬约束：桶是**划分**（不会悄悄变小）；这是**复查顺序而不是因果结论**（同时错在两处的
+消息只记最先一格，另一处进 `also_failed`）；**没记结果 ≠ 没回复**（落在 `ok` 并带
+`outcome_unavailable`，绝不进失败桶）。话题那一格复用 `candidate_observations` 自己的
+判定，避免两份实现印出两个都带数字的答案。
+
+### P1 前向验证、置信区间、数据门槛、分层诊断
+
+- **时间前向留出集**：按标注时间切，旧段训练、新段验证。会话留出集问「换到没见过的会话
+  还成立吗」，前向留出集问「换到更晚的数据还成立吗」，**两个都要过**；
+- **按会话成对 bootstrap**：输出 `+0.8% 95% CI [-0.2%, +1.9%]` 而不是一个点估计；
+  区间跨 0 即判定「与噪声无法区分」，不给可采纳结论。重采样单位是会话而不是样本 ——
+  同一段对话的两条消息共享话题与情绪，按样本重采样会得到一个恰好窄掉聚集程度的区间；
+- **数据门槛**在任何学习之前跑：样本量、会话数、标注年龄是阻塞项；正负比例、轨迹降级率、
+  候选覆盖率、结果覆盖率是限定条件（它们只限定对应方向，不该一票否决另一个方向）。
+  不通过就**完全不产生策略记录**，连 `proposed` 都不记 —— 否则控制台里会躺着一个
+  等着被点的版本号；
+- **按会话分层诊断**：指出全局变好时哪些会话反而变差了，并且**不产生本地策略**：
+  在一个会话上拟合出的阈值是记住对话，不是学会相处。
+
+### P1.5 策略状态机与发布面
+
+    proposed → validated → shadow → promoted → superseded / rolled_back
+
+自动路径最多到 `validated`：评测能证明离线提升，证明不了它没见过的门禁、生成与平台。
+`validated → promoted` 允许，但**记下来**：发布记录带 `shadow_observed`，说明这份策略
+到底有没有被看着跑过。跳过箭头会被拒绝并说明两个状态名。
+
+`GET /published` 只发 `promoted` 的记录，发的是**解析后的全部参数**而不是增量：
+只发增量的消费者得自己补全其余项，而那个补全会静默变成它实际应用的值。
+
+策略记录新增 `training_dataset` / `holdout_result` / `forward_result` / `target_error` /
+`collateral_regressions` / `confidence` / `compatibility` / `status_history`。
+旧状态词按语义映射：`candidate → proposed`，`accepted → validated`（旧 `accepted`
+是评测结论，从未发布给本体，因此不是 `promoted`）。
+
+### 界面
+
+新增「错误归因链」卡片；离线评测区增加置信区间列、采纳门槛块与按会话分层表；数据契约区
+增加数据门槛表；策略版本表增加验证结果列与状态机操作按钮。样本浏览的任务筛选改为
+`recipient` / `topic` / `reply_admission` / `reply_outcome`。
+
+### 契约命名：三个版本号，互不推导
+
+之前有个命名事故：`contract_version` 同时表示「本体写的 trace schema」和「本插件读取端的
+修订号」，读一次就要猜 4 指的是哪一个。现在拆开：
+
+| 名字 | 含义 | 谁改它 |
+| --- | --- | --- |
+| `trace.supported` / `trace.latest` | 本插件**能读**哪些 trace schema | 只有可读集合变化时 |
+| `trace.observed` | 本体**实际写了**哪些（分布） | 只有本体 |
+| `reader_version` | 本插件的读取端修订号（重置为 1） | 本插件 |
+| `policy_contract_version` | `/published` 的协议版本（= 1） | 本插件 |
+
+轨迹里的 schema 号也改由 `trace_schema_version` 承载：`routing_schema_version` 描述的是
+routing 段，而数字描述的是整条轨迹。旧键仍然读取（已落库的标注不能因此读成「未记录」），
+写回时只写新键。
+
+### 发布面
+
+`/published` 改为四段式，三个版本号各自归位：
+
+```json
+{
+  "policy_contract_version": 1,
+  "policy_id": "policy_v3",
+  "state": "promoted",
+  "source": { "trace_schema_version": 3, "dataset_fingerprint": "…", "learning_version": "0.9.0" },
+  "target": { "chat_dynamics_version": "v1.6.2", "baseline_config_hash": "…",
+              "validated_host_versions": ["v1.6.2"] },
+  "params": { "…": "全部参数" }
+}
+```
+
+- `dataset_fingerprint` 降级为**来源证明**：必须存在、必须记录与展示，但不再作为拒绝条件。
+  只有消费端显式配置 `expected_dataset_fingerprint` 时才做 pin 校验；真正适合「人为批准
+  锁定」的是 `policy_id`；
+- 兼容性靠**验证出来的** `validated_host_versions`，不做 SemVer 推断：1.7.0 → 1.7.1 可能
+  改掉一个参与度计算或门禁顺序，而这份文件里每个阈值都是对着旧分布校准的。列表今天只含
+  训练时观测到的那一个版本，本体没报版本时为空 —— 空列表是「无法验证」，不是「匹配」；
+- `active` 要求严格版本相等，`shadow` 允许 `version_mismatch` 但**绝不实际应用**（这条由
+  本体实现）。
+
+### 发布契约落成一个键
+
+`/published` 之外，发布契约现在也**物化**在共享首选项的 `learning_published_v1` 里
+（每次策略状态变化与每次分析结束时写入）。消费端读一个键就拿到商定好的契约，
+而不是自己从策略记录里重新推导一遍形状 —— 同一份契约两份实现，就是两次走样的机会，
+而走样的表现是「策略悄悄不生效」。清空存储时这个键一并删除。
+
+### 跨仓库契约测试
+
+新增 `tests/test_cross_repo_contract.py`：调用**真实**的 ChatDynamics
+`build_routing_trace`、`outcome_recorder` 与 `learning_policy`，覆盖完整闭环 ——
+本体写轨迹 → 学习层导入训练验证 → 产出 promoted 策略 → 发布 → 本体解析并确认
+would-override 与学习层发布的**逐键相同**。本体的包不在导入路径上时测试会 skip，
+而不是退回 fixture —— 一个会悄悄退化成 fixture 的跨仓库检查，正是它存在的理由的反面。
+
+这个测试当场抓到了一处真实的跨仓库耦合：本体的 `topic_commit_threshold` 配置字段默认
+0.0（由 `topic_join_threshold` 推导），而学习层的 `BASE_POLICY` 认为它是 0.58。
+不修的话每一份发布摘要都对不上，`active` 永远不可达，而且看起来像是「运营改过配置」。
+
 ## v0.7.0 — 会话画像：先说清楚它不是什么
 
 画像层回答的是「**在这个会话里，我人工检查过的那批消息，系统经常错在哪里**」。

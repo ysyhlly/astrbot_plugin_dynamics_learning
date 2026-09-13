@@ -8,6 +8,8 @@ const ENDPOINTS = {
   overview: "overview",
   samples: "samples",
   quality: "quality",
+  attribution: "attribution",
+  shadow: "shadow",
   scopes: "scopes",
   scope: "scope",
   ingest: "ingest",
@@ -22,7 +24,17 @@ const ENDPOINTS = {
 // the corpus cannot answer this question, which is a finding, not a failure.
 const CAP_STATUS_CLASS = { ok: "ok", warning: "warn", unsupported: "bad", insufficient: "" };
 
-const TASK_LABEL = { recipient: "对话对象", topic: "话题", reply: "回复准入" };
+// Two reply layers, because they are two questions: admission is "should this
+// have entered the reply flow" (the router's cut), outcome is "did anything
+// actually go out". A turn suppressed by 作息 is correct on the first and
+// negative on the second, and one label for both hid exactly that.
+const TASK_LABEL = {
+  recipient: "对话对象",
+  topic: "话题",
+  reply: "回复准入（旧）",
+  reply_admission: "回复准入",
+  reply_outcome: "最终发送",
+};
 const VERDICT_LABEL = {
   accepted: { text: "可采纳", cls: "ok" },
   rejected: { text: "拒绝", cls: "bad" },
@@ -34,7 +46,7 @@ const CONFIDENCE_LABEL = {
   moderate: "置信度中",
 };
 
-const state = { overview: null, report: null, quality: null, scopes: null, view: "overview" };
+const state = { overview: null, report: null, quality: null, attribution: null, scopes: null, view: "overview" };
 
 function $(id) {
   return document.getElementById(id);
@@ -121,7 +133,7 @@ function renderWindow(report) {
     host.innerHTML = '<p class="empty">还没有分析结果，先点「运行分析」。</p>';
     return;
   }
-  const rows = ["recipient", "topic", "reply"].map((task) => {
+  const rows = ["recipient", "topic", "reply_admission", "reply_outcome"].map((task) => {
     const row = (report.overview || {})[task] || {};
     const label = TASK_LABEL[task] || task;
     return statCard(label, row.total ? pct(row.accuracy) : "—", `标注 ${row.total ?? 0} 条`);
@@ -245,6 +257,171 @@ function renderCandidates(report) {
   </article>`;
 }
 
+// ---- error attribution chain -------------------------------------------
+//
+// One row per bucket, and one bucket per message. The table is a review order,
+// not a causal claim: it answers "which layer do I open first", and a message
+// that failed two layers still appears once — the second failure is listed
+// under 「同时出错」 rather than inflating the counts.
+
+const BUCKET_CLASS = {
+  ok: "ok",
+  recipient_error: "bad",
+  topic_candidate_miss: "bad",
+  topic_ranking_error: "warn",
+  participation_error: "warn",
+  gate_suppression: "",
+  generation_failure: "",
+  delivery_failure: "",
+  unattributable: "",
+};
+
+function renderAttribution(data) {
+  const host = $("attribution");
+  if (!data || !data.messages) {
+    host.innerHTML = '<p class="empty">还没有可归因的消息，先导入标注。</p>';
+    return;
+  }
+  const counts = data.counts || {};
+  const rates = data.rates || {};
+  const labels = data.labels || {};
+  const actions = data.actions || {};
+  const rows = Object.keys(labels).map((bucket) => {
+    const count = counts[bucket] ?? 0;
+    return `<tr>
+      <td>` + esc(labels[bucket]) + `<div class="sub">` + esc(bucket) + `</div></td>
+      <td><span class="tag ` + (BUCKET_CLASS[bucket] || "") + `">` + esc(count) + `</span></td>
+      <td class="num">` + (count ? pct(rates[bucket]) : "—") + `</td>
+      <td>` + esc(actions[bucket] || "") + `</td>
+    </tr>`;
+  }).join("");
+  const coverage = data.coverage || {};
+  const also = Object.entries(data.also_failed || {}).map(([bucket, count]) =>
+    esc(labels[bucket] || bucket) + " ×" + esc(count)).join("、");
+  const reasons = Object.entries(data.suppression_reasons || {}).map(([reason, count]) =>
+    esc(reason) + " ×" + esc(count)).join("、");
+  const examples = (data.examples || []).slice(0, 5).map((row) => `<li>
+      <span class="tag ` + (BUCKET_CLASS[row.bucket] || "") + `">` + esc(row.bucket_label) + `</span>
+      ` + esc(row.reason || "—") + `</li>`).join("");
+  host.innerHTML = `<div class="grid">
+      ` + statCard("可归因消息", data.messages,
+        "链路覆盖：话题 " + (coverage.topic ?? 0) + " · 回复 " + (coverage.admission ?? 0)
+        + " · 最终结果 " + (coverage.outcome ?? 0)) + `
+      ` + statCard("模型错误", data.model_errors,
+        "收件人 / 候选生成 / 排序 / 参与准入，占 " + pct(data.model_error_rate)) + `
+      ` + statCard("系统事件", data.system_events,
+        "门禁 / 生成 / 发送，占 " + pct(data.system_event_rate)) + `
+      ` + statCard("没有最终结果记录", data.outcome_unavailable,
+        "schema 2 记录：只能归因到路由层") + `
+    </div>
+    <div class="table-host"><table><thead><tr>
+      <th>归因</th><th>条数</th><th class="num">占比</th><th>该改哪一层</th>
+    </tr></thead><tbody>` + rows + `</tbody></table></div>
+    ` + (also ? `<p class="hint">同时出错（未计入上面的条数）：` + also + `</p>` : "") + `
+    ` + (reasons ? `<p class="hint">压制原因：` + reasons + `</p>` : "") + `
+    ` + (examples ? `<ul class="bullets">` + examples + `</ul>` : "") + `
+    <p class="hint">` + (data.notes || []).map(esc).join("<br />") + `</p>`;
+}
+
+// ---- shadow A/B ---------------------------------------------------------
+//
+// The table is a 2x2 over the labelled turns: whether each decision was right.
+// The two off-diagonal cells are the disagreement subset, and that is the only
+// place the policy's effect exists — the diagonal is where the two decisions
+// agreed and therefore where nothing about the policy can be learned.
+
+const SHADOW_CELLS = [
+  { key: "both_correct", label: "两边都对", note: "两个判定一致，与策略无关" },
+  { key: "both_wrong", label: "两边都错", note: "两个判定一致，与策略无关" },
+  { key: "baseline_only", label: "只有 baseline 对", note: "策略的代价" },
+  { key: "shadow_only", label: "只有 shadow 对", note: "策略的收益" },
+];
+
+function renderOperationalShadow(data) {
+  const host = $("shadowOperational");
+  if (data && data.source_status === "unavailable") {
+    host.innerHTML = '<p class="empty">读取 shadow telemetry 失败，请稍后重试；此状态不表示零比较。</p>';
+    return;
+  }
+  if (!data || !data.available) {
+    host.innerHTML = '<p class="empty">尚未收到独立 shadow telemetry 快照。</p>';
+    return;
+  }
+  const window = data.window || {};
+  const timestamp = (value) => typeof value === "number" && Number.isFinite(value)
+    ? new Date(value * 1000).toLocaleString() : "—";
+  const distribution = (title, rows, bucket = false) => `<h4>${esc(title)}</h4>
+    <div class="table-host"><table><thead><tr><th>分组</th><th>比较</th><th>分歧</th><th>分歧率</th></tr></thead><tbody>`
+    + (rows || []).map((row) => `<tr><td>${esc(bucket ? row.policy_id + " / " + row.host_version : row.key)}</td>
+      <td>${esc(row.comparisons)}</td><td>${esc(row.disagreements)}</td><td>${pct(row.disagreement_rate)}</td></tr>`).join("")
+    + `</tbody></table></div>`;
+  host.innerHTML = `<div class="grid">`
+    + statCard("真实比较", data.comparisons, "保留窗口内去重、校验后的独立记录")
+    + statCard("真实分歧", data.disagreements, "分歧率 " + pct(data.disagreement_rate))
+    + `</div><p class="hint">此分母仅覆盖保留窗口，不代表历史总流量，也不作为已标注训练样本。
+      保留 ${esc(window.retention_seconds)} 秒，最多 ${esc(window.max_records)} 条。
+      当前记录范围 ${esc(timestamp(window.from))} 至 ${esc(timestamp(window.to))}；快照更新 ${esc(timestamp(data.updated_at))}。
+      重复 ${esc(data.duplicates)} 条，无效 ${esc(data.invalid)} 条，过期 ${esc(data.expired)} 条。</p>`
+    + distribution("策略 / 本体版本", data.buckets, true)
+    + distribution("准入原因", data.by_reason)
+    + `<details><summary>会话与活跃时段分布</summary>`
+    + distribution("匿名会话", data.by_session)
+    + distribution("判定时段（UTC）", data.by_hour) + `</details>`;
+}
+
+function renderShadow(data) {
+  renderOperationalShadow(data && data.operational);
+  const host = $("shadow");
+  if (!data || !data.rows) {
+    host.innerHTML = '<p class="empty">还没有可评估的带标签 shadow 样本；真实比较覆盖见上方。</p>';
+    return;
+  }
+  const table = data.table || {};
+  const labelled = table.labelled ?? 0;
+  const rows = SHADOW_CELLS.map((cell) => `<tr>
+      <td>` + esc(cell.label) + `<div class="sub">` + esc(cell.key) + `</div></td>
+      <td class="num">` + esc(table[cell.key] ?? 0) + `</td>
+      <td>` + esc(cell.note) + `</td>
+    </tr>`).join("");
+  const gate = data.gate || {};
+  const GATE_CLASS = { ok: "ok", warn: "warn", block: "bad" };
+  const checks = (gate.checks || []).map((row) => `<tr>
+      <td>` + esc(row.name) + `</td>
+      <td><span class="tag ` + (GATE_CLASS[row.status] || "") + `">` + esc(row.status) + `</span></td>
+      <td>` + esc(row.detail) + `</td>
+    </tr>`).join("");
+  const net = table.net_gain ?? 0;
+  host.innerHTML = `<div class="grid">
+      ` + statCard("记录 shadow 的消息", data.rows,
+        "其中带人工标签 " + labelled + " 条；只有带标签的才能判对错") + `
+      ` + statCard("策略产生分歧", table.changed ?? 0,
+        "占比 " + pct(table.changed_rate) + "；其余 " + esc(table.same ?? 0) + " 条两个判定一致") + `
+      ` + statCard("净收益", (net >= 0 ? "+" : "") + net,
+        "分歧里 shadow 多赢 " + esc(table.shadow_only ?? 0) + " 条、多输 "
+        + esc(table.baseline_only ?? 0) + " 条") + `
+      ` + statCard("总体准确率", pct(table.overall_shadow_accuracy),
+        "baseline " + pct(table.overall_baseline_accuracy) + "（被那 "
+        + pct(table.changed_rate) + " 的分歧稀释）") + `
+    </div>
+    <div class="table-host"><table><thead><tr>
+      <th>配对结果</th><th class="num">条数</th><th>含义</th>
+    </tr></thead><tbody>` + rows + `</tbody></table></div>
+    <p class="hint">分歧子集上的准确率：baseline ` + pct(table.subset_baseline_accuracy)
+      + ` → shadow ` + pct(table.subset_shadow_accuracy) + `；
+      95% 区间 ` + esc((data.interval || {}).lower === null || (data.interval || {}).lower === undefined
+        ? "—"
+        : "[" + num(data.interval.lower, 4) + ", " + num(data.interval.upper, 4) + "]") + `
+      ` + ((data.interval || {}).crosses_zero ? "（跨 0）" : "") + `。
+      覆盖 ` + esc(data.sessions ?? 0) + ` 个会话、` + esc(data.active_hours ?? 0)
+      + ` 个活跃时段。</p>
+    <article class="rec ` + (gate.ok ? "actionable" : "diagnostic") + `">
+      <h3>进入 active 的门槛：` + (gate.ok ? "已通过" : "未通过") + `</h3>
+      <div class="table-host"><table><thead><tr><th>检查</th><th>状态</th><th>说明</th></tr></thead>
+        <tbody>` + checks + `</tbody></table></div>
+    </article>
+    <p class="hint">` + (data.notes || []).map(esc).join("<br />") + `</p>`;
+}
+
 function renderTuning(report) {
   const host = $("tuning");
   const runs = (report && report.tuning) || [];
@@ -313,6 +490,7 @@ function renderEvaluation(report) {
   const tasks = Object.values(evaluation.tasks || {});
   const table = tasks.length ? `<table><thead><tr>
       <th>任务</th><th>指标</th><th class="num">baseline</th><th class="num">candidate</th><th class="num">变化</th>
+      <th>95% 置信区间（按会话重采样）</th>
     </tr></thead><tbody>${tasks.map((task) => Object.entries(task.deltas || {}).map(([metric, row], index) => `
       <tr>
         <td>${index === 0 ? esc(TASK_LABEL[task.task] || task.task) + ` (${task.holdout})` : ""}</td>
@@ -320,6 +498,10 @@ function renderEvaluation(report) {
         <td class="num">${num(row.before)}</td>
         <td class="num">${num(row.after)}</td>
         <td class="num">${row.delta === null ? "—" : (row.delta >= 0 ? "+" : "") + num(row.delta)}</td>
+        <td>${metric === task.primary_metric
+          ? esc(task.interval || "—") + ((task.bootstrap || {}).crosses_zero
+            ? ` <span class="tag bad">跨 0</span>` : "")
+          : ""}</td>
       </tr>`).join("")).join("")}</tbody></table>` : '<p class="empty">没有可评测的任务。</p>';
 
   const candidate = evaluation.candidate;
@@ -352,7 +534,80 @@ function renderEvaluation(report) {
        </tr>`).join("")}</tbody></table>`
     : "";
 
-  host.innerHTML = head + table + candidateBlock + learnedBlock;
+  const gate = (report && report.promotion) || {};
+  const forward = report && report.forward;
+  const gateBlock = `<article class="rec ${gate.verdict === "accepted" ? "actionable" : "diagnostic"}">
+    <h3>采纳门槛：${esc((VERDICT_LABEL[gate.verdict] || {}).text || gate.verdict || "—")}</h3>
+    <p class="rationale">${(gate.reasons || []).map(esc).join("<br />")}</p>
+    <div class="meta">
+      <span class="tag">会话留出集：${esc((VERDICT_LABEL[gate.session_verdict] || {}).text || gate.session_verdict || "—")}</span>
+      <span class="tag">前向验证：${esc((VERDICT_LABEL[gate.forward_verdict] || {}).text || gate.forward_verdict || "未运行")}</span>
+      ${gate.interval ? `<span class="tag">${esc(gate.interval)}</span>` : ""}
+    </div>
+    <p class="hint">会话留出集回答「换到没见过的会话还成立吗」，前向验证回答「换到更晚的数据还成立吗」；
+    区间跨 0 时不下可采纳结论。</p>
+    ${forward ? `<p class="hint">前向切分：训练 ${forward.split.train_samples} 条 /
+      留出 ${forward.split.holdout_samples} 条（按标注时间，同一会话可能跨边界）</p>` : ""}
+  </article>`;
+
+  const strata = tasks
+    .map((task) => ({ task: task.task, rows: ((task.strata || {}).groups || []).filter((row) => row.eligible) }))
+    .filter((entry) => entry.rows.length);
+  const strataBlock = strata.length
+    ? `<h3 class="hint">按会话分层（只诊断，不产生本地策略）</h3>`
+      + strata.map((entry) => `<table><thead><tr><th>${esc(TASK_LABEL[entry.task] || entry.task)}</th>
+        <th class="num">支撑</th><th class="num">baseline</th><th class="num">candidate</th><th class="num">变化</th></tr></thead>
+        <tbody>${entry.rows.slice(0, 8).map((row) => `<tr>
+          <td>${esc(row.group.slice(0, 12))}</td>
+          <td class="num">${esc(row.support)}</td>
+          <td class="num">${num(row.baseline)}</td>
+          <td class="num">${num(row.candidate)}</td>
+          <td class="num">${(row.delta >= 0 ? "+" : "") + num(row.delta)}</td>
+        </tr>`).join("")}</tbody></table>`).join("")
+    : "";
+
+  host.innerHTML = head + gateBlock + table + candidateBlock + strataBlock + learnedBlock;
+}
+
+// The state machine's actions. "采纳" moves a record to promoted, which is the
+// only state /published offers to ChatDynamics — and even then the host decides
+// whether to read it.
+const POLICY_ACTIONS = [
+  { action: "validate", label: "标记已验证" },
+  { action: "shadow", label: "影子观察" },
+  { action: "accept", label: "采纳" },
+  { action: "ignore", label: "忽略" },
+  { action: "rollback", label: "回滚" },
+];
+
+const POLICY_STATUS_CLASS = {
+  proposed: "",
+  validated: "warn",
+  shadow: "warn",
+  promoted: "ok",
+  superseded: "",
+  rolled_back: "bad",
+  rejected: "bad",
+};
+
+function policyEvidence(row) {
+  const holdout = row.holdout_result || {};
+  const parts = [];
+  if (holdout.primary_metric) {
+    const delta = holdout.cumulative_delta;
+    parts.push("留出集 " + esc(holdout.primary_metric) + " "
+      + (delta === null || delta === undefined ? "—" : money(delta)));
+  }
+  if (row.target_error) parts.push("目标错误 " + esc(row.target_error));
+  if (row.forward_result && Object.keys(row.forward_result).length) {
+    parts.push("已做前向验证");
+  } else {
+    parts.push("未做前向验证");
+  }
+  if ((row.collateral_regressions || []).length) {
+    parts.push("附带变化 " + esc(row.collateral_regressions.join("、")));
+  }
+  return parts.join("<br />");
 }
 
 function renderPolicies(data) {
@@ -362,18 +617,25 @@ function renderPolicies(data) {
     host.innerHTML = '<p class="empty">还没有策略记录。</p>';
     return;
   }
-  host.innerHTML = `<table><thead><tr><th>版本</th><th>状态</th><th>来源</th><th>参数变化</th><th>操作</th></tr></thead>
-    <tbody>${rows.map((row) => `<tr>
+  const published = (data.published || []).length;
+  host.innerHTML = `` + statCard("策略记录", data.total ?? rows.length,
+      "状态分布：" + Object.entries(data.status_counts || {})
+        .map(([key, value]) => key + " " + value).join(" / ")) + `
+    ` + statCard("已发布给本体", published,
+      "只有 promoted 会出现在 /published；是否采用由 ChatDynamics 决定") + `
+    <table><thead><tr><th>版本</th><th>状态</th><th>来源</th><th>参数变化</th>
+      <th>验证结果</th><th>操作</th></tr></thead>
+    <tbody>${rows.map((row) => {
+      const cls = POLICY_STATUS_CLASS[row.status] || "";
+      return `<tr>
       <td>${esc(row.version)}</td>
-      <td><span class="tag ${row.status === "accepted" ? "ok" : row.status === "rejected" ? "bad" : ""}">${esc(row.status)}</span></td>
+      <td><span class="tag ${cls}">${esc(row.status_label || row.status)}</span></td>
       <td>${esc(row.source)}</td>
       <td>${(row.deltas || []).map((d) => `${esc(d.param)} ${num(d.before)}→${num(d.after)}`).join("<br />") || "—"}</td>
-      <td>
-        <button class="btn small" data-policy="${esc(row.version)}" data-action="accept">采纳</button>
-        <button class="btn small" data-policy="${esc(row.version)}" data-action="ignore">忽略</button>
-        <button class="btn small" data-policy="${esc(row.version)}" data-action="rollback">回滚</button>
-      </td>
-    </tr>`).join("")}</tbody></table>`;
+      <td class="sub">${policyEvidence(row)}</td>
+      <td>${POLICY_ACTIONS.map((item) => `<button class="btn small" data-policy="${esc(row.version)}" data-action="${item.action}">${item.label}</button>`).join("")}</td>
+    </tr>`;
+    }).join("")}</tbody></table>`;
 }
 
 function renderSamples(data) {
@@ -435,6 +697,23 @@ function renderQuality(data) {
     </tr>`;
   }).join("");
   const blocked = (data.blocked || []).map((line) => `<li>${esc(line)}</li>`).join("");
+  // The pre-learning gate. It is published with quality, not with the report, so
+  // a reader can see why a corpus will produce no policy BEFORE running one.
+  const gate = data.dataset_gate || {};
+  const GATE_CLASS = { ok: "ok", warn: "warn", block: "bad" };
+  const gateRows = (gate.checks || []).map((row) => `<tr>
+      <td>${esc(row.name)}<div class="sub">${row.blocking ? "阻塞项" : "限定条件"}</div></td>
+      <td><span class="tag ${GATE_CLASS[row.status] || ""}">${esc(row.status)}</span></td>
+      <td>${esc(row.detail)}</td>
+    </tr>`).join("");
+  const gateBlock = (gate.checks || []).length
+    ? `<article class="rec">
+        <h3>数据门槛：${gate.ok ? "通过" : "未通过，本次不出策略"}</h3>
+        <p class="rationale">${esc(gate.summary || "")}</p>
+        <div class="table-host"><table><thead><tr><th>检查</th><th>状态</th><th>说明</th></tr></thead>
+          <tbody>${gateRows}</tbody></table></div>
+      </article>`
+    : "";
   const findings = (data.contract_findings || []).map((line) => `<li>${esc(line)}</li>`).join("");
   host.innerHTML = `<div class="grid">
       ${statCard("样本", dataset.samples ?? 0, `会话 ${dataset.sessions ?? 0} · 作用域 ${dataset.scopes ?? 0}（${dataset.scope_level || "session"}）`)}
@@ -444,6 +723,7 @@ function renderQuality(data) {
     <div class="table-host"><table><thead><tr>
       <th>能力</th><th>状态</th><th class="num">覆盖</th><th class="num">可用/合计</th><th>说明</th>
     </tr></thead><tbody>${rows}</tbody></table></div>
+    ${gateBlock}
     ${blocked ? `<div class="rec diagnostic"><h3>当前不支持的分析</h3><ul class="bullets">${blocked}</ul></div>` : ""}
     <p class="hint">契约面：${esc(contractLine(data.contract))}</p>
     ${findings ? `<ul class="bullets">${findings}</ul>` : ""}
@@ -554,18 +834,23 @@ function setView(view) {
 
 async function refresh() {
   try {
-    const [overview, report, policies, quality] = await Promise.all([
+    const [overview, report, policies, quality, attribution, shadow] = await Promise.all([
       call(ENDPOINTS.overview),
       call(ENDPOINTS.report),
       call(ENDPOINTS.policies),
       call(ENDPOINTS.quality),
+      call(ENDPOINTS.attribution),
+      call(ENDPOINTS.shadow),
     ]);
     state.overview = overview;
     state.report = report.report;
     state.quality = quality;
+    state.attribution = attribution;
     $("linkLamp").classList.add("on");
     $("linkLabel").textContent = "已连接";
     renderOverview(overview);
+    renderAttribution(attribution);
+    renderShadow(shadow);
     renderWindow(state.report);
     renderErrors(state.report);
     renderRecommendations(state.report);

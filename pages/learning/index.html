@@ -49,6 +49,33 @@
           <div id="candidates" class="stack"></div>
         </section>
 
+        <section class="card" data-view="overview" aria-labelledby="hShadow">
+          <h2 id="hShadow">Shadow A/B</h2>
+          <h3>Operational Shadow Coverage：真实比较覆盖</h3>
+          <div id="shadowOperational" class="stack"></div>
+          <h3>已标注样本：配对评估与分歧子集</h3>
+          <p class="hint">
+            本体把 <code>learning_policy_mode</code> 设为 <code>shadow</code> 且策略移动阈值时，会同时算出
+            「原本会怎么判」和「策略会怎么判」。这张表只关心两者<strong>不一致</strong>的那部分 ——
+            当 95% 的判定完全相同时，总体准确率会把策略的差异稀释掉。
+            「净收益」= shadow 在分歧里多赢的条数减去多输的条数；它不为止损，
+            就没有进入 <code>active</code> 的理由。
+          </p>
+          <div id="shadow" class="stack"></div>
+        </section>
+
+        <section class="card" data-view="overview" aria-labelledby="hAttribution">
+          <h2 id="hAttribution">错误归因链</h2>
+          <p class="hint">
+            每条被标注的消息归入<strong>唯一一格</strong>，从「谁在跟谁说」到「最后有没有发出去」。
+            这张表是<strong>复查顺序</strong>而不是因果结论：一条消息可能同时错在多环，
+            只记入最先的一格，其余列在「同时出错」。
+            「门禁压制 / 生成失败 / 发送失败」不是路由错误——把它们读成「漏回复」，
+            会去动一个没有错的阈值。
+          </p>
+          <div id="attribution" class="stack"></div>
+        </section>
+
         <section class="card" data-view="overview" aria-labelledby="hWindow">
           <h2 id="hWindow">最近 7 天标注表现</h2>
           <p class="hint">仅统计人工标注样本，不代表真实准确率。</p>
@@ -83,6 +110,8 @@
           <h2 id="hEval">离线评测（baseline vs candidate）</h2>
           <p class="hint">
             按会话切分留出集。回放的是记录轨迹上的决策函数，不是 ChatDynamics 路由器的完整重跑。
+            回复准入与最终发送是两个任务：前者回放路由准入判定，后者只报告已记录的事实
+            （门禁、生成、平台发送都不在记录轨迹里，无法回放）。
           </p>
           <div id="eval" class="stack"></div>
         </section>
@@ -100,7 +129,8 @@
                 <option value="">全部</option>
                 <option value="recipient">recipient</option>
                 <option value="topic">topic</option>
-                <option value="reply">reply</option>
+                <option value="reply_admission">reply_admission</option>
+                <option value="reply_outcome">reply_outcome</option>
               </select>
             </label>
             <button id="btnSamples" type="button" class="btn">加载样本</button>
@@ -131,7 +161,7 @@
       </main>
 
       <footer class="foot">
-        <span>Dynamics Learning v0.7.0 · Shadow Learning：只学习、只分析、只推荐。</span>
+        <span>Dynamics Learning v1.0.0 · Shadow Learning：只学习、只分析、只推荐。</span>
       </footer>
     </div>
     <script src="./app.js"></script>
