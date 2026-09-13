@@ -271,6 +271,9 @@ async def test_plugin_registers_every_endpoint_once(plugin):
     assert routes == {
         "/astrbot_plugin_dynamics_learning/overview",
         "/astrbot_plugin_dynamics_learning/samples",
+        "/astrbot_plugin_dynamics_learning/quality",
+        "/astrbot_plugin_dynamics_learning/scopes",
+        "/astrbot_plugin_dynamics_learning/scope",
         "/astrbot_plugin_dynamics_learning/ingest",
         "/astrbot_plugin_dynamics_learning/analyze",
         "/astrbot_plugin_dynamics_learning/report",
@@ -281,7 +284,49 @@ async def test_plugin_registers_every_endpoint_once(plugin):
     }
     assert plugin.web.registered is True
     plugin.web.register()
-    assert len(plugin.context.routes) == 9
+    assert len(plugin.context.routes) == 12
+
+
+def test_the_page_only_calls_endpoints_the_plugin_registers(plugin):
+    r"""The page is not compiled, so a mistyped endpoint fails silently in a browser.
+
+    The map in app.js must name routes the plugin actually registers, and must not
+    carry a declaration nothing calls. The reverse is deliberately not asserted:
+    the plugin exposes endpoints (reset, for one) that the page has no button for.
+    """
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "pages" / "learning" / "app.js") \
+        .read_text(encoding="utf-8")
+    block = re.search(r"const ENDPOINTS = \{(.*?)\};", source, flags=re.S)
+    assert block is not None, "app.js no longer declares an ENDPOINTS map"
+    declared = dict(re.findall(r"(\w+):\s*\"([^\"]+)\"", block.group(1)))
+    used = set(re.findall(r"ENDPOINTS\.(\w+)", source))
+
+    plugin.web.register()
+    registered = {route.rsplit("/", 1)[-1] for route, _h, _m, _d in plugin.context.routes}
+
+    assert used <= set(declared), "an endpoint is used but not declared"
+    assert set(declared) == used, "an endpoint is declared but never used"
+    assert set(declared.values()) <= registered, "the page calls a route the plugin does not serve"
+
+
+def test_the_page_script_only_touches_elements_the_page_has():
+    r"""A mistyped id is a null dereference in the browser and nothing at build time."""
+    import re
+    from pathlib import Path
+
+    pages = Path(__file__).resolve().parents[1] / "pages" / "learning"
+    markup = (pages / "index.html").read_text(encoding="utf-8")
+    script = (pages / "app.js").read_text(encoding="utf-8")
+    ids = set(re.findall(r'id="([^"]+)"', markup))
+    referenced = set(re.findall(r'\$("([^"]+)")', script))
+    views = set(re.findall(r'data-view="([^"]+)"', markup))
+    buttons = set(re.findall(r'data-view-btn="([^"]+)"', script))
+
+    assert referenced <= ids, sorted(referenced - ids)
+    assert buttons <= views, sorted(buttons - views)
 
 
 @pytest.mark.asyncio

@@ -27,9 +27,13 @@ from .candidates import (
 )
 from .config import LearningConfig
 from .features import FEATURE_SCHEMA_VERSION, build_features, feature_summary
-from .trace import known_topic_label, trace_from_sample_record
+from .scope import SCOPE_SOURCE_SESSION, LearningScope, resolve_scope, session_hash
+from .trace import LEVELS, known_topic_label, trace_from_sample_record
 
-SAMPLE_SCHEMA_VERSION = 1
+# 2 adds the scope fields. They are additive and optional, so a schema 1 row
+# still loads; the version is persisted per row so a future change can be read
+# off the data instead of guessed from which fields happen to be present.
+SAMPLE_SCHEMA_VERSION = 2
 
 TASK_RECIPIENT = "recipient"
 TASK_TOPIC = "topic"
@@ -70,6 +74,61 @@ def _topic_candidates(record: Mapping[str, Any]) -> tuple[list[dict[str, Any]], 
     return records_to_payload(parsed.items), parsed.recorded
 
 
+def _contribution_total_recorded(record: Mapping[str, Any]) -> bool:
+    """Whether the host recorded an additive score for this turn.
+
+    The same distinction `topic_candidates_recorded` draws, for the field the
+    threshold replay cannot work without: `to_contract` always writes a float, so
+    once a sample is stored, "the host scored this 0.0" and "the host never scored
+    it" are indistinguishable — and a replay that reads the second as the first
+    invents a decisive score the host never produced.
+    """
+    trace = record.get("decision_trace")
+    participation = trace.get("participation") if isinstance(trace, Mapping) else None
+    value = (participation.get("contribution_total")
+             if isinstance(participation, Mapping) else None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value))
+
+
+def _legacy_contribution_total_recorded(trace: Mapping[str, Any]) -> bool:
+    """Best reading available for rows written before the flag existed.
+
+    A completely empty participation block is the signature of a turn the host
+    never scored, so its total was never written either. Anything non-empty is
+    taken as recorded, which can only mislead for a turn the host scored while
+    omitting the total — narrower, and in the safer direction, than reading every
+    absent score as a real zero.
+    """
+    participation = trace.get("participation")
+    if isinstance(participation, Mapping):
+        evidence = participation.get("evidence")
+        if isinstance(evidence, list) and evidence:
+            return True
+        if participation.get("family_contributions"):
+            return True
+        if isinstance(participation.get("score"), (int, float)) \
+                and not isinstance(participation.get("score"), bool):
+            return True
+        if participation.get("level") in LEVELS:
+            return True
+        total = participation.get("contribution_total")
+        if isinstance(total, (int, float)) and not isinstance(total, bool) and float(total) != 0.0:
+            return True
+    summary = trace.get("evidence_summary")
+    if isinstance(summary, Mapping):
+        codes = summary.get("codes")
+        if isinstance(codes, list) and codes:
+            return True
+        if summary.get("level") in LEVELS:
+            return True
+        total = summary.get("contribution_total")
+        if isinstance(total, (int, float)) and not isinstance(total, bool) and float(total) != 0.0:
+            return True
+    return False
+
+
 def _selected_topic(record: Mapping[str, Any]) -> str:
     routing = record.get("routing")
     if isinstance(routing, Mapping):
@@ -85,11 +144,6 @@ def _finite(value: Any, default: float = 0.0) -> float:
         return default
     number = float(value)
     return number if math.isfinite(number) else default
-
-
-def session_hash(session_key: str) -> str:
-    """Same hashing the host uses for its per-session annotation key."""
-    return hashlib.sha256(str(session_key).encode("utf-8")).hexdigest()
 
 
 def sample_identifier(session_key: str, msg_id: str, task: str) -> str:
@@ -113,6 +167,25 @@ class LearningSample:
     annotated_at: float = 0.0
     features: Mapping[str, float] = field(default_factory=dict)
     trace: Mapping[str, Any] = field(default_factory=dict)
+
+    # Which conversation this sample is evidence about (schema 2). Under the
+    # current host contract the scope *is* the session, so this is a
+    # byte-for-byte copy of `session_hash`. It is still stored separately
+    # because it is the single field a future cross-session scope would change,
+    # and a scope re-derived at read time could silently come to mean something
+    # other than what it meant when the sample was written.
+    scope_hash: str = ""
+    scope_source: str = SCOPE_SOURCE_SESSION
+    # Diagnostic provenance only; never an aggregation key. See `core/scope.py`.
+    group_hint_hash: str = ""
+
+    def __post_init__(self) -> None:
+        # The migration invariant: a sample constructed without an explicit
+        # scope — every schema 1 row, and every caller that predates the field —
+        # keeps the legacy session identity instead of acquiring a new one.
+        if not self.scope_hash:
+            object.__setattr__(self, "scope_hash",
+                               self.session_hash or session_hash(self.session_key))
 
     @property
     def correct(self) -> bool:
@@ -140,12 +213,29 @@ class LearningSample:
         return bool(self.topic_candidates)
 
     @property
+    def contribution_total_recorded(self) -> bool:
+        """Whether the host recorded an additive score — not whether it was zero.
+
+        Rows written before the flag existed fall back to
+        `_legacy_contribution_total_recorded`, which can only distinguish "no
+        participation block at all" from "one was written"; the residual
+        ambiguity is documented there rather than papered over.
+        """
+        if not isinstance(self.trace, Mapping):
+            return False
+        flagged = self.trace.get("contribution_total_recorded")
+        if isinstance(flagged, bool):
+            return flagged
+        return _legacy_contribution_total_recorded(self.trace)
+
+    @property
     def selected_topic(self) -> str:
         value = self.trace.get("selected_topic") if isinstance(self.trace, Mapping) else None
         return value if isinstance(value, str) else self.predicted
 
     def as_dict(self, *, include_trace: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
+            "sample_schema_version": SAMPLE_SCHEMA_VERSION,
             "sample_id": self.sample_id,
             "session_key": self.session_key,
             "session_hash": self.session_hash,
@@ -159,6 +249,9 @@ class LearningSample:
             "error_type": self.error_type,
             "annotated_at": self.annotated_at,
             "features": {key: float(value) for key, value in self.features.items()},
+            "scope_hash": self.scope_hash or self.session_hash,
+            "scope_source": self.scope_source,
+            "group_hint_hash": self.group_hint_hash,
         }
         if include_trace:
             payload["trace"] = dict(self.trace)
@@ -185,10 +278,15 @@ class LearningSample:
                 if isinstance(key, str):
                     clean_features[key[:64]] = _finite(value)
         trace = raw.get("trace")
+        digest = str(raw.get("session_hash") or session_hash(session_key))[:64]
+        # A schema 1 row carries no scope fields at all. It keeps the identity
+        # its `session_hash` already had, byte for byte — re-deriving it under a
+        # new prefix would strand every stored sample outside its own history.
+        scope_hash = str(raw.get("scope_hash") or digest)[:64]
         return cls(
             sample_id=str(raw.get("sample_id") or sample_identifier(session_key, msg_id, task))[:64],
             session_key=session_key[:256],
-            session_hash=str(raw.get("session_hash") or session_hash(session_key))[:64],
+            session_hash=digest,
             msg_id=msg_id[:256],
             timestamp=_finite(raw.get("timestamp")),
             task=task,
@@ -200,6 +298,9 @@ class LearningSample:
             annotated_at=_finite(raw.get("annotated_at")),
             features=clean_features,
             trace=dict(trace) if isinstance(trace, Mapping) else {},
+            scope_hash=scope_hash,
+            scope_source=str(raw.get("scope_source") or SCOPE_SOURCE_SESSION)[:32],
+            group_hint_hash=str(raw.get("group_hint_hash") or "")[:64],
         )
 
 
@@ -237,6 +338,7 @@ def samples_from_annotation(
     record: Mapping[str, Any],
     session_key: str,
     *,
+    scope: LearningScope | None = None,
     config: LearningConfig | None = None,
     now: float | None = None,
 ) -> list[LearningSample]:
@@ -244,6 +346,9 @@ def samples_from_annotation(
 
     A record with no usable supervision yields no samples rather than a sample
     with an invented label. Missing labels are never treated as negatives.
+
+    `scope` is resolved by the caller when it has the runtime snapshot to hand
+    (`build_dataset`); on its own the session identity is the scope.
     """
     config = config or LearningConfig()
     if not isinstance(record, Mapping):
@@ -251,10 +356,12 @@ def samples_from_annotation(
     msg_id = record.get("msg_id")
     if not isinstance(msg_id, str) or not msg_id:
         return []
+    resolved = scope if scope is not None else resolve_scope(session_key)
     trace = trace_from_sample_record(record)
     annotated_at = _finite(record.get("annotated_at"), now if now is not None else time.time())
     digest = session_hash(session_key)
     features = build_features(trace)
+    score_recorded = _contribution_total_recorded(record)
     trace_payload = trace.to_contract() if config.store_raw_trace else {}
     summary = feature_summary(trace)
     short_id = msg_id[:256]
@@ -264,6 +371,9 @@ def samples_from_annotation(
              error_type: str, extra: Mapping[str, Any] | None = None) -> LearningSample:
         payload: dict[str, Any] = dict(trace_payload)
         payload["evidence_summary"] = summary
+        # Stored even when the raw trace is not: it is a fact about the host's
+        # record, not part of the trace snapshot.
+        payload["contribution_total_recorded"] = score_recorded
         payload.update(extra or {})
         return LearningSample(
             sample_id=sample_identifier(session_key, msg_id, task),
@@ -280,6 +390,9 @@ def samples_from_annotation(
             annotated_at=annotated_at,
             features=dict(features),
             trace=payload,
+            scope_hash=resolved.scope_hash,
+            scope_source=resolved.scope_source,
+            group_hint_hash=resolved.group_hint_hash,
         )
 
     # --- recipient ------------------------------------------------------
@@ -333,13 +446,23 @@ def samples_from_annotation(
 def build_dataset(
     annotations: Iterable[tuple[str, Mapping[str, Any]]],
     *,
+    session_meta: Mapping[str, Mapping[str, Any]] | None = None,
     config: LearningConfig | None = None,
 ) -> list[LearningSample]:
-    """Convert `(session_key, record)` pairs, de-duplicating by sample id."""
+    """Convert `(session_key, record)` pairs, de-duplicating by sample id.
+
+    `session_meta` is the host's runtime snapshot keyed by session key. It does
+    not change the identity — it records which host facts backed the scope, so
+    "the host confirmed this session's scope" stays tellable from "we fell back
+    to it" (see `core/scope.py`). Callers without it still get the session
+    scope, which is what every stored sample already has.
+    """
     config = config or LearningConfig()
+    meta_by_session = session_meta if isinstance(session_meta, Mapping) else {}
     latest: dict[str, LearningSample] = {}
     for session_key, record in annotations:
-        for sample in samples_from_annotation(record, session_key, config=config):
+        scope = resolve_scope(session_key, meta_by_session.get(session_key))
+        for sample in samples_from_annotation(record, session_key, scope=scope, config=config):
             previous = latest.get(sample.sample_id)
             if previous is None or sample.annotated_at >= previous.annotated_at:
                 latest[sample.sample_id] = sample

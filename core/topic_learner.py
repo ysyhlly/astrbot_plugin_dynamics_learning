@@ -79,7 +79,13 @@ class TopicLearning:
         }
 
 
-def _rows(samples: Sequence[LearningSample]) -> list[TopicPairRow]:
+def pair_rows(samples: Sequence[LearningSample]) -> list[TopicPairRow]:
+    """Label / confidence / candidate view of topic samples, for replay.
+
+    Public because contract health asks the same question the sweep does: can a
+    threshold move change this row's label? Deriving it a second time in
+    `core/quality.py` would let the two answers drift apart.
+    """
     rows: list[TopicPairRow] = []
     for sample in samples:
         rows.append(TopicPairRow(
@@ -150,6 +156,22 @@ def replay_label(row: TopicPairRow, threshold: float, *, allow_relax: bool = Tru
     return best.topic_id if best else UNASSIGNED
 
 
+def replay_can_move(row: TopicPairRow) -> bool:
+    """Whether a commit-threshold move can change this row's label at all.
+
+    Tightening can always drop a committed assignment, so every committed row
+    responds to the threshold. Relaxing needs something to relax *to*: a
+    candidate whose score the host actually recorded. A row with neither stays at
+    its recorded label under every threshold — a fact about the corpus worth
+    reporting, not a row to quietly average in.
+    """
+    if row.committed:
+        return True
+    if row.ambiguous:
+        return False
+    return any(candidate.score_known for candidate in row.candidates)
+
+
 def replay_pairs(rows: Sequence[TopicPairRow], threshold: float, *,
                  allow_relax: bool = True) -> list[list[tuple[str, str]]]:
     grouped: dict[str, list[tuple[str, str]]] = {}
@@ -184,7 +206,7 @@ def learn(samples: Sequence[LearningSample], *, config: LearningConfig | None = 
         report.notes.append("没有话题标注样本；先在本体回放页标注 expected_topic。")
         return report
 
-    rows = _rows(subset)
+    rows = pair_rows(subset)
     report.confusion = _display_confusion(subset)
     report.pair_metrics = topic_pair_metrics(replay_pairs(rows, 0.0))
     report.candidate_metrics = summarise_candidates(candidate_observations(subset))
@@ -379,5 +401,5 @@ def threshold_curve_rows(report: TopicLearning) -> list[dict[str, Any]]:
 
 __all__ = [
     "TopicLearning", "TopicPairRow", "UNASSIGNED_DISPLAY", "candidate_observations", "learn",
-    "replay_label", "replay_pairs", "threshold_curve_rows",
+    "pair_rows", "replay_can_move", "replay_label", "replay_pairs", "threshold_curve_rows",
 ]

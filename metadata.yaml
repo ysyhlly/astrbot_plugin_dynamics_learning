@@ -14,9 +14,13 @@ desc: |
   Shadow Learning：只学习、只分析、只推荐，不会自动修改 ChatDynamics 的线上配置，
   也不会写入本体的任何数据。
 
+  控制台分两个视图：总览（样本、契约健康度、建议、调参与评测）与会话画像
+  （逐个会话看「被人工检查过的样本里系统经常错在哪里」，用 leave-one-out 基线对比）。
+
   需要 ChatDynamics 提供 topic_annotations_v1_* 与 panel_runtime_v1 两类共享首选项；
   话题候选集（routing.topic_candidates）记录得越完整，候选召回与错误归因越准。
-version: v0.6.0
+  画像的作用域当前等于会话：本体契约没有提供跨会话的群身份。
+version: v0.7.0
 author: ysyhlly
 astrbot_version: ">=4.16,<5"
 tags:

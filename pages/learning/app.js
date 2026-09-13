@@ -7,6 +7,9 @@
 const ENDPOINTS = {
   overview: "overview",
   samples: "samples",
+  quality: "quality",
+  scopes: "scopes",
+  scope: "scope",
   ingest: "ingest",
   analyze: "analyze",
   report: "report",
@@ -14,6 +17,10 @@ const ENDPOINTS = {
   policy: "policy",
   export: "export",
 };
+
+// Contract-health statuses. "unsupported" is deliberately its own look: it says
+// the corpus cannot answer this question, which is a finding, not a failure.
+const CAP_STATUS_CLASS = { ok: "ok", warning: "warn", unsupported: "bad", insufficient: "" };
 
 const TASK_LABEL = { recipient: "对话对象", topic: "话题", reply: "回复准入" };
 const VERDICT_LABEL = {
@@ -27,7 +34,7 @@ const CONFIDENCE_LABEL = {
   moderate: "置信度中",
 };
 
-const state = { overview: null, report: null };
+const state = { overview: null, report: null, quality: null, scopes: null, view: "overview" };
 
 function $(id) {
   return document.getElementById(id);
@@ -391,15 +398,171 @@ function renderSamples(data) {
     </tr>`).join("")}</tbody></table>`;
 }
 
+
+// ---- data contract health ----------------------------------------------
+
+function contractLine(contract) {
+  if (!contract) return "还没有导入记录：契约面（本体到底写了什么字段）暂无数据。";
+  const candidates = contract.topic_candidates || {};
+  const total = (candidates.missing || 0) + (candidates.empty || 0) + (candidates.nonempty || 0);
+  return [
+    `标注 ${contract.annotations_kept}/${contract.annotations_seen} 条（格式异常 ${contract.malformed}，`
+      + `无法归属 ${contract.unknown_session}，截断 ${contract.truncated}）`,
+    `decision_trace 缺失 ${contract.decision_trace_absent} 条`,
+    `候选集字段 缺失 ${candidates.missing || 0}/${total}`,
+  ].join(" · ");
+}
+
+function renderQuality(data) {
+  const host = $("quality");
+  if (!data) {
+    host.innerHTML = '<p class="empty">还没有数据契约状态。</p>';
+    return;
+  }
+  const dataset = data.dataset || {};
+  const capabilities = data.capabilities || {};
+  const found = Object.values(capabilities);
+  const needing = found.filter((row) => row.status !== "ok").length;
+  const rows = found.map((row) => {
+    const cls = CAP_STATUS_CLASS[row.status] || "";
+    const reasons = (row.reasons || []).map(esc).join("<br />");
+    return `<tr>
+      <td>${esc(row.name)}<div class="sub">${esc(row.definition || "")}</div></td>
+      <td><span class="tag ${cls}">${esc(row.status_label || row.status)}</span></td>
+      <td class="num">${row.coverage === null || row.coverage === undefined ? "—" : pct(row.coverage)}</td>
+      <td class="num">${esc(row.eligible)}/${esc(row.total)}</td>
+      <td>${reasons || "—"}</td>
+    </tr>`;
+  }).join("");
+  const blocked = (data.blocked || []).map((line) => `<li>${esc(line)}</li>`).join("");
+  const findings = (data.contract_findings || []).map((line) => `<li>${esc(line)}</li>`).join("");
+  host.innerHTML = `<div class="grid">
+      ${statCard("样本", dataset.samples ?? 0, `会话 ${dataset.sessions ?? 0} · 作用域 ${dataset.scopes ?? 0}（${dataset.scope_level || "session"}）`)}
+      ${statCard("需要补数据的能力", needing, "状态不是「正常」的能力数（不支持 / 警告 / 样本不足）")}
+      ${statCard("解析异常轨迹", dataset.degraded_traces ?? 0, "契约降级的样本条数")}
+    </div>
+    <div class="table-host"><table><thead><tr>
+      <th>能力</th><th>状态</th><th class="num">覆盖</th><th class="num">可用/合计</th><th>说明</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>
+    ${blocked ? `<div class="rec diagnostic"><h3>当前不支持的分析</h3><ul class="bullets">${blocked}</ul></div>` : ""}
+    <p class="hint">契约面：${esc(contractLine(data.contract))}</p>
+    ${findings ? `<ul class="bullets">${findings}</ul>` : ""}
+    <p class="hint">${(data.notes || []).map(esc).join("<br />")}</p>`;
+}
+
+// ---- scope review profile ----------------------------------------------
+
+function deltaBar(delta) {
+  if (delta === null || delta === undefined) return "";
+  const width = Math.min(100, Math.abs(delta) * 100 * 3);
+  const cls = delta >= 0 ? "bad" : "ok";
+  return `<span class="bar-track"><span class="bar-fill ${cls}" style="width:${width.toFixed(1)}%"></span></span>`;
+}
+
+function renderScopes(data) {
+  const host = $("scopes");
+  const rows = (data && data.rows) || [];
+  if (!rows.length) {
+    host.innerHTML = '<p class="empty">还没有标注样本，先导入并标注。</p>';
+    return;
+  }
+  host.innerHTML = `<table><thead><tr>
+      <th>会话</th><th class="num">被检查样本</th><th class="num">标注日</th><th>置信度</th>
+      <th>主要问题</th><th>候选链诊断</th><th></th>
+    </tr></thead><tbody>${rows.map((row) => `<tr>
+      <td>${esc(row.scope_label)}</td>
+      <td class="num">${esc(row.samples)}</td>
+      <td class="num">${esc(row.annotation_days)}</td>
+      <td>${esc(row.confidence_label)}</td>
+      <td>${(row.dominant_labels || []).map(esc).join("、") || "—"}</td>
+      <td>${esc(row.diagnosis_label || "—")}</td>
+      <td><button class="btn small" data-scope="${esc(row.scope_hash)}">查看</button></td>
+    </tr>`).join("")}</tbody></table>
+    <p class="hint">${(data.notes || []).map(esc).join("<br />")}</p>`;
+}
+
+function renderScopeDetail(payload) {
+  const host = $("scopeDetail");
+  if (!payload || !payload.profile) {
+    host.innerHTML = '<p class="empty">没有这个会话的画像。</p>';
+    return;
+  }
+  const profile = payload.profile;
+  const deltas = (payload.deltas || []).filter((row) => row.support > 0);
+  const rows = deltas.map((row) => `<tr>
+      <td>${esc(row.label)}</td>
+      <td class="num">${pct(row.raw_rate)}<div class="sub">${esc(row.count)}/${esc(row.support)}</div></td>
+      <td class="num">${row.smoothed_rate === null ? "—" : pct(row.smoothed_rate)}</td>
+      <td class="num">${row.loo_rate === null ? "—" : pct(row.loo_rate)}<div class="sub">${esc(row.loo_count)}/${esc(row.loo_support)}</div></td>
+      <td class="num">${row.delta_pp === null ? "—" : (row.delta_pp >= 0 ? "+" : "") + row.delta_pp + "pp"}
+        ${deltaBar(row.delta)}${row.comparable ? "" : `<div class="sub">${esc(row.reason)}</div>`}</td>
+    </tr>`).join("");
+  const diagnosis = payload.diagnosis || {};
+  host.innerHTML = `<div class="grid">
+      ${statCard("被检查样本", profile.labelled_samples, `${profile.labelled_sessions} 个会话 · ${profile.annotation_days} 个标注日`)}
+      ${statCard("置信度", profile.confidence_label, profile.confidence_reason)}
+      ${statCard("候选覆盖", pct(((profile.candidate_metrics || {}).candidate_recall || {}).coverage),
+        "记录候选集的话题标注占比")}
+      ${statCard("Recall@3", pct(((profile.candidate_metrics || {}).candidate_recall || {}).recall_at_3),
+        "正确话题进入前 3 的比例")}
+      ${statCard("选中准确率", pct(((profile.candidate_metrics || {}).selection_accuracy || {}).accuracy),
+        "仅统计正确话题已进候选集的样本")}
+    </div>
+    <div class="table-host"><table><thead><tr>
+      <th>问题</th><th class="num">本会话（原始）</th><th class="num">平滑后</th>
+      <th class="num">其余会话</th><th class="num">偏差</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>
+    <article class="rec ${diagnosis.code === "candidate_generation" || diagnosis.code === "ranking_or_scoring" ? "actionable" : "diagnostic"}">
+      <h3>候选链诊断：${esc(diagnosis.label || "—")}</h3>
+      <p class="rationale">${esc(diagnosis.detail || "")}</p>
+      ${diagnosis.recommended_target ? `<div class="meta"><span class="tag">优化目标 ${esc(diagnosis.recommended_target)}</span></div>` : ""}
+    </article>
+    <ul class="bullets">${(payload.diagnostics || []).map((line) => `<li>${esc(line)}</li>`).join("")}</ul>
+    <p class="hint">${esc(payload.note || "")}</p>`;
+}
+
+async function loadScope(scopeHash) {
+  const button = document.querySelector(`[data-scope="${scopeHash}"]`);
+  const target = button instanceof HTMLElement ? button : $("btnScopes");
+  await withBusy(target, "…", async () => {
+    renderScopeDetail(await call(ENDPOINTS.scope, { params: { id: scopeHash } }));
+  });
+}
+
+async function loadScopes() {
+  const [listing, quality] = await Promise.all([
+    call(ENDPOINTS.scopes),
+    call(ENDPOINTS.quality),
+  ]);
+  state.scopes = listing;
+  state.quality = quality;
+  renderScopes(listing);
+  return listing;
+}
+
+function setView(view) {
+  state.view = view;
+  document.querySelectorAll("[data-view]").forEach((section) => {
+    section.hidden = section.dataset.view !== view;
+  });
+  document.querySelectorAll("[data-view-btn]").forEach((button) => {
+    const active = button.dataset.viewBtn === view;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-current", active ? "true" : "false");
+  });
+}
+
 async function refresh() {
   try {
-    const [overview, report, policies] = await Promise.all([
+    const [overview, report, policies, quality] = await Promise.all([
       call(ENDPOINTS.overview),
       call(ENDPOINTS.report),
       call(ENDPOINTS.policies),
+      call(ENDPOINTS.quality),
     ]);
     state.overview = overview;
     state.report = report.report;
+    state.quality = quality;
     $("linkLamp").classList.add("on");
     $("linkLabel").textContent = "已连接";
     renderOverview(overview);
@@ -410,6 +573,7 @@ async function refresh() {
     renderTuning(state.report);
     renderEvaluation(state.report);
     renderPolicies(policies);
+    renderQuality(quality);
   } catch (error) {
     $("linkLamp").classList.remove("on");
     $("linkLabel").textContent = "未连接";
@@ -472,9 +636,34 @@ function bind() {
     renderSamples(await call(ENDPOINTS.samples, { params: { task, page: 1, page_size: 50 } }));
   }));
 
+  document.querySelectorAll("[data-view-btn]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const view = button.dataset.viewBtn || "overview";
+      setView(view);
+      // Loaded on first visit rather than on every refresh: the scope list is a
+      // second view, not part of the overview a reader opens the page for.
+      if (view === "scopes" && !state.scopes) {
+        try {
+          await loadScopes();
+        } catch (error) {
+          notice(String(error.message || error), "error");
+        }
+      }
+    });
+  });
+
+  $("btnScopes").addEventListener("click", () => withBusy($("btnScopes"), "加载中…", async () => {
+    const listing = await loadScopes();
+    notice(`已加载 ${listing.total} 个会话画像。`, "ok");
+  }));
+
   document.addEventListener("click", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
+    if (target.dataset.scope) {
+      loadScope(target.dataset.scope);
+      return;
+    }
     const version = target.dataset.policy;
     const action = target.dataset.action;
     if (version && action) {
@@ -496,6 +685,7 @@ function bind() {
 
 async function main() {
   bind();
+  setView(state.view);
   const api = bridge();
   if (api && typeof api.ready === "function") {
     try {

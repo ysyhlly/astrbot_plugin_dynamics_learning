@@ -88,6 +88,9 @@ class LearningWebAPI:
         routes = [
             ("overview", self.overview, ["GET"], "学习层状态、数据面与最近一次分析"),
             ("samples", self.samples, ["GET"], "分页查看学习样本（不含正文）"),
+            ("quality", self.quality, ["GET"], "数据契约健康度：能力矩阵与原始记录统计"),
+            ("scopes", self.scopes, ["GET"], "作用域列表：被检查样本量与主要问题（当前作用域=会话）"),
+            ("scope", self.scope, ["GET"], "单个作用域画像：被检查样本、leave-one-out 基线与偏差"),
             ("ingest", self.ingest, ["POST"], "从 ChatDynamics 只读导入标注，或导入导出文件"),
             ("analyze", self.analyze, ["POST"], "运行学习与离线评测并保存结果"),
             ("report", self.report, ["GET"], "最近一次分析结果"),
@@ -131,10 +134,41 @@ class LearningWebAPI:
                 page_size=_query_int("page_size", 50, 1, _MAX_PAGE_SIZE),
                 task=_query_param("task"),
                 session=_query_param("session"),
+                scope=_query_param("scope"),
             ))
+        except ValueError as exc:
+            # A malformed filter is the caller's mistake and has a fix, so it is
+            # answered as 400 rather than being flattened into an empty page.
+            return _json_err(str(exc), 400)
         except Exception as exc:
             logger.error("[DynamicsLearning] samples failed type=%s", type(exc).__name__)
             return _json_err("读取学习样本失败", 500)
+
+    async def quality(self):
+        try:
+            return _json_ok(await self.plugin.quality_payload())
+        except Exception as exc:
+            logger.error("[DynamicsLearning] quality failed type=%s", type(exc).__name__)
+            return _json_err("读取数据契约健康度失败", 500)
+
+    async def scopes(self):
+        try:
+            return _json_ok(await self.plugin.scopes_payload())
+        except Exception as exc:
+            logger.error("[DynamicsLearning] scopes failed type=%s", type(exc).__name__)
+            return _json_err("读取作用域列表失败", 500)
+
+    async def scope(self):
+        identifier = _query_param("id")
+        if not identifier.strip():
+            return _json_err("需要 id（完整 64 位 scope_hash）")
+        try:
+            return _json_ok(await self.plugin.scope_payload(identifier))
+        except ValueError as exc:
+            return _json_err(str(exc), 404)
+        except Exception as exc:
+            logger.error("[DynamicsLearning] scope failed type=%s", type(exc).__name__)
+            return _json_err("读取作用域画像失败", 500)
 
     async def ingest(self):
         body = await _json_body()

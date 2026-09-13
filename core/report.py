@@ -75,6 +75,11 @@ def dataset_summary(samples: Sequence[LearningSample]) -> dict[str, Any]:
     return {
         "samples": len(samples),
         "sessions": len({sample.session_hash for sample in samples}),
+        # Reported next to sessions rather than merged into it: under the current
+        # host contract a scope *is* a session, and a number that silently equals
+        # another number teaches a reader to trust a dimension that is not there.
+        "scopes": len({sample.scope_hash for sample in samples}),
+        "scope_level": "session",
         "tasks": tasks,
         "first_timestamp": min((sample.timestamp for sample in samples), default=None),
         "last_timestamp": max((sample.timestamp for sample in samples), default=None),

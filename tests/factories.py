@@ -391,6 +391,63 @@ def topic_sessions(*, sessions: int = 10, per_session: int = 10) -> list[tuple[s
     return rows
 
 
+def recipient_record(
+    msg_id: str,
+    *,
+    error: bool = False,
+    kind: str = "missed_bot",
+    annotated_at: float = 1000.0,
+) -> dict[str, Any]:
+    """One record that yields exactly one recipient sample and nothing else.
+
+    The topic label is UNKNOWN and there is no reply supervision, so a batch of
+    these has an exact per-scope composition — which is what a leave-one-out
+    baseline and a smoothing prior have to be checked against by hand.
+    """
+    trace = make_trace(bot_targeted=False, recipient_confidence=0.5)
+    return make_record(msg_id, trace=trace, predicted_topic="UNKNOWN", expected_topic="UNKNOWN",
+                       bot_targeted=error, recipient_error_type=kind if error else "correct",
+                       annotated_at=annotated_at)
+
+
+def scope_batch(
+    *,
+    scopes: int = 3,
+    per_scope: int = 14,
+    wrong_scope: int = 0,
+    wrong_ratio: float = 0.6,
+    other_ratio: float = 0.1,
+    days: int = 3,
+    topics: int = 0,
+    start: float = 1_000_000.0,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Several scopes, one deliberately worse, spread over several annotation days.
+
+    Three things the other fixtures do not produce and the scope view needs:
+    more than one scope, a difference large enough to survive a leave-one-out
+    baseline, and annotation timestamps on different days — without those the
+    "stable" tier is unreachable no matter how much is reviewed.
+    """
+    rows: list[tuple[str, dict[str, Any]]] = []
+    span = max(1, days)
+    for scope_index in range(scopes):
+        scope = f"umo:scope:{scope_index}"
+        wrong = int(round(per_scope * (wrong_ratio if scope_index == wrong_scope else other_ratio)))
+        for position in range(per_scope):
+            rows.append((scope, recipient_record(
+                f"s{scope_index}-m{position}", error=position < wrong,
+                annotated_at=start + (position % span) * 86_400.0 + scope_index * 60 + position)))
+        for position in range(topics):
+            expected = f"t{scope_index}-{position // 4}"
+            rows.append((scope, topic_record(
+                f"s{scope_index}-t{position}",
+                predicted=expected if position % 4 else f"t{scope_index}-other",
+                expected=expected, confidence=0.62,
+                candidates=[[0.62, expected], [0.4, "t-other"]],
+                annotated_at=start + (position % span) * 86_400.0 + scope_index * 60 + position)))
+    return rows
+
+
 def export_payload(rows: Iterable[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for session, record in rows:

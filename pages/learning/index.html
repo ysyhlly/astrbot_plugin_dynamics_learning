@@ -27,25 +27,40 @@
 
       <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
 
+      <nav class="tabs" aria-label="视图">
+        <button type="button" class="tab active" data-view-btn="overview" aria-current="true">总览</button>
+        <button type="button" class="tab" data-view-btn="scopes" aria-current="false">会话画像</button>
+      </nav>
+
       <main id="main">
-        <section class="card" aria-labelledby="hOverview">
+        <section class="card" data-view="overview" aria-labelledby="hQuality">
+          <h2 id="hQuality">数据契约状态</h2>
+          <p class="hint">
+            每一行是学习层真正要用的一项能力，以及这批数据能不能支撑它。
+            覆盖率低不代表系统差，代表记录里没有可以判断的证据；
+            「不支持」是结论，不是错误。
+          </p>
+          <div id="quality" class="stack"></div>
+        </section>
+
+        <section class="card" data-view="overview" aria-labelledby="hOverview">
           <h2 id="hOverview">学习概览</h2>
           <div id="overview" class="grid">加载中…</div>
           <div id="candidates" class="stack"></div>
         </section>
 
-        <section class="card" aria-labelledby="hWindow">
+        <section class="card" data-view="overview" aria-labelledby="hWindow">
           <h2 id="hWindow">最近 7 天标注表现</h2>
           <p class="hint">仅统计人工标注样本，不代表真实准确率。</p>
           <div id="window" class="grid"></div>
         </section>
 
-        <section class="card" aria-labelledby="hErrors">
+        <section class="card" data-view="overview" aria-labelledby="hErrors">
           <h2 id="hErrors">错误分布与话题候选归因</h2>
           <div id="errors" class="table-host"></div>
         </section>
 
-        <section class="card" aria-labelledby="hRec">
+        <section class="card" data-view="overview" aria-labelledby="hRec">
           <h2 id="hRec">系统建议</h2>
           <p class="hint">
             参数建议都指向 ChatDynamics 的真实配置键，并已按单次变化上限截断。
@@ -54,7 +69,7 @@
           <div id="recs" class="stack"></div>
         </section>
 
-        <section class="card" aria-labelledby="hTuning">
+        <section class="card" data-view="overview" aria-labelledby="hTuning">
           <h2 id="hTuning">迭代调参（小步累计）</h2>
           <p class="hint">
             单步上限 ±5%，累计上限 ±15%，最多连续 3 步。每一步都在留出集上回放，
@@ -64,7 +79,7 @@
           <div id="tuning" class="stack"></div>
         </section>
 
-        <section class="card" aria-labelledby="hEval">
+        <section class="card" data-view="overview" aria-labelledby="hEval">
           <h2 id="hEval">离线评测（baseline vs candidate）</h2>
           <p class="hint">
             按会话切分留出集。回放的是记录轨迹上的决策函数，不是 ChatDynamics 路由器的完整重跑。
@@ -72,12 +87,12 @@
           <div id="eval" class="stack"></div>
         </section>
 
-        <section class="card" aria-labelledby="hPolicies">
+        <section class="card" data-view="overview" aria-labelledby="hPolicies">
           <h2 id="hPolicies">策略版本</h2>
           <div id="policies" class="stack"></div>
         </section>
 
-        <section class="card" aria-labelledby="hSamples">
+        <section class="card" data-view="overview" aria-labelledby="hSamples">
           <h2 id="hSamples">样本浏览</h2>
           <div class="row-controls">
             <label>任务
@@ -92,10 +107,31 @@
           </div>
           <div id="samples" class="table-host"></div>
         </section>
+
+        <section class="card" data-view="scopes" aria-labelledby="hScopes" hidden>
+          <h2 id="hScopes">会话画像</h2>
+          <p class="hint">
+            只统计<strong>被人工检查过</strong>的样本：它回答的是「在这个会话里，我看过的那些消息系统经常错在哪里」，
+            不是「这个会话有多少比例的消息会出错」。偏差对照的是 leave-one-out 基线
+            （除本会话以外的全部样本），避免自己稀释自己。
+          </p>
+          <div class="row-controls">
+            <button id="btnScopes" type="button" class="btn">加载会话列表</button>
+          </div>
+          <div id="scopes" class="table-host"></div>
+        </section>
+
+        <section class="card" data-view="scopes" aria-labelledby="hScopeDetail" hidden>
+          <h2 id="hScopeDetail">会话详情</h2>
+          <p class="hint">作用域当前等于会话：本体契约没有提供跨会话的群身份。</p>
+          <div id="scopeDetail" class="stack">
+            <p class="empty">在上面的列表里点「查看」。</p>
+          </div>
+        </section>
       </main>
 
       <footer class="foot">
-        <span>Dynamics Learning v0.6.0 · Shadow Learning：只学习、只分析、只推荐。</span>
+        <span>Dynamics Learning v0.7.0 · Shadow Learning：只学习、只分析、只推荐。</span>
       </footer>
     </div>
     <script src="./app.js"></script>

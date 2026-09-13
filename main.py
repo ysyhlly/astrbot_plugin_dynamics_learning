@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import time
 from typing import Any, Optional
 
@@ -25,8 +26,10 @@ except ImportError as exc:  # pragma: no cover - the host runtime always has it
 from .core.config import LearningConfig, parse_learning_config
 from .core.ingest import IngestResult, collect_from_host, parse_export
 from .core.policy import BASE_POLICY
+from .core.quality import quality_report
 from .core.report import analyze, policy_rows
-from .core.samples import LearningSample, build_dataset
+from .core import scope_profile
+from .core.samples import LearningSample, build_dataset, session_hash
 from .core.store import LearningStore
 from .core.web_api import LearningWebAPI, PLUGIN_NAME
 
@@ -38,7 +41,7 @@ _MAX_SAMPLE_PAGE = 200
     PLUGIN_NAME,
     "ysyhlly",
     "群间 · Dynamics Learning",
-    "v0.6.0",
+    "v0.7.0",
     "",
 )
 class DynamicsLearningPlugin(Star):
@@ -52,6 +55,7 @@ class DynamicsLearningPlugin(Star):
         self._samples: Optional[list[LearningSample]] = None
         self._last_report: Optional[dict[str, Any]] = None
         self._last_diagnostics: dict[str, Any] = {}
+        self._last_contract: dict[str, Any] = {}
         self._lock = asyncio.Lock()
         self._analysis_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
@@ -66,6 +70,8 @@ class DynamicsLearningPlugin(Star):
         self._last_report = report if isinstance(report, dict) else None
         diagnostics = state.get("last_diagnostics")
         self._last_diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        contract = state.get("last_contract_stats")
+        self._last_contract = contract if isinstance(contract, dict) else {}
         self._samples = await self.store.load_samples(config=self.runtime_config())
         self._stop.clear()
         if self.runtime_config().auto_analyze:
@@ -140,7 +146,12 @@ class DynamicsLearningPlugin(Star):
                     result = IngestResult(diagnostics={
                         "source": "shared_preferences", "available": False,
                         "error": type(exc).__name__, "records": 0})
-            samples = build_dataset(result.annotations, config=config)
+            # The runtime snapshot decides nothing about identity; it records
+            # which host facts (umo / group_id / bot_id) were available, so the
+            # contract health report can tell a confirmed session scope from a
+            # fallback.
+            samples = build_dataset(result.annotations, session_meta=result.sessions,
+                                    config=config)
             by_session: dict[str, list[LearningSample]] = {}
             for sample in samples:
                 by_session.setdefault(sample.session_key, []).append(sample)
@@ -150,7 +161,12 @@ class DynamicsLearningPlugin(Star):
                 self._samples = None
             await self.load_samples(refresh=True)
             self._last_diagnostics = dict(result.diagnostics)
+            # The contract plane is a snapshot: it describes the raw records as
+            # they were at this moment, and nothing downstream can reconstruct it
+            # later. `/quality` reads it back with its own timestamp.
+            self._last_contract = result.contract.as_dict()
             await self.store.patch_state(last_diagnostics=self._last_diagnostics,
+                                         last_contract_stats=self._last_contract,
                                          last_ingest_at=time.time())
             stored = len(self._samples or [])
         available = result.diagnostics.get("available")
@@ -164,6 +180,7 @@ class DynamicsLearningPlugin(Star):
             "sessions": len(by_session),
             "stored_samples": stored,
             "diagnostics": dict(result.diagnostics),
+            "contract": dict(self._last_contract or {}),
             "note": "只读取 ChatDynamics 的共享首选项，不写入本体任何数据。",
         }
 
@@ -216,7 +233,7 @@ class DynamicsLearningPlugin(Star):
         policies = await self.store.load_policies()
         return {
             "plugin": PLUGIN_NAME,
-            "version": "v0.6.0",
+            "version": "v0.7.0",
             "config": config.as_dict(),
             "dataset": {
                 "samples": len(samples),
@@ -239,17 +256,17 @@ class DynamicsLearningPlugin(Star):
         }
 
     async def samples_payload(self, *, page: int = 1, page_size: int = 50,
-                              task: str = "", session: str = "") -> dict[str, Any]:
+                              task: str = "", session: str = "", scope: str = "") -> dict[str, Any]:
         samples = await self.load_samples()
         rows = samples
         if task:
             rows = [row for row in rows if row.task == task]
         if session:
-            digest = session
-            if len(digest) != 64:
-                from .core.samples import session_hash
-                digest = session_hash(session)
+            digest = resolve_session_digest(session)
             rows = [row for row in rows if row.session_hash == digest]
+        if scope:
+            digest = resolve_session_digest(scope)
+            rows = [row for row in rows if row.scope_hash == digest]
         page_size = max(1, min(_MAX_SAMPLE_PAGE, int(page_size or 50)))
         page = max(1, int(page or 1))
         start = (page - 1) * page_size
@@ -273,6 +290,42 @@ class DynamicsLearningPlugin(Star):
             } for row in window],
             "note": "样本不含消息正文；身份字段按首尾保留脱敏。",
         }
+
+    async def quality_payload(self) -> dict[str, Any]:
+        """Contract health: what the recorded data can and cannot answer.
+
+        The sample plane is recomputed here on every request; the contract plane
+        is the snapshot the last import took, so it can only ever be as fresh as
+        that import — which is why it travels with its own timestamp.
+        """
+        config = self.runtime_config()
+        samples = await self.load_samples()
+        state = await self.store.load_state()
+        contract = self._last_contract or state.get("last_contract_stats")
+        return quality_report(
+            samples,
+            contract=contract if isinstance(contract, dict) else None,
+            contract_version=int(self._last_diagnostics.get("contract_version") or 0) or None,
+            ingest_at=_as_float(state.get("last_ingest_at")),
+            min_samples=config.min_samples_for_evaluation,
+        )
+
+    async def scopes_payload(self) -> dict[str, Any]:
+        """Every reviewed scope, one row each, already ranked for the list view."""
+        return scope_profile.scopes_payload(await self.load_samples())
+
+    async def scope_payload(self, identifier: str) -> dict[str, Any]:
+        """One scope's review profile against the leave-one-out baseline.
+
+        The comparison is computed here rather than in the page: a server-side
+        number can be tested, and a page that recomputed the baseline could
+        disagree with the report it is sitting next to.
+        """
+        digest = resolve_session_digest(identifier)
+        payload = scope_profile.scope_payload(await self.load_samples(), digest)
+        if payload is None:
+            raise ValueError(f"数据集里没有作用域 {digest[:12]} 的样本")
+        return payload
 
     async def report_payload(self) -> dict[str, Any]:
         return self.report_payload_sync()
@@ -314,6 +367,32 @@ class DynamicsLearningPlugin(Star):
         return {"removed_samples": removed, "note": "已清空本插件的样本与报告。"}
 
 
+_SESSION_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_SCOPE_LABEL_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def resolve_session_digest(value: str) -> str:
+    """A full digest passes through; a raw session key is hashed.
+
+    A 12-character hex string is rejected rather than hashed. That is exactly the
+    shape of the display label, and hashing one would answer "no samples" with
+    HTTP 200 — a wrong answer that is indistinguishable from an empty result.
+    """
+    text = str(value).strip()
+    if _SESSION_DIGEST_RE.match(text):
+        return text
+    if _SCOPE_LABEL_RE.match(text):
+        raise ValueError("session 需要完整 64 位 scope_hash；"
+                         "12 位十六进制是页面展示用的 scope_label，不能当查询键")
+    return session_hash(text)
+
+
+def _as_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def _redact(value: Any) -> str:
     """Keep identity fields out of the page while staying recognisable.
 
@@ -341,4 +420,4 @@ def _trim(payload: dict[str, Any]) -> dict[str, Any]:
     return walk(payload)
 
 
-__all__ = ["PLUGIN_NAME", "DynamicsLearningPlugin"]
+__all__ = ["PLUGIN_NAME", "DynamicsLearningPlugin", "resolve_session_digest"]

@@ -163,6 +163,40 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .empty { color: var(--muted); font-size: 13px; }
 .foot { margin-top: 20px; color: var(--muted); font-size: 12px; text-align: center; }
 
+/* View switch. Two views only: the overview a reader opens the page for, and
+   the per-conversation profiles, which are a different question entirely. */
+.tabs { display: flex; gap: 6px; margin: 14px 0 2px; }
+.tab {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+}
+.tab:hover { border-color: var(--accent); }
+.tab.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+
+.sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.bullets { margin: 6px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
+.bullets li { margin: 2px 0; }
+
+/* A delta is read as a direction first and a magnitude second, so the bar shows
+   the direction and the number stays beside it. */
+.bar-track {
+  display: block;
+  height: 4px;
+  margin-top: 4px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+}
+.bar-fill { display: block; height: 100%; background: var(--muted); }
+.bar-fill.bad { background: var(--danger); }
+.bar-fill.ok { background: var(--accent); }
+
 @media (max-width: 640px) {
   .bar { flex-direction: column; align-items: flex-start; }
+  .tabs { flex-wrap: wrap; }
 }

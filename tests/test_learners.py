@@ -8,7 +8,9 @@ from astrbot_plugin_dynamics_learning.core.policy import BASE_POLICY, PARAM_SPEC
 from astrbot_plugin_dynamics_learning.core.recipient_learner import learn as learn_recipient
 from astrbot_plugin_dynamics_learning.core.recommendation import KIND_CONFIG_PARAM, KIND_DIAGNOSTIC
 from astrbot_plugin_dynamics_learning.core.samples import TASK_TOPIC, build_dataset
-from astrbot_plugin_dynamics_learning.core.topic_learner import learn as learn_topic, replay_label, replay_pairs, _rows
+from astrbot_plugin_dynamics_learning.core.topic_learner import (
+    learn as learn_topic, pair_rows, replay_label, replay_pairs,
+)
 
 from .factories import ambient_record, annotated_sessions, make_record, make_trace, topic_record
 
@@ -21,7 +23,7 @@ def _topic_row(session, record):
     """One replayed topic row, built through the real sample pipeline."""
     samples = [s for s in build_dataset([(session, record)]) if s.task == TASK_TOPIC]
     assert samples, "record produced no topic sample"
-    return _rows(samples)[0]
+    return pair_rows(samples)[0]
 
 
 def test_recipient_learner_reports_statistics_without_claiming_accuracy():

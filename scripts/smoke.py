@@ -43,7 +43,10 @@ async def run(sessions: int, per_session: int) -> dict:
         ingested = await plugin.ingest(source="export", payload=export_payload(rows))
         analysis = await plugin.run_analysis(with_evaluation=True)
         policies = await plugin.policies_payload()
-        return {"ingest": ingested, "report": analysis["report"], "policies": policies}
+        quality = await plugin.quality_payload()
+        scopes = await plugin.scopes_payload()
+        return {"ingest": ingested, "report": analysis["report"], "policies": policies,
+                "quality": quality, "scopes": scopes}
     finally:
         await plugin.terminate()
 
@@ -90,6 +93,21 @@ def summarise(payload: dict) -> str:
         lines.append(
             f"  {name}: {primary} {row.get('before')} -> {row.get('after')} "
             f"({row.get('delta')})  留出 {task.get('holdout')}")
+    quality = payload.get("quality") or {}
+    for name, row in (quality.get("capabilities") or {}).items():
+        lines.append(f"  能力 {name}: {row['status_label']} "
+                     f"{row['eligible']}/{row['total']}")
+    contract = quality.get("contract")
+    if contract:
+        lines.append(f"契约面：{contract['annotations_kept']}/{contract['annotations_seen']} 条进入样本，"
+                     f"计数{'守恒' if contract['balanced'] else '不守恒'}，"
+                     f"trace 缺失 {contract['decision_trace_absent']} 条")
+    else:
+        lines.append("契约面：这次导入没有留下原始记录计数")
+    for row in (payload.get("scopes") or {}).get("rows", [])[:3]:
+        lines.append(f"会话 {row['scope_label']}：{row['samples']} 条被检查样本 · "
+                     f"{row['confidence_label']} · 主要问题 "
+                     f"{'、'.join(row['dominant_labels']) or '—'} · {row['diagnosis_label']}")
     lines.append(f"策略记录：{payload['policies']['total']} 条")
     return "\n".join(lines)
 

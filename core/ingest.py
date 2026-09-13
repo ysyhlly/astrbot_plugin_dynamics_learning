@@ -5,13 +5,21 @@ preferences scope (`plugin` / `{author}/{name}`):
 
 | Key | Written by | Used for |
 | --- | --- | --- |
-| `panel_runtime_v1` | `core/runtime_persistence.export_runtime_state` | session -> hash mapping, bounded runtime context |
+| `panel_runtime_v1` | `core/runtime_persistence.export_runtime_state` | session -> hash mapping, identity facts, bounded runtime context |
 | `topic_annotations_v1_<sha256(session)>` | `core/topic_annotations.TopicAnnotations.save` | human labels + frozen `decision_trace` |
 
 The annotation key is a hash, so the session name is recovered by hashing every
 `session_key` in the runtime snapshot. Records whose session cannot be
 recovered are reported as diagnostics and skipped: a label without a session
 cannot be scored, because topic metrics are within-session only.
+
+Every record is also counted **before** it is cleaned or converted, into a
+`RawContractStats`. Those counters are the only place where "the host did not
+write this field" is still distinguishable from "it was written as zero": the
+sample layer normalises traces into schema 2 and re-emits them, which erases
+both facts. The counters are therefore taken here, where the records are still
+raw, and they are made to satisfy an accounting identity so the health report
+cannot quietly lose rows.
 
 This module never writes to the host plugin.
 """
@@ -24,16 +32,23 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
+from .quality import RawContractStats
 from .samples import session_hash
 
 ANNOTATION_KEY_PREFIX = "topic_annotations_v1_"
 RUNTIME_KEY = "panel_runtime_v1"
 RUNTIME_VERSION = 1
-CONTRACT_VERSION = 2
+CONTRACT_VERSION = 3
 MAX_RECORDS_PER_SESSION = 2_000
 
 _ANNOTATION_KEY = re.compile(r"^topic_annotations_v1_[0-9a-f]{64}$")
 _MAX_KEY_BYTES = 4_000_000
+
+REASON_OK = ""
+REASON_BAD_SHAPE = "bad_shape"
+REASON_MISSING_ID = "missing_msg_id"
+REASON_NOT_SERIALISABLE = "not_serialisable"
+REASON_TOO_LARGE = "too_large"
 
 
 @dataclass
@@ -41,6 +56,7 @@ class IngestResult:
     annotations: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    contract: RawContractStats = field(default_factory=RawContractStats)
 
     @property
     def records(self) -> int:
@@ -85,24 +101,31 @@ def _runtime_sessions(payload: Any) -> list[dict[str, Any]]:
     return result
 
 
-def _clean_record(raw: Any) -> dict[str, Any] | None:
+def clean_record(raw: Any) -> tuple[dict[str, Any] | None, str]:
+    """Return the usable record (or None) and why it was rejected."""
     if not isinstance(raw, Mapping):
-        return None
+        return None, REASON_BAD_SHAPE
     msg_id = raw.get("msg_id")
     if not isinstance(msg_id, str) or not msg_id:
-        return None
+        return None, REASON_MISSING_ID
     try:
         encoded = json.dumps(raw, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError):
-        return None
+        return None, REASON_NOT_SERIALISABLE
     if len(encoded) > _MAX_KEY_BYTES:
-        return None
-    return dict(raw)
+        return None, REASON_TOO_LARGE
+    return dict(raw), REASON_OK
+
+
+def _clean_record(raw: Any) -> dict[str, Any] | None:
+    record, _reason = clean_record(raw)
+    return record
 
 
 def parse_preferences(rows: Any) -> IngestResult:
     """Split host preferences into runtime sessions and labelled records."""
     result = IngestResult()
+    stats = RawContractStats(source="shared_preferences")
     pairs = _preference_pairs(rows)
     raw_annotations: list[tuple[str, Any]] = []
     runtime_payload: Any = None
@@ -118,34 +141,53 @@ def parse_preferences(rows: Any) -> IngestResult:
         by_hash[session_hash(item["session_key"])] = item
     result.sessions = {item["session_key"]: item for item in sessions}
 
+    stats.annotation_keys = len(raw_annotations)
     unknown_sessions = 0
-    malformed = 0
     kept = 0
+    used: list[str] = []
     for digest, value in raw_annotations:
         if not isinstance(value, list):
-            malformed += 1
+            # The key exists but carries nothing readable: counted, not parsed.
+            stats.unreadable_keys += 1
             continue
+        stats.truncated += max(0, len(value) - MAX_RECORDS_PER_SESSION)
         session = by_hash.get(digest)
         if session is None:
             unknown_sessions += 1
-            continue
-        session_key = session["session_key"]
+        session_key = session["session_key"] if session is not None else ""
         for row in value[:MAX_RECORDS_PER_SESSION]:
-            record = _clean_record(row)
-            if record is None:
-                malformed += 1
+            # Counted before anything can drop it, so the accounting identity
+            # covers every row the host actually stored.
+            stats.annotations_seen += 1
+            if not session_key:
+                stats.unknown_session += 1
                 continue
+            record, reason = clean_record(row)
+            if record is None:
+                stats.malformed += 1
+                if reason == REASON_TOO_LARGE:
+                    stats.oversized += 1
+                continue
+            stats.observe_record(row)
             result.annotations.append((session_key, record))
+            used.append(session_key)
             kept += 1
 
+    stats.annotations_kept = kept
+    stats.observe_sessions(result.sessions, used)
+    result.contract = stats
     result.diagnostics = {
         "contract_version": CONTRACT_VERSION,
         "runtime_present": runtime_payload is not None,
         "runtime_sessions": len(sessions),
-        "annotation_keys": len(raw_annotations),
+        "annotation_keys": stats.annotation_keys,
         "records": kept,
         "unknown_sessions": unknown_sessions,
-        "malformed": malformed,
+        # Kept in its historical shape (unreadable keys + rejected records) so the
+        # console copy does not change meaning; the precise split lives in the
+        # contract block.
+        "malformed": stats.malformed + stats.unreadable_keys,
+        "balanced": stats.balanced,
         "source": "shared_preferences",
     }
     return result
@@ -160,6 +202,7 @@ def parse_export(payload: Any) -> IngestResult:
       * a bare `[record, ...]` list, which requires `session_key` in each record
     """
     result = IngestResult()
+    stats = RawContractStats(source="export")
     rows: Sequence[Any]
     if isinstance(payload, Mapping):
         candidate = payload.get("sessions")
@@ -167,41 +210,63 @@ def parse_export(payload: Any) -> IngestResult:
     elif isinstance(payload, list):
         rows = payload
     else:
+        result.contract = stats
         result.diagnostics = {"source": "export", "records": 0, "malformed": 1,
+                              "balanced": stats.balanced,
                               "error": "unsupported export shape"}
         return result
 
-    malformed = 0
+    used: list[str] = []
     for row in rows:
         if not isinstance(row, Mapping):
-            malformed += 1
+            stats.annotation_keys += 1
+            stats.annotations_seen += 1
+            stats.malformed += 1
             continue
         session_key = row.get("session_key") or row.get("umo")
         records = row.get("records")
         if isinstance(session_key, str) and session_key and isinstance(records, list):
+            stats.annotation_keys += 1
+            stats.truncated += max(0, len(records) - MAX_RECORDS_PER_SESSION)
             for record in records[:MAX_RECORDS_PER_SESSION]:
-                clean = _clean_record(record)
+                stats.annotations_seen += 1
+                clean, reason = clean_record(record)
                 if clean is None:
-                    malformed += 1
+                    stats.malformed += 1
+                    if reason == REASON_TOO_LARGE:
+                        stats.oversized += 1
                     continue
+                stats.observe_record(record)
                 result.annotations.append((session_key, clean))
+                used.append(session_key)
+                stats.annotations_kept += 1
             continue
-        clean = _clean_record(row)
+        stats.annotation_keys += 1
+        stats.annotations_seen += 1
+        clean, reason = clean_record(row)
         if clean is None or not isinstance(session_key, str) or not session_key:
-            malformed += 1
+            stats.malformed += 1
+            if reason == REASON_TOO_LARGE:
+                stats.oversized += 1
             continue
+        stats.observe_record(row)
         result.annotations.append((session_key, clean))
+        used.append(session_key)
+        stats.annotations_kept += 1
 
     result.sessions = {}
     for session_key, _ in result.annotations:
         result.sessions.setdefault(session_key, {"session_key": session_key})
+    stats.observe_sessions(result.sessions, used)
+    result.contract = stats
     result.diagnostics = {
         "contract_version": CONTRACT_VERSION,
         "source": "export",
         "runtime_sessions": len(result.sessions),
         "records": len(result.annotations),
         "unknown_sessions": 0,
-        "malformed": malformed,
+        "malformed": stats.malformed,
+        "balanced": stats.balanced,
     }
     return result
 
@@ -224,14 +289,17 @@ async def collect_from_host(source_plugin_id: str, *, sp_module: Any = None) -> 
         except Exception:
             module = None
     if module is None or not hasattr(module, "range_get_async"):
-        return IngestResult(diagnostics={"source": "shared_preferences", "available": False,
-                                         "error": "astrbot shared preferences unavailable",
-                                         "records": 0})
+        return IngestResult(
+            contract=RawContractStats(source="shared_preferences"),
+            diagnostics={"source": "shared_preferences", "available": False,
+                         "error": "astrbot shared preferences unavailable", "records": 0})
     try:
         rows = await module.range_get_async("plugin", source_plugin_id, None)
     except Exception as exc:
-        return IngestResult(diagnostics={"source": "shared_preferences", "available": False,
-                                         "error": type(exc).__name__, "records": 0})
+        return IngestResult(
+            contract=RawContractStats(source="shared_preferences"),
+            diagnostics={"source": "shared_preferences", "available": False,
+                         "error": type(exc).__name__, "records": 0})
     result = parse_preferences(rows)
     result.diagnostics["available"] = True
     result.diagnostics["source_plugin_id"] = source_plugin_id
@@ -243,8 +311,10 @@ def merge_results(results: Iterable[IngestResult]) -> IngestResult:
     for result in results:
         merged.annotations.extend(result.annotations)
         merged.sessions.update(result.sessions)
+        merged.contract.merge(result.contract)
     merged.diagnostics = {"merged": True, "records": merged.records,
-                          "runtime_sessions": len(merged.sessions)}
+                          "runtime_sessions": len(merged.sessions),
+                          "balanced": merged.contract.balanced}
     return merged
 
 
@@ -253,6 +323,8 @@ def digest_of(session_key: str) -> str:
 
 
 __all__ = [
-    "ANNOTATION_KEY_PREFIX", "CONTRACT_VERSION", "IngestResult", "RUNTIME_KEY",
-    "collect_from_host", "digest_of", "merge_results", "parse_export", "parse_preferences",
+    "ANNOTATION_KEY_PREFIX", "CONTRACT_VERSION", "IngestResult", "REASON_BAD_SHAPE",
+    "REASON_MISSING_ID", "REASON_NOT_SERIALISABLE", "REASON_OK", "REASON_TOO_LARGE", "RUNTIME_KEY",
+    "clean_record", "collect_from_host", "digest_of", "merge_results", "parse_export",
+    "parse_preferences",
 ]

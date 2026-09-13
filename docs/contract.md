@@ -32,6 +32,31 @@ rows = await sp.range_get_async("plugin", source_plugin_id, None)
 反推。**无法归属的标注会被统计进 `diagnostics.unknown_sessions` 并跳过**：话题指标只在
 会话内比较，没有会话的标注无法参与评分，猜测归属会比丢掉它更糟。
 
+### 2b. 作用域身份（PR1）
+
+`panel_runtime_v1.sessions[]` 同时带 `session_key / group_id / umo / bot_id`，本插件自
+v0.6.1 起读取它们，但**只用于诊断**，不参与任何聚合：
+
+| 字段 | 本体的行为 | 本插件怎么用 |
+| --- | --- | --- |
+| `session_key` | `unified_msg_origin or group_id` | **唯一的学习作用域**，`scope_hash = sha256(session_key)` |
+| `umo` | `unified_msg_origin or session_key`，且本体恢复时要求 `umo == session_key` | 只记录是否等于 session_key（`scope_source`） |
+| `group_id` | 平台的原始群号，**不带平台前缀**；事件没有群号时会写成 session_key | `group_hint_hash`，仅诊断，**不得作为聚合键** |
+| `bot_id` | 机器人自身账号 | 暂不使用 |
+
+三条约束，改代码时不要绕过：
+
+1. **正常事件路径下 `umo == session_key`**，所以 `umo` 无法证明"两个会话是同一个群"。
+2. **`group_id` 不是跨会话群身份**：两个适配器可能给出同一个原始群号，而本体自己的
+   测试就用 `platform-a:GroupMessage:room` 与 `platform-b:GroupMessage:room` 验证过这一点；
+   同一个群号还有可能来自创建 runtime 的不同代码路径。按它聚合会把两个无关会话并成
+   一个画像。
+3. **`scope_hash` 必须逐字节等于 `session_hash(session_key)`**。这是升级不变量：换前缀
+   重新哈希会把每一份已存样本劈成两个身份。
+
+等本体提供一个语义明确的跨会话会话标识（并说明跨 session / 跨 adapter / 跨 bot 账号
+是否相同、生命周期如何）之后，改 `core/scope.py` 一处即可，样本层不需要动。
+
 ## 3. 标注记录里用到的字段
 
 | 字段 | 类型 | 用途 |
@@ -179,7 +204,38 @@ Topic Learner 目前看到的是「最终归属 + 候选集 + 每个候选的证
 | `learning_index_v1` | 每会话样本数与更新时间 |
 | `learning_samples_v1_<sha256(session)>` | 该会话的学习样本（无正文） |
 | `learning_policies_v1` | 策略版本记录与状态 |
-| `learning_state_v1` | 最近一次分析与导入的时间戳、报告摘要 |
+| `learning_state_v1` | 最近一次分析与导入的时间戳、报告摘要、诊断，以及契约面计数快照（`last_contract_stats`） |
 
 不存在任何指向 `ysyhlly/astrbot_plugin_chat_dynamics` 作用域的写入调用。控制台里的
 「采纳」只改 `learning_policies_v1` 里的状态字段。
+
+## 7. 契约健康度：为什么必须在原始记录上数
+
+本插件把读取面记为 `contract_version`：v0.6.1 起为 **3**（开始消费 `panel_runtime_v1`
+的身份字段），并新增 `GET /quality` 把「本体到底写了什么」和「学习层能用这些样本做什么」
+分开报告。
+
+分开的原因不是分层好看，而是**样本层是有损的**：
+
+| 原始记录里的事实 | 经过 `core/trace.py` 归一化之后 |
+| --- | --- |
+| `decision_trace.routing_schema_version = 1` | 永远写回 `2`（`parse_decision_trace` 固定 `contract_version`，`to_contract` 再写回） |
+| `participation.contribution_total = null` | 永远读回 `0.0`（`_finite` 把缺失归一成零） |
+| `routing.topic_candidates` 键不存在 | 由 `topic_candidates_recorded` 标记单独带走（v0.6.0 起） |
+| `contribution_total` 键不存在 | 由 `contribution_total_recorded` 标记单独带走（v0.6.1 起） |
+
+所以对 `/quality` 的规定是：
+
+1. **契约面**只在导入时对原始记录计数，并把快照连同 `contract_at` 一起返回——它永远是
+   「上一次导入时的样子」，页面必须按这个口径读；
+2. **样本面**每次请求实时重算，判据取自学习器自己的谓词（`core/policy.py` 的回放分支、
+   `core/topic_learner.py` 的 `replay_can_move`），不在这里二次推导；
+3. 契约面的会计恒等式为
+
+   ```text
+   annotations_seen == annotations_kept + malformed + unknown_session
+   ```
+
+   并由 `balanced` 字段自报。不守恒时它先说自己是坏的，而不是让读者去猜；
+4. 字段类计数（schema 分布、候选桶、加性分数有无）只统计**进入了样本的那部分记录**，
+   被丢掉的行由会计类计数负责。分子的分母不能来自另一个人群。
