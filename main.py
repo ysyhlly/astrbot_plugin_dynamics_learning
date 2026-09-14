@@ -30,6 +30,11 @@ from .core.policy import (
     ACTION_STATUS, ACTIONS, BASE_POLICY, candidate_payload, normalize_status, published_payload,
 )
 from .core.quality import dataset_gate, quality_report
+from .core.reply_review import (
+    REPLY_REVIEW_SCHEMA_VERSION, build_digest as build_reply_digest,
+    build_prompt as build_reply_prompt, digest_fingerprint as reply_digest_fingerprint,
+    parse_reply_review, select_messages,
+)
 from .core.review import (
     REVIEW_SCHEMA_VERSION, build_digest, build_prompt, digest_fingerprint, parse_review,
 )
@@ -65,7 +70,7 @@ def _completion_text(response: Any) -> str:
     PLUGIN_NAME,
     "ysyhlly",
     "群间 · Dynamics Learning",
-    "v1.1.0",
+    "v1.2.0",
     "",
 )
 class DynamicsLearningPlugin(Star):
@@ -86,6 +91,11 @@ class DynamicsLearningPlugin(Star):
         self._shutting_down = False
         self._review_failed_at = 0.0
         self._review_failure_reason = ""
+        # The post-mortem carries message text, so its result lives in memory for
+        # the life of the process and is never written to the KV store.
+        self._reply_review_cache: dict[str, Any] = {}
+        self._reply_review_failed_at = 0.0
+        self._reply_review_failure_reason = ""
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -271,7 +281,7 @@ class DynamicsLearningPlugin(Star):
         policies = await self.store.load_policies()
         return {
             "plugin": PLUGIN_NAME,
-            "version": "v1.1.0",
+            "version": "v1.2.0",
             "config": config.as_dict(),
             "dataset": {
                 "samples": len(samples),
@@ -401,7 +411,7 @@ class DynamicsLearningPlugin(Star):
                 payload["reason"] = self._review_failure_reason
                 return payload
 
-        provider_id, model = await self._review_provider()
+        provider_id, model = await self._review_provider(config.review_provider_id)
         if not provider_id:
             payload["state"] = "unavailable"
             payload["reason"] = "宿主没有可用的对话模型 Provider，无法生成模型解读。"
@@ -449,7 +459,7 @@ class DynamicsLearningPlugin(Star):
         payload["reason"] = reason
         return payload
 
-    async def _review_provider(self) -> tuple[str, str]:
+    async def _review_provider(self, explicit: str = "") -> tuple[str, str]:
         """The provider to ask, and its model name when the host knows it.
 
         An explicit id wins: a review is a fixed analytical task, and letting the
@@ -458,7 +468,6 @@ class DynamicsLearningPlugin(Star):
         why. With nothing configured, the host's current chat provider is used,
         because a plugin that cannot be configured still has to say something.
         """
-        explicit = self.runtime_config().review_provider_id
         if explicit:
             return explicit, ""
         context = getattr(self, "context", None)
@@ -493,6 +502,132 @@ class DynamicsLearningPlugin(Star):
             response = await response
         return _completion_text(response)
 
+    async def reply_review_payload(self, *, refresh: bool = False,
+                                   sp_module: Any = None) -> dict[str, Any]:
+        """Per-message post-mortem of the reply decision, written by a model.
+
+        This is the one path in the plugin that reads message text. It is read
+        from the host shared preferences for this call only, sent to the
+        configured model, and never written back: not into the sample store,
+        not into a cache. The result is held in memory for the life of the
+        process, so a restart forgets it — which is also why the cache below
+        is a plain dict and not a KV key.
+
+        The model is not shown the human label or what the host decided. That
+        is the whole point: a judge that has been shown the answer agrees with
+        it, and the useful rows here are the ones where the three disagree.
+        """
+        config = self.runtime_config()
+        payload: dict[str, Any] = {
+            "reply_review_schema_version": REPLY_REVIEW_SCHEMA_VERSION,
+            "state": "unavailable",
+            "reason": "",
+            "provider_id": "",
+            "model": "",
+            "generated_at": None,
+            "stats": {},
+            "review": None,
+            "text_policy": ("正文只在本体与模型之间过一次：本插件不保存正文，复盘结果也不落盘；"
+                            "关掉开关后连读都不读。"),
+        }
+        if not config.reply_review_enabled:
+            payload["state"] = "disabled"
+            payload["reason"] = ("逐条复盘默认关闭：它会把群消息正文发给你配置的模型。"
+                                 "确认接受这一点后，打开 learning_reply_review_enabled。")
+            return payload
+
+        try:
+            result = await collect_from_host(config.source_plugin_id, sp_module=sp_module)
+        except Exception as exc:
+            payload["reason"] = f"读取本体标注失败（{type(exc).__name__}）。"
+            return payload
+        if result.diagnostics.get("available") is False:
+            # collect_from_host reports an unreachable host instead of raising:
+            # "the host is not there" and "the host has no annotations" are
+            # different findings with different fixes.
+            payload["reason"] = ("读不到本体的共享首选项（本体未安装、未加载，或 AstrBot 版本不支持）。")
+            return payload
+        messages, stats = select_messages(result.annotations,
+                                          limit=config.reply_review_max_messages)
+        payload["stats"] = stats
+        if not messages:
+            payload["state"] = "empty"
+            payload["reason"] = ("本体还没有可复盘的标注记录：先在 ChatDynamics 的场景回放里标注"
+                                 "「该不该回」（expected_reply）。")
+            return payload
+        if not stats["with_text"]:
+            payload["state"] = "no_text"
+            payload["reason"] = (
+                f"选中的 {stats['selected']} 条都没有正文。本插件从不保存正文，本体也只在打开"
+                "「控制台显示消息正文」时才把它写进标注记录；打开它并重新标注后即可复盘。")
+            return payload
+
+        digest = build_reply_digest(messages)
+        fingerprint = reply_digest_fingerprint(digest)
+        cached = self._reply_review_cache
+        if not refresh and cached.get("fingerprint") == fingerprint:
+            payload.update(state="cached", generated_at=cached.get("generated_at"),
+                           provider_id=cached.get("provider_id", ""),
+                           model=cached.get("model", ""), review=cached.get("review"))
+            return payload
+        if not refresh and self._reply_review_failed_at:
+            if time.time() - self._reply_review_failed_at < REVIEW_RETRY_SECONDS:
+                payload["state"] = "failed"
+                payload["reason"] = self._reply_review_failure_reason
+                return payload
+
+        provider_id, model = await self._review_provider(config.reply_review_provider_id)
+        if not provider_id:
+            payload["reason"] = "宿主没有可用的对话模型 Provider，无法复盘。"
+            return payload
+        payload["provider_id"] = provider_id
+        payload["model"] = model
+        try:
+            reply = await asyncio.wait_for(
+                self._ask_reply_review(digest, provider_id),
+                timeout=float(config.reply_review_timeout_seconds))
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            return self._reply_review_failed(
+                payload, f"模型在 {config.reply_review_timeout_seconds} 秒内没有返回。")
+        except Exception as exc:
+            return self._reply_review_failed(
+                payload, f"调用模型失败（{type(exc).__name__}）。")
+
+        review = parse_reply_review(reply, messages, stats=stats)
+        if review is None:
+            return self._reply_review_failed(payload, "模型返回的不是可解析的 JSON 对象。")
+
+        self._reply_review_failed_at = 0.0
+        self._reply_review_failure_reason = ""
+        generated_at = time.time()
+        review["provider_id"] = provider_id
+        review["model"] = model
+        review["generated_at"] = generated_at
+        self._reply_review_cache = {"fingerprint": fingerprint, "generated_at": generated_at,
+                                    "provider_id": provider_id, "model": model,
+                                    "review": review}
+        payload.update(state="fresh", generated_at=generated_at, review=review)
+        return payload
+
+    def _reply_review_failed(self, payload: dict[str, Any], reason: str) -> dict[str, Any]:
+        self._reply_review_failed_at = time.time()
+        self._reply_review_failure_reason = reason
+        payload["state"] = "failed"
+        payload["reason"] = reason
+        return payload
+
+    async def _ask_reply_review(self, digest: dict[str, Any], provider_id: str) -> str:
+        context = getattr(self, "context", None)
+        generate = getattr(context, "llm_generate", None)
+        if not callable(generate):
+            raise RuntimeError("AstrBot context does not expose llm_generate")
+        system_prompt, prompt = build_reply_prompt(digest)
+        response = generate(chat_provider_id=provider_id, prompt=prompt, system_prompt=system_prompt)
+        if inspect.isawaitable(response):
+            response = await response
+        return _completion_text(response)
     async def attribution_payload(self, *, examples: int = 8) -> dict[str, Any]:
         """The error attribution chain, computed from the stored samples.
 

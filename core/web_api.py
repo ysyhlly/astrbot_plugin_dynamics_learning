@@ -95,7 +95,9 @@ class LearningWebAPI:
             ("quality", self.quality, ["GET"], "数据契约健康度：能力矩阵与原始记录统计"),
         ("review", self.review, ["GET"],
          "由模型重写数据契约解读（?refresh=1 重新解读；模型不可用时回落本插件判定）"),
-            ("attribution", self.attribution, ["GET"],
+            ("reply_review", self.reply_review, ["GET"],
+         "逐条复盘回复判定（模型判断；默认关闭，会把正文发给模型）"),
+        ("attribution", self.attribution, ["GET"],
              "错误归因链：每条消息归入唯一一层（收件人/候选生成/排序/参与准入/门禁/生成/发送）"),
             ("shadow", self.shadow, ["GET"],
              "shadow A/B：分歧子集对比、置信区间与进入 active 的门槛"),
@@ -171,6 +173,14 @@ class LearningWebAPI:
         except Exception as exc:
             logger.error("[DynamicsLearning] review failed type=%s", type(exc).__name__)
             return _json_err("生成数据契约解读失败", 500)
+
+    async def reply_review(self):
+        try:
+            refresh = _query_param("refresh", "") not in ("", "0", "false", "False")
+            return _json_ok(await self.plugin.reply_review_payload(refresh=refresh))
+        except Exception as exc:
+            logger.error("[DynamicsLearning] reply review failed type=%s", type(exc).__name__)
+            return _json_err("生成回复复盘失败", 500)
 
     async def attribution(self):
         try:

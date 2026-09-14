@@ -130,6 +130,15 @@ class LearningConfig:
     review_provider_id: str = ""
     review_timeout_seconds: int = 45
 
+    # Per-message reply post-mortem. Off by default because it is the one path
+    # that sends message text off the machine: the contract review above sends
+    # counts only. Text is read from the host for a single call and is never
+    # written to this plugin's store.
+    reply_review_enabled: bool = False
+    reply_review_provider_id: str = ""
+    reply_review_timeout_seconds: int = 60
+    reply_review_max_messages: int = 12
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
@@ -172,6 +181,10 @@ class LearningConfig:
             "review_enabled": self.review_enabled,
             "review_provider_id": self.review_provider_id,
             "review_timeout_seconds": self.review_timeout_seconds,
+            "reply_review_enabled": self.reply_review_enabled,
+            "reply_review_provider_id": self.reply_review_provider_id,
+            "reply_review_timeout_seconds": self.reply_review_timeout_seconds,
+            "reply_review_max_messages": self.reply_review_max_messages,
         }
 
     def with_overrides(self, **changes: Any) -> "LearningConfig":
@@ -273,6 +286,14 @@ def parse_learning_config(raw: Any) -> LearningConfig:
         review_provider_id=_as_text(pick("learning_review_provider"), defaults.review_provider_id, 128),
         review_timeout_seconds=_as_int(
             pick("learning_review_timeout"), defaults.review_timeout_seconds, 5, 300),
+        reply_review_enabled=_as_bool(pick("learning_reply_review_enabled"),
+                                      defaults.reply_review_enabled),
+        reply_review_provider_id=_as_text(pick("learning_reply_review_provider"),
+                                          defaults.reply_review_provider_id, 128),
+        reply_review_timeout_seconds=_as_int(
+            pick("learning_reply_review_timeout"), defaults.reply_review_timeout_seconds, 5, 300),
+        reply_review_max_messages=_as_int(
+            pick("learning_reply_review_messages"), defaults.reply_review_max_messages, 1, 40),
     )
 
 
@@ -295,4 +316,6 @@ _KNOWN_KEYS = (
     "learning_rate", "learning_l2", "learning_iterations",
     "learning_auto_analyze", "learning_auto_analyze_minutes",
     "learning_review_enabled", "learning_review_provider", "learning_review_timeout",
+    "learning_reply_review_enabled", "learning_reply_review_provider",
+    "learning_reply_review_timeout", "learning_reply_review_messages",
 )

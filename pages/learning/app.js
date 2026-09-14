@@ -16,6 +16,7 @@ const ENDPOINTS = {
   analyze: "analyze",
   report: "report",
   review: "review",
+  replyReview: "reply_review",
   policies: "policies",
   policy: "policy",
   export: "export",
@@ -47,7 +48,7 @@ const CONFIDENCE_LABEL = {
   moderate: "置信度中",
 };
 
-const state = { overview: null, report: null, quality: null, attribution: null, scopes: null, review: null, view: "overview" };
+const state = { overview: null, report: null, quality: null, attribution: null, scopes: null, review: null, replyReview: null, view: "overview" };
 
 // Where the deterministic table lives in the markup: the review card borrows it
 // while a review exists and gives it back when one does not.
@@ -801,6 +802,91 @@ async function loadReview({ refresh = false, quiet = false } = {}) {
   }
 }
 
+// ---- per-message reply post-mortem -------------------------------------
+//
+// The model is asked one question about each message and is deliberately not
+// shown the human label or what the host decided: it sees the text, and its
+// judgement is then placed beside both. Where the three disagree is the only
+// place a reader learns something they did not already know. Nothing here is
+// stored: the text makes one trip and the answer lives in the plugin process.
+
+const HUMAN_LABEL = { true: "该回", false: "不该回" };
+
+function humanCell(value) {
+  if (value === null || value === undefined) return `<span class="sub">没有标注</span>`;
+  return `<span class="tag ${value ? "ok" : ""}">${esc(HUMAN_LABEL[String(value)] || "—")}</span>`;
+}
+
+function hostCell(row) {
+  const level = row.host_level ? `<span class="tag">${esc(row.host_level)}</span>` : `<span class="sub">未记录</span>`;
+  const outcome = row.outcome || {};
+  const actual = row.outcome_recorded
+    ? `<span class="tag ${outcome.delivered ? "ok" : "bad"}">${esc(outcome.value_label || outcome.value || "—")}</span>`
+      + (outcome.suppression_reason ? `<div class="sub">${esc(outcome.suppression_reason)}</div>` : "")
+    : `<span class="sub">结果未记录</span>`;
+  return `${level}<div class="sub">实际：${actual}</div>`;
+}
+
+function modelCell(row) {
+  if (!row.decided) {
+    return `<span class="tag">未判断</span><div class="sub">${esc(row.model_reason || "模型没有给出布尔判断")}</div>`;
+  }
+  // The reason is the only part of a judgement a reader can argue with, so it
+  // sits next to the call rather than behind a tooltip.
+  return `<span class="tag ${row.model_should_reply ? "ok" : ""}">${esc(HUMAN_LABEL[String(row.model_should_reply)])}</span>`
+    + `<div class="sub">置信度 ${esc(row.model_confidence)}</div>`
+    + (row.model_reason ? `<div class="sub">${esc(row.model_reason)}</div>` : "");
+}
+
+function renderReplyReview(data) {
+  const host = $("replyReview");
+  if (!host) return;
+  const review = data && data.review;
+  if (!review) {
+    const stats = (data && data.stats) || {};
+    const detail = stats.selected ? `（选中 ${esc(stats.selected)} 条，其中带正文 ${esc(stats.with_text || 0)} 条）` : "";
+    host.innerHTML = `<p class="hint">${esc((data && data.reason) || "还没有复盘结果。")}${detail}</p>`;
+    return;
+  }
+  const counts = review.counts || {};
+  const rows = (review.rows || []).map((row) => `<tr>
+      <td>${row.has_text ? esc(row.text) : `<span class="sub">（没有正文）</span>`}
+        <div class="sub">${esc(row.msg_id)}${row.mentions_bot ? " · 提到了机器人" : ""}</div></td>
+      <td>${humanCell(row.human_expected_reply)}</td>
+      <td>${hostCell(row)}</td>
+      <td>${modelCell(row)}</td>
+      <td><span class="tag ${row.verdict === "missed" || row.verdict === "over_replied" ? "warn" : ""}">${esc(row.verdict_label || "")}</span>
+        ${row.vs_human !== "unknown" ? `<span class="tag ${row.vs_human === "disagree" ? "warn" : ""}">${esc(row.vs_human_label)}</span>` : ""}</td>
+    </tr>`).join("");
+  const patterns = (review.patterns || []).map((line) => `<li>${esc(line)}</li>`).join("");
+  host.innerHTML = `<div class="grid">
+      ${statCard("模型判断", counts.decided ?? 0, `未判断 ${counts.undecided ?? 0} 条`)}
+      ${statCard("与人工一致", `${counts.human_agree ?? 0}/${counts.with_human ?? 0}`, `不一致 ${counts.human_disagree ?? 0} 条`)}
+      ${statCard("模型认为漏回", counts.missed ?? 0, `认为多回 ${counts.over_replied ?? 0} 条`)}
+    </div>
+    <p class="rationale">${esc(review.summary || "")}</p>
+    <div class="table-host"><table><thead><tr>
+      <th>消息</th><th>人工标注</th><th>本体 / 实际</th><th>模型判断</th><th>对照</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>
+    ${patterns ? `<h4>反复出现的模式</h4><ul class="bullets">${patterns}</ul>` : ""}
+    <p class="hint">由 ${esc(review.model || (data && data.provider_id) || "当前模型")} 复盘子
+      ${esc(typeof review.generated_at === "number" ? new Date(review.generated_at * 1000).toLocaleString() : "—")}
+      ${data.state === "cached" ? "（直接复用进程内结果）" : ""}；
+      本插件不保存正文，复盘结果也不落盘。${esc((data && data.text_policy) || "")}</p>`;
+}
+
+async function loadReplyReview() {
+  const host = $("replyReview");
+  if (!host) return;
+  host.innerHTML = `<p class="empty">正在让模型逐条复盘…</p>`;
+  try {
+    const data = await call(ENDPOINTS.replyReview, { params: { refresh: 1 } });
+    state.replyReview = data;
+    renderReplyReview(data);
+  } catch (error) {
+    host.innerHTML = `<p class="hint">回复复盘失败：${esc(error.message || error)}</p>`;
+  }
+}
 function renderQuality(data) {
   const host = $("quality");
   if (!data) {
@@ -1066,6 +1152,11 @@ function bind() {
       }
     });
   });
+
+  $("btnReplyReview").addEventListener("click", () => withBusy($("btnReplyReview"), "复盘中…", async () => {
+    await loadReplyReview();
+    notice("复盘完成；正文没有被写进本插件的存储。", "ok");
+  }));
 
   $("btnScopes").addEventListener("click", () => withBusy($("btnScopes"), "加载中…", async () => {
     const listing = await loadScopes();

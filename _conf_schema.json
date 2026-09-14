@@ -266,5 +266,29 @@
     "type": "int",
     "default": 45,
     "hint": "超过该时间未返回即回落到本插件判定。结果按数据集指纹缓存，只有数据或契约面变化、或手动点「重新解读」时才会重新调用模型。范围 5~300。"
+  },
+  "learning_reply_review_enabled": {
+    "description": "回复复盘：让模型逐条判断该不该回",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。这是本插件唯一会把群消息正文发出去的路径：开启后，点面板上的「开始复盘」会把选中的消息正文发给你配置的模型。正文只从本体读一次、不写进本插件的存储，复盘结果也不落盘；关掉开关连读都不读。还需要 ChatDynamics 打开「控制台显示消息正文」，否则标注记录里没有正文。"
+  },
+  "learning_reply_review_provider": {
+    "description": "复盘所用模型 Provider（留空用当前对话模型）",
+    "type": "string",
+    "default": "",
+    "hint": "留空时用宿主当前的对话模型 Provider。判断「该不该回」是一件固定的分析任务，固定一个模型才能让不同时间的复盘可比。"
+  },
+  "learning_reply_review_timeout": {
+    "description": "复盘超时（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "逐条判断比读一遍数字慢，默认给 60 秒。超时即放弃本次复盘并退避 90 秒，期间不会反复调用模型。范围 5~300。"
+  },
+  "learning_reply_review_messages": {
+    "description": "单次复盘的消息条数",
+    "type": "int",
+    "default": 12,
+    "hint": "每次取最近这么多条可复盘消息（有标注、有判定或有结果记录的），范围 1~40。条数越多，一次调用越贵，判断也越容易相互影响。"
   }
 }

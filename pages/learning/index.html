@@ -67,6 +67,24 @@
           <div id="shadow" class="stack"></div>
         </section>
 
+        <section class="card" data-view="overview" aria-labelledby="hReplyReview">
+          <h2 id="hReplyReview">回复复盘</h2>
+          <p class="hint">
+            让模型逐条回答同一个问题：<strong>这条消息，机器人当时应该回复吗？</strong>
+            模型看不到人工标注，也看不到本体当时判成了什么 —— 它只看正文。判断回来之后，
+            与人工标注、本体判定和实际结果并排放，所以三列不一致的那几行才是这张表的意义。
+            正文只在本体与模型之间过一次：本插件不保存正文，复盘结果也不落盘，默认关闭。
+            需要同时打开本插件的 <code>learning_reply_review_enabled</code>，以及 ChatDynamics 的
+            「控制台显示消息正文」（否则标注记录里根本没有正文）。
+          </p>
+          <div class="bar-actions">
+            <button id="btnReplyReview" type="button" class="btn">开始复盘</button>
+          </div>
+          <div id="replyReview" class="stack">
+            <p class="empty">点「开始复盘」才会调用模型 —— 这一步会把选中的消息正文发给模型。</p>
+          </div>
+        </section>
+
         <section class="card" data-view="overview" aria-labelledby="hAttribution">
           <h2 id="hAttribution">错误归因链</h2>
           <p class="hint">
@@ -164,7 +182,7 @@
       </main>
 
       <footer class="foot">
-        <span>Dynamics Learning v1.1.0 · Shadow Learning：只学习、只分析、只推荐。</span>
+        <span>Dynamics Learning v1.2.0 · Shadow Learning：只学习、只分析、只推荐。</span>
       </footer>
     </div>
     <script src="./app.js"></script>
