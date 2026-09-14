@@ -43,6 +43,10 @@
   所以从未暴露这个问题。）现在页面在 `<head>` 里显式加载 `/api/plugin/page/bridge-sdk.js`
   （AstrBot 会把该地址重写成带页面令牌的地址），并且启动时最多等 4 秒再发第一次请求；
   真的没有桥接时报错也会说清是「直接打开了 index.html」还是「宿主没有注入 SDK」。
+- 修复 `Cannot set properties of null (setting 'innerHTML')`：模型解读卡片此前把确定性表格的**节点搬进**
+  自己动态创建的 `<details>`，而下一次重绘解读卡片会用一个 `innerHTML` 覆盖整块子树 —— 被搬进去的表格
+  因此从文档里消失，之后每次渲染它都命中 null（表现为切到任意页签都报这一句）。现在表格有自己固定的
+  `<details id="qualityRaw">`，解读卡片只切换它的展开状态，不再移动任何节点。
 
 ### 验证
 

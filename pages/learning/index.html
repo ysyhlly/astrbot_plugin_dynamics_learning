@@ -47,7 +47,14 @@
             越界的数字会单独标出；模型不可用时自动回落到本插件自己的判定。
           </p>
           <div id="review" class="stack"></div>
-          <div id="quality" class="stack"></div>
+          <!-- The deterministic table lives here and is never moved into the
+               review card: moving a node into a parent that is later replaced
+               with innerHTML destroys it, and every later render of it then
+               fails on a null element. -->
+          <details id="qualityRaw" open>
+            <summary>原始判定与计数（本插件计算，未经过模型）</summary>
+            <div id="quality" class="stack"></div>
+          </details>
         </section>
 
         <section class="card" data-view="overview" aria-labelledby="hOverview">

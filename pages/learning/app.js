@@ -50,10 +50,6 @@ const CONFIDENCE_LABEL = {
 
 const state = { overview: null, report: null, quality: null, attribution: null, scopes: null, review: null, replyReview: null, view: "overview" };
 
-// Where the deterministic table lives in the markup: the review card borrows it
-// while a review exists and gives it back when one does not.
-const QUALITY_HOME = document.getElementById("quality")?.parentElement || null;
-
 function $(id) {
   return document.getElementById(id);
 }
@@ -725,15 +721,9 @@ function traceLine(trace) {
 
 const VERDICT_CLASS = { empty: "", usable: "ok", partial: "warn", blocked: "bad" };
 
-function qualityNode() {
-  return $("quality");
-}
-
-function restoreQualityNode() {
-  const node = qualityNode();
-  if (node && QUALITY_HOME && node.parentElement !== QUALITY_HOME) {
-    QUALITY_HOME.appendChild(node);
-  }
+function setQualityRawOpen(open) {
+  const details = $("qualityRaw");
+  if (details) details.open = open;
 }
 
 function reviewTags(row) {
@@ -748,7 +738,7 @@ function renderReview(data) {
   if (!host) return;
   const review = data && data.review;
   if (!review) {
-    restoreQualityNode();
+    setQualityRawOpen(true);
     const reason = (data && data.reason) || "模型解读不可用。";
     host.innerHTML = `<p class="hint">${esc(reason)}</p>`;
     return;
@@ -796,13 +786,7 @@ function renderReview(data) {
         <button type="button" class="btn small" data-review-refresh="1">重新解读</button>
       </p>
     </article>`;
-  const detail = document.createElement("details");
-  const summary = document.createElement("summary");
-  summary.textContent = "原始判定与计数（本插件计算，未经过模型）";
-  detail.appendChild(summary);
-  const node = qualityNode();
-  if (node) detail.appendChild(node);
-  host.appendChild(detail);
+  setQualityRawOpen(false);
 }
 
 async function loadReview({ refresh = false, quiet = false } = {}) {
@@ -814,7 +798,7 @@ async function loadReview({ refresh = false, quiet = false } = {}) {
     state.review = data;
     renderReview(data);
   } catch (error) {
-    restoreQualityNode();
+    setQualityRawOpen(true);
     host.innerHTML = `<p class="hint">模型解读失败：${esc(error.message || error)}；下面是本插件自己的判定。</p>`;
   }
 }
