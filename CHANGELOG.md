@@ -35,6 +35,15 @@
 - 新增 `learning_reply_review_enabled`（默认 false）、`learning_reply_review_provider`（留空用宿主当前对话模型）、
   `learning_reply_review_timeout`（默认 60 秒）、`learning_reply_review_messages`（默认 12，范围 1~40）。
 
+### 插件页加载
+
+- 修复面板整体报「Plugin Page bridge 不可用」：AstrBot 在本页没有自带桥接时，是把 `bridge-sdk.js`
+  追加在 `</body>` 之前，而本页的 `app.js` 是普通脚本、先于它执行，于是第一次请求时
+  `window.AstrBotPluginPage` 还不存在。（本体自己的控制台页用的是 `type="module"`，天然延后执行，
+  所以从未暴露这个问题。）现在页面在 `<head>` 里显式加载 `/api/plugin/page/bridge-sdk.js`
+  （AstrBot 会把该地址重写成带页面令牌的地址），并且启动时最多等 4 秒再发第一次请求；
+  真的没有桥接时报错也会说清是「直接打开了 index.html」还是「宿主没有注入 SDK」。
+
 ### 验证
 
 - 新增 `tests/test_reply_review.py`（22 项）：摘要必须不含标注/判定/结果/会话标识、批次挑选与统计、
