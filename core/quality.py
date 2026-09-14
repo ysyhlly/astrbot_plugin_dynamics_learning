@@ -16,13 +16,14 @@ Two planes, and the split is not cosmetic:
 * **sample plane** — facts about the samples the learners actually read,
   recomputed from the store on every request.
 
-The division is mandatory, not stylistic: `core/trace.py` normalises every trace
-into schema 2 and re-emits it, so a version counter read back from a stored
-sample reports 100% schema 2 no matter what the host wrote, and a missing
-`contribution_total` reads back as `0.0`. Anything whose presence can be erased
-by the round trip is either counted on the contract plane or carried through
-normalisation as an explicit flag (`topic_candidates_recorded`,
-`contribution_total_recorded`); it is never inferred afterwards.
+The division is mandatory, not stylistic. `core/trace.py` re-emits a trace in
+the schema it was read in — since v0.9.0 a schema 3 record stays schema 3 — but
+the round trip still erases what the host never wrote: a missing
+`contribution_total` reads back as `0.0`, and an `outcome` block that was absent
+is absent again. Anything whose presence can be erased that way is either
+counted on the contract plane or carried through normalisation as an explicit
+fact (`topic_candidates_recorded`, `contribution_total_recorded`,
+`source_schema`); it is never inferred afterwards.
 
 Capabilities are asked of the learners' own predicates — `policy.decide`'s
 conditions for the threshold-sensitive split, `topic_learner.replay_can_move`
@@ -180,6 +181,23 @@ def _health(name: str, eligible: int, total: int, *, definition: str, reasons: S
 
 
 # ---- sample plane: what the learners can do with these samples ----------
+
+def _declared_trace_schemas(samples: Sequence[LearningSample]) -> set[int]:
+    """The trace schemas the host actually declared on these rows.
+
+    `source_schema` is the number the host wrote (0 when it wrote none, or one
+    this reader does not know). That is exactly the difference between "schema 2
+    cannot answer this" and "nothing here has been labelled yet", so the
+    verdict on a capability must be read from it rather than assumed.
+    """
+    found: set[int] = set()
+    for sample in samples:
+        trace = sample.trace if isinstance(sample.trace, Mapping) else {}
+        declared = trace.get("source_schema")
+        if isinstance(declared, int) and not isinstance(declared, bool):
+            found.add(declared)
+    return found
+
 
 def _replay_split(samples: Sequence[LearningSample]) -> dict[str, int]:
     """Why a threshold move can or cannot change these samples.
@@ -346,9 +364,25 @@ def final_reply_outcome(samples: Sequence[LearningSample], *,
         if found.recorded and not found.is_delivered:
             stages[found.stage] = stages.get(found.stage, 0) + 1
     if not recorded:
-        reasons.append("没有任何标注记录过最终发送结果：schema 2 的 decision_trace 里"
-                       "没有 outcome 字段，本体也没有写 participation.should_reply，"
-                       "因此在这个契约下该能力不可用")
+        # Which of the three ways this row is empty matters, and only one of them
+        # is about the contract. An unlabelled corpus used to be read as the
+        # schema 2 hole, which told a reader running a schema 3 host that the
+        # host could not answer the question at all.
+        schemas = _declared_trace_schemas(labelled)
+        newest = max(schemas) if schemas else 0
+        if not labelled:
+            reasons.append("还没有回复准入标注样本：本体记录 expected_reply 才会产生。")
+        elif newest == 0:
+            reasons.append(f"{len(labelled)} 条回复标注的轨迹没有声明 trace schema 号"
+                           "（或声明了本插件不认识的值），无法判断这个契约是否写 outcome")
+        elif newest < LATEST_TRACE_SCHEMA:
+            reasons.append("没有任何标注记录过最终发送结果：schema 2 的 decision_trace 里"
+                           "没有 outcome 字段，本体也没有写 participation.should_reply，"
+                           "因此在这个契约下该能力不可用")
+        else:
+            reasons.append(f"{len(labelled)} 条回复标注的轨迹声明 schema {newest}，"
+                           "但没有一条带 outcome 段：缺的是记录，不是契约 —— "
+                           "该轮结束时的最终发送结果本就应当写在这一段里")
     elif recorded < len(labelled):
         reasons.append(f"{len(labelled) - recorded} 条回复标注没有对应的最终结果记录，"
                        "它们只能按路由准入解释")
@@ -698,6 +732,21 @@ class RawContractStats:
         }
 
 
+def _contract_trace_schemas(contract: Mapping[str, Any]) -> set[int]:
+    """The trace schema numbers a raw contract snapshot counted, as integers."""
+    raw = contract.get("routing_schema_versions")
+    if not isinstance(raw, Mapping):
+        return set()
+    found: set[int] = set()
+    for key, value in raw.items():
+        try:
+            if int(value or 0) > 0:
+                found.add(int(key))
+        except (TypeError, ValueError):
+            continue
+    return found
+
+
 def contract_findings(contract: Mapping[str, Any] | None) -> list[str]:
     """The few things a reader must know before trusting the raw plane."""
     if not isinstance(contract, Mapping) or not contract:
@@ -737,10 +786,20 @@ def contract_findings(contract: Mapping[str, Any] | None) -> list[str]:
         present = int(outcome.get("present") or 0)
         absent = int(outcome.get("absent") or 0)
         if absent:
-            findings.append(
-                f"{absent} 条记录没有最终发送结果（schema 2 不写 outcome）："
-                "在这些记录上，「该回但被作息压掉」与「该回而路由没回」是同一条记录，"
-                "只能按路由准入解释")
+            declared = _contract_trace_schemas(contract)
+            newest = max(declared) if declared else 0
+            if newest >= LATEST_TRACE_SCHEMA:
+                # A schema 3 record with no outcome is a recording gap, not a
+                # documented hole: naming which one it is decides who fixes it.
+                findings.append(
+                    f"{absent} 条记录声明 schema {newest} 却没有最终发送结果："
+                    "该版本的契约要求写出这一段，缺的是这几条记录本身"
+                    "（写入早于该字段，或该轮没走到记录点）")
+            else:
+                findings.append(
+                    f"{absent} 条记录没有最终发送结果（schema 2 不写 outcome）："
+                    "在这些记录上，「该回但被作息压掉」与「该回而路由没回」是同一条记录，"
+                    "只能按路由准入解释")
         if present:
             reasons = outcome.get("suppression_reasons")
             rendered = "、".join(f"{key}×{value}" for key, value in

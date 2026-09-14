@@ -4,6 +4,7 @@
 
 - 独立 candidate API/KV 提供 validated/shadow 策略用于真实影子观察，published 仍只提供 promoted。
 - 增加 Operational Shadow Coverage：读取独立无正文 telemetry，去重后按策略、本体版本、原因、会话与时段统计，保留窗口分母与人工标签收益分开显示。
+- 数据契约状态按数据说话：能力行的「不支持」不再一律解释成 schema 2 的契约缺口 —— 没有标注样本时只说还没有样本，轨迹声明 schema 2 时才说契约不写 outcome，声明 schema 3 却没有 outcome 段时按**记录缺失**报出（`contract_findings` 同样区分）；面板另显示本体实际写入的 trace schema 分布与读取端支持的版本。
 
 这一版把闭环补上：本体在 `shadow` 模式下**不改行为**，但每条消息会同时算出
 「baseline 会怎么判」与「策略会怎么判」，学习层据此回答唯一值得问的问题 ——

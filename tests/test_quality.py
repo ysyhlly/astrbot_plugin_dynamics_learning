@@ -367,6 +367,54 @@ def test_the_final_send_outcome_is_unsupported_by_contract():
     assert any("最终发送结果" in reason for reason in health.reasons)
 
 
+def test_an_unlabelled_corpus_is_not_a_contract_verdict():
+    """Zero rows say nothing about what the host writes.
+
+    The row used to explain itself with "schema 2 has no outcome" whenever the
+    numerator was zero — including on an empty corpus, which told a reader
+    running a schema 3 host that the host could not answer the question at all.
+    """
+    from astrbot_plugin_dynamics_learning.core.quality import final_reply_outcome
+
+    health = final_reply_outcome([], min_samples=1)
+
+    assert health.status == STATUS_UNSUPPORTED
+    assert health.total == 0
+    assert any("还没有回复准入标注样本" in reason for reason in health.reasons)
+    assert not any("这个契约下该能力不可用" in reason for reason in health.reasons)
+
+
+def test_a_schema_three_row_without_an_outcome_is_a_record_gap():
+    """Schema 3 writes the outcome block; a missing one is a record gap."""
+    from astrbot_plugin_dynamics_learning.core.quality import final_reply_outcome
+
+    record = _ambient("m1")
+    record["decision_trace"]["trace_schema_version"] = 3
+    samples = build_dataset([(SESSION, record)])
+    rows = [sample for sample in samples if sample.task == TASK_REPLY_ADMISSION]
+
+    health = final_reply_outcome(samples, min_samples=1)
+
+    assert rows, "the fixture is meant to carry reply supervision"
+    assert health.status == STATUS_UNSUPPORTED
+    assert health.eligible == 0
+    assert any("缺的是记录，不是契约" in reason for reason in health.reasons)
+    assert not any("这个契约下该能力不可用" in reason for reason in health.reasons)
+
+
+def test_a_schema_two_row_still_names_the_contract_hole():
+    """The other direction: an older record really is the documented hole."""
+    from astrbot_plugin_dynamics_learning.core.quality import final_reply_outcome
+
+    samples = build_dataset([(SESSION, _ambient("m1"))])
+    rows = [sample for sample in samples if sample.task == TASK_REPLY_ADMISSION]
+
+    health = final_reply_outcome(samples, min_samples=1)
+
+    assert rows
+    assert any("schema 2" in reason and "这个契约下该能力不可用" in reason
+               for reason in health.reasons)
+
 def test_quality_report_without_an_import_says_so():
     report = quality_report(build_dataset([(SESSION, _ambient("m1"))]), now=10.0)
 
@@ -411,6 +459,21 @@ def test_contract_findings_name_the_field_that_is_missing():
     assert any("4/10" in finding for finding in findings)
     assert any("截断" in finding for finding in findings)
 
+
+def test_contract_findings_separate_a_record_gap_from_a_schema_two_hole():
+    """Who has to fix a missing outcome depends on what the host declared."""
+    older = contract_findings({
+        "balanced": True, "routing_schema_versions": {"2": 12},
+        "outcome": {"present": 0, "absent": 12},
+    })
+    newer = contract_findings({
+        "balanced": True, "routing_schema_versions": {"3": 12},
+        "outcome": {"present": 0, "absent": 12},
+    })
+
+    assert any("schema 2 不写 outcome" in finding for finding in older)
+    assert any("声明 schema 3" in finding for finding in newer)
+    assert not any("schema 2" in finding for finding in newer)
 
 def test_contract_findings_shout_when_the_counters_do_not_balance():
     findings = contract_findings({"balanced": False})

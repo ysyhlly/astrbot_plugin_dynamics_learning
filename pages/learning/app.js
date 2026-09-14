@@ -675,6 +675,23 @@ function contractLine(contract) {
   ].join(" · ");
 }
 
+function traceLine(trace) {
+  // Which trace schema the host writes, and which ones this reader knows. The
+  // capability matrix below can only say "no data yet" or "not in the record";
+  // only this line can say "the host does not write that field at all".
+  if (!trace) return "—";
+  const observed = trace.observed || {};
+  const keys = Object.keys(observed).sort();
+  const rendered = keys.length
+    ? keys.map((key) => `${key}×${observed[key]}`).join("、")
+    : "还没有读到轨迹";
+  const supported = (trace.supported || []).join(" / ");
+  const unreadable = (trace.unreadable || []).length
+    ? `；本插件读不了：${trace.unreadable.join("、")}`
+    : "";
+  return `本体写了 ${rendered}（读取端支持 ${supported}，最新 ${trace.latest}）${unreadable}`;
+}
+
 function renderQuality(data) {
   const host = $("quality");
   if (!data) {
@@ -726,6 +743,7 @@ function renderQuality(data) {
     ${gateBlock}
     ${blocked ? `<div class="rec diagnostic"><h3>当前不支持的分析</h3><ul class="bullets">${blocked}</ul></div>` : ""}
     <p class="hint">契约面：${esc(contractLine(data.contract))}</p>
+    <p class="hint">轨迹 schema：${esc(traceLine(data.trace))}</p>
     ${findings ? `<ul class="bullets">${findings}</ul>` : ""}
     <p class="hint">${(data.notes || []).map(esc).join("<br />")}</p>`;
 }
