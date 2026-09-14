@@ -499,6 +499,7 @@ _COUNTER_FIELDS = (
     "shadow_present", "shadow_absent",
     "contribution_total_present", "contribution_total_absent",
     "contribution_total_unknown", "sessions", "distinct_group_id_sessions",
+    "ai_assisted", "human_only",
 )
 _COUNTER_MAPS = ("annotation_schema_versions", "routing_schema_versions", "scope_sources",
                  "suppression_reasons", "candidate_evidence_levels")
@@ -583,6 +584,13 @@ class RawContractStats:
     contribution_total_absent: int = 0
     contribution_total_unknown: int = 0
 
+    # How much of a label is model output. The host marks a record when the
+    # values a human saved are the ones a model drafted; the learning layer
+    # reports the split rather than deciding for the reader whether that is
+    # still human truth.
+    ai_assisted: int = 0
+    human_only: int = 0
+
     sessions: int = 0
     scope_sources: dict[str, int] = field(default_factory=dict)
     distinct_group_id_sessions: int = 0
@@ -621,6 +629,10 @@ class RawContractStats:
             self.shadow_absent += 1
         _bump(self.candidate_evidence_levels, observed.candidate_evidence)
         self._observe_outcome(observed.outcome)
+        if raw.get("accepted_from") == "ai":
+            self.ai_assisted += 1
+        else:
+            self.human_only += 1
 
     def _observe_participation(self, participation: Any) -> None:
         value = (participation.get("contribution_total")
@@ -726,6 +738,8 @@ class RawContractStats:
                 "absent": self.contribution_total_absent,
                 "no_trace": self.contribution_total_unknown,
             },
+            "ai_assisted": self.ai_assisted,
+            "human_only": self.human_only,
             "sessions": self.sessions,
             "scope_sources": dict(self.scope_sources),
             "distinct_group_id_sessions": self.distinct_group_id_sessions,
@@ -812,6 +826,13 @@ def contract_findings(contract: Mapping[str, Any] | None) -> list[str]:
         if absent_scores:
             findings.append(f"{absent_scores} 条记录的 participation.contribution_total 为 null"
                             "（不是 0），阈值回放对它们只能沿用原判定")
+    assisted = int(contract.get("ai_assisted") or 0)
+    if assisted:
+        only = int(contract.get("human_only") or 0)
+        findings.append(
+            f"{assisted} 条标注是先由模型起草、再由人工采纳的（纯人工 {only} 条）："
+            "这些标签的值来自模型，只有「按下保存」这一步是人做的，"
+            "按人工真值解释它们之前先知道这一点")
     truncated = int(contract.get("truncated") or 0)
     if truncated:
         findings.append(f"{truncated} 条记录因超过每会话上限被截断，没有进入学习样本")

@@ -543,3 +543,36 @@ async def test_samples_endpoint_maps_a_bad_filter_to_400(plugin):
 
     assert response["status"] == "error"
     assert response["status_code"] == 400
+
+
+# ---- AI 预标注的来源报告 ------------------------------------------------
+
+def test_contract_findings_report_how_much_of_a_label_is_model_output():
+    """采纳模型草稿的标注要用一行字说清，不能混进人工真值里。"""
+    findings = contract_findings({"balanced": True, "ai_assisted": 12, "human_only": 40})
+
+    reported = [line for line in findings if "起草" in line]
+    assert reported, findings
+    assert "12" in reported[0] and "40" in reported[0]
+
+
+def test_a_corpus_without_draft_assistance_says_nothing_about_it():
+    assert not any("起草" in line for line in contract_findings(
+        {"balanced": True, "ai_assisted": 0, "human_only": 12}))
+
+
+def test_the_raw_plane_counts_draft_assistance_from_the_records():
+    rows = [
+        _runtime([{"session_key": SESSION, "umo": SESSION}]),
+        _annotations(SESSION, [
+            _ambient("m1"),
+            {**_ambient("m2"), "accepted_from": "ai", "label_source": "human"},
+        ]),
+    ]
+
+    contract = parse_preferences(rows).contract.as_dict()
+
+    assert contract["ai_assisted"] == 1
+    assert contract["human_only"] == 1
+    assert any("起草" in line for line in contract_findings(contract))
+
