@@ -23,12 +23,6 @@
     "default": true,
     "hint": "保存无正文的决策轨迹快照，便于日后重新提取特征。关闭后只保留特征向量，体积更小但不可回溯。"
   },
-  "learning_keep_message_text": {
-    "description": "保存消息正文",
-    "type": "bool",
-    "default": false,
-    "hint": "默认关闭。本插件从不在样本中保存消息正文；即使 ChatDynamics 打开了正文快照，这里也不会复制过来。"
-  },
   "learning_min_samples": {
     "description": "出参数建议所需最少样本",
     "type": "int",

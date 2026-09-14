@@ -452,7 +452,7 @@ POLICY_CONTRACT_VERSION = 1
 
 # The version stamped into `source.learning_version`. Kept in step with
 # `register(...)` in main.py and metadata.yaml.
-LEARNING_VERSION = "1.2.0"
+LEARNING_VERSION = "1.3.0"
 
 
 def baseline_config_hash(policy: Mapping[str, float]) -> str:

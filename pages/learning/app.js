@@ -17,6 +17,7 @@ const ENDPOINTS = {
   report: "report",
   review: "review",
   replyReview: "reply_review",
+  annotationWindow: "annotation_window",
   policies: "policies",
   policy: "policy",
   export: "export",
@@ -48,7 +49,7 @@ const CONFIDENCE_LABEL = {
   moderate: "置信度中",
 };
 
-const state = { overview: null, report: null, quality: null, attribution: null, scopes: null, review: null, replyReview: null, view: "overview" };
+const state = { overview: null, report: null, quality: null, attribution: null, scopes: null, review: null, replyReview: null, annotationWindow: null, view: "overview" };
 
 function $(id) {
   return document.getElementById(id);
@@ -888,6 +889,93 @@ async function loadReplyReview() {
     host.innerHTML = `<p class="hint">回复复盘失败：${esc(error.message || error)}</p>`;
   }
 }
+// ---- the annotation window ---------------------------------------------
+//
+// Not a model call and not a judgement: this is the deadline. The host keeps a
+// bounded message graph per session, so the messages a human can still label
+// are the ones inside it, and the useful thing to say about them is how long
+// that stays true — the annotation records themselves are permanent, and they
+// are what keeps a message text.
+
+function humanDuration(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value < 0) return "—";
+  if (value < 90) return Math.round(value) + " 秒";
+  if (value < 5400) return Math.round(value / 60) + " 分钟";
+  return (value / 3600).toFixed(1) + " 小时";
+}
+
+function wallMoment(epoch) {
+  const value = Number(epoch);
+  if (!Number.isFinite(value)) return "—";
+  return new Date(value * 1000).toLocaleString();
+}
+
+function windowDeadline(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return "—";
+  if (value <= 0) return "已超期，随时清理";
+  return "约 " + humanDuration(value) + " 后";
+}
+
+function renderAnnotationWindow(data) {
+  const host = $("annotationWindow");
+  if (!host) return;
+  const rows = (data && data.sessions) || [];
+  const totals = (data && data.totals) || {};
+  const limits = (data && data.limits) || {};
+  if (!rows.length) {
+    host.innerHTML = `<p class="empty">${esc((data && data.hint) || "还没有可标注的窗口。")}</p>`;
+    return;
+  }
+  const table = rows.map((row) => `<tr>
+      <td>${esc(row.session)}<div class="sub">${esc(row.session_hash)}</div></td>
+      <td class="num">${esc(row.messages)}</td>
+      <td class="num">${esc(row.with_text)}</td>
+      <td class="num">${esc(row.unlabelled)}</td>
+      <td class="num">${esc(humanDuration(row.span_seconds))}</td>
+      <td class="num">${esc(windowDeadline(row.expires_in_seconds))}</td>
+      <td>${esc(wallMoment(row.oldest_wall))}</td>
+    </tr>`).join("");
+  const retention = `${limits.max_nodes ?? "—"} 条 / ${Math.round(Number(limits.ttl_seconds || 0) / 60)} 分钟`;
+  host.innerHTML = `<div class="grid">
+      ${statCard("窗口内消息", totals.messages ?? 0, `带正文 ${totals.with_text ?? 0} 条`)}
+      ${statCard("还没标注", totals.unlabelled ?? 0, `已标注 ${totals.annotated ?? 0} 条`)}
+      ${statCard("本体保留规则", retention, limits.reported_by_host ? "由本体快照报出" : "本体未报出，按默认值估")}
+    </div>
+    <p class="rationale">${esc(data.hint || "")}</p>
+    <div class="table-host"><table><thead><tr>
+      <th>会话</th><th class="num">窗口内</th><th class="num">带正文</th><th class="num">未标注</th>
+      <th class="num">跨度</th><th class="num">最旧的还剩</th><th>最旧一条的时间</th>
+    </tr></thead><tbody>${table}</tbody></table></div>
+    <p class="hint">${esc(data.text_policy || "")}</p>`;
+}
+
+async function loadAnnotationWindow() {
+  const host = $("annotationWindow");
+  if (!host) return;
+  try {
+    const data = await call(ENDPOINTS.annotationWindow);
+    state.annotationWindow = data;
+    renderAnnotationWindow(data);
+  } catch (error) {
+    host.innerHTML = `<p class="hint">读取待标注窗口失败：${esc(error.message || error)}</p>`;
+  }
+}
+
+async function exportAnnotationWindow(button) {
+  const data = await call(ENDPOINTS.annotationWindow, { params: { export: 1 } });
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `chat_dynamics_annotation_window_${stamp}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
 function renderQuality(data) {
   const host = $("quality");
   if (!data) {
@@ -1073,6 +1161,8 @@ async function refresh() {
     renderEvaluation(state.report);
     renderPolicies(policies);
     renderQuality(quality);
+    // No model, no cost: the window is two host reads, so it loads with the page.
+    loadAnnotationWindow();
     // The panel a reader sees is the model reading; it loads after the
     // deterministic payload so a slow or broken model never delays the page.
     loadReview();
@@ -1153,6 +1243,16 @@ function bind() {
       }
     });
   });
+
+  $("btnAnnotationWindow").addEventListener("click", () => withBusy($("btnAnnotationWindow"), "读取中…", async () => {
+    await loadAnnotationWindow();
+    notice("已读取本体当前的标注窗口。", "ok");
+  }));
+
+  $("btnExportWindow").addEventListener("click", () => withBusy($("btnExportWindow"), "导出中…", async () => {
+    await exportAnnotationWindow();
+    notice("窗口已导出到你本机；本插件没有保存正文。", "ok");
+  }));
 
   $("btnReplyReview").addEventListener("click", () => withBusy($("btnReplyReview"), "复盘中…", async () => {
     await loadReplyReview();

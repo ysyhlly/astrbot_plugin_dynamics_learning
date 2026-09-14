@@ -322,6 +322,7 @@ async def test_plugin_registers_every_endpoint_once(plugin):
         "/astrbot_plugin_dynamics_learning/quality",
         "/astrbot_plugin_dynamics_learning/review",
         "/astrbot_plugin_dynamics_learning/reply_review",
+        "/astrbot_plugin_dynamics_learning/annotation_window",
         "/astrbot_plugin_dynamics_learning/attribution",
         "/astrbot_plugin_dynamics_learning/shadow",
         "/astrbot_plugin_dynamics_learning/scopes",
@@ -338,7 +339,7 @@ async def test_plugin_registers_every_endpoint_once(plugin):
     }
     assert plugin.web.registered is True
     plugin.web.register()
-    assert len(plugin.context.routes) == 18
+    assert len(plugin.context.routes) == 19
 
 
 def test_the_page_only_calls_endpoints_the_plugin_registers(plugin):

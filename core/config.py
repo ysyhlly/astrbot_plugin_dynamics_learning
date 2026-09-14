@@ -58,9 +58,12 @@ class LearningConfig:
     source_plugin_id: str = DEFAULT_SOURCE_PLUGIN_ID
 
     # Sampling and storage.
+    #
+    # There is deliberately no switch for keeping message text: the plugin never
+    # stores any. The one text path is the reply post-mortem, which reads the
+    # host annotation record for a single call and writes nothing back.
     max_samples: int = 5_000
     store_raw_trace: bool = True
-    keep_message_text: bool = False
 
     # Recommendation gate.
     min_samples_for_recommendation: int = 100
@@ -145,7 +148,6 @@ class LearningConfig:
             "source_plugin_id": self.source_plugin_id,
             "max_samples": self.max_samples,
             "store_raw_trace": self.store_raw_trace,
-            "keep_message_text": self.keep_message_text,
             "min_samples_for_recommendation": self.min_samples_for_recommendation,
             "max_param_delta_ratio": self.max_param_delta_ratio,
             "min_samples_for_evaluation": self.min_samples_for_evaluation,
@@ -216,7 +218,6 @@ def parse_learning_config(raw: Any) -> LearningConfig:
         source_plugin_id=_as_text(pick("source_plugin_id"), defaults.source_plugin_id),
         max_samples=_as_int(pick("learning_max_samples"), defaults.max_samples, 50, HARD_MAX_SAMPLES),
         store_raw_trace=_as_bool(pick("learning_store_raw_trace"), defaults.store_raw_trace),
-        keep_message_text=_as_bool(pick("learning_keep_message_text"), defaults.keep_message_text),
         min_samples_for_recommendation=_as_int(
             pick("learning_min_samples"), defaults.min_samples_for_recommendation,
             MIN_RECOMMENDATION_SAMPLES, HARD_MAX_SAMPLES),
@@ -299,7 +300,7 @@ def parse_learning_config(raw: Any) -> LearningConfig:
 
 _KNOWN_KEYS = (
     "learning_enabled", "source_plugin_id", "learning_max_samples", "learning_store_raw_trace",
-    "learning_keep_message_text", "learning_min_samples", "learning_max_param_delta_ratio",
+    "learning_min_samples", "learning_max_param_delta_ratio",
     "learning_min_evaluation_samples", "learning_min_improvement", "learning_max_regression",
     "learning_holdout_ratio", "learning_forward_holdout_ratio", "learning_require_forward",
     "learning_bootstrap_iterations", "learning_bootstrap_seed", "learning_bootstrap_alpha",

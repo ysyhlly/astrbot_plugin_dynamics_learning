@@ -97,6 +97,8 @@ class LearningWebAPI:
          "由模型重写数据契约解读（?refresh=1 重新解读；模型不可用时回落本插件判定）"),
             ("reply_review", self.reply_review, ["GET"],
          "逐条复盘回复判定（模型判断；默认关闭，会把正文发给模型）"),
+        ("annotation_window", self.annotation_window, ["GET"],
+         "待标注窗口：还能标哪些消息、还剩多久（export=1 附带消息明细）"),
         ("attribution", self.attribution, ["GET"],
              "错误归因链：每条消息归入唯一一层（收件人/候选生成/排序/参与准入/门禁/生成/发送）"),
             ("shadow", self.shadow, ["GET"],
@@ -181,6 +183,14 @@ class LearningWebAPI:
         except Exception as exc:
             logger.error("[DynamicsLearning] reply review failed type=%s", type(exc).__name__)
             return _json_err("生成回复复盘失败", 500)
+
+    async def annotation_window(self):
+        try:
+            export = _query_param("export", "") not in ("", "0", "false", "False")
+            return _json_ok(await self.plugin.annotation_window_payload(include_messages=export))
+        except Exception as exc:
+            logger.error("[DynamicsLearning] annotation window failed type=%s", type(exc).__name__)
+            return _json_err("读取待标注窗口失败", 500)
 
     async def attribution(self):
         try:

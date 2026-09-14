@@ -25,7 +25,7 @@ except ImportError as exc:  # pragma: no cover - the host runtime always has it
 
 from .core.attribution import attribution_report
 from .core.config import LearningConfig, parse_learning_config
-from .core.ingest import IngestResult, collect_from_host, parse_export
+from .core.ingest import IngestResult, collect_from_host, parse_export, parse_preferences
 from .core.policy import (
     ACTION_STATUS, ACTIONS, BASE_POLICY, candidate_payload, normalize_status, published_payload,
 )
@@ -44,6 +44,7 @@ from .core.shadow_coverage import evaluate_shadow_coverage
 from .core import scope_profile
 from .core.samples import LearningSample, build_dataset, session_hash
 from .core.store import LearningStore
+from .core.window import session_digest, window_payload
 from .core.web_api import LearningWebAPI, PLUGIN_NAME
 
 AUTO_ANALYZE_MIN_INTERVAL = 900.0
@@ -70,7 +71,7 @@ def _completion_text(response: Any) -> str:
     PLUGIN_NAME,
     "ysyhlly",
     "群间 · Dynamics Learning",
-    "v1.2.0",
+    "v1.3.0",
     "",
 )
 class DynamicsLearningPlugin(Star):
@@ -281,7 +282,7 @@ class DynamicsLearningPlugin(Star):
         policies = await self.store.load_policies()
         return {
             "plugin": PLUGIN_NAME,
-            "version": "v1.2.0",
+            "version": "v1.3.0",
             "config": config.as_dict(),
             "dataset": {
                 "samples": len(samples),
@@ -628,6 +629,39 @@ class DynamicsLearningPlugin(Star):
         if inspect.isawaitable(response):
             response = await response
         return _completion_text(response)
+    async def annotation_window_payload(self, *, include_messages: bool = False,
+                                        sp_module: Any = None) -> dict[str, Any]:
+        """Which messages can still be labelled, and for how much longer.
+
+        Two reads of the host shared preferences — its runtime snapshot and the
+        annotation keys — and no model call: this is a fact about the window, and
+        the reader is about to open the reply page with it. Nothing is written:
+        the export is assembled here and downloaded by the page.
+        """
+        config = self.runtime_config()
+        runtime: Any = None
+        annotated: dict[str, set[str]] = {}
+        status = "unavailable"
+        try:
+            if sp_module is None:
+                from astrbot.core import sp as sp_module
+            runtime = await sp_module.get_async(
+                scope="plugin", scope_id=config.source_plugin_id,
+                key="panel_runtime_v1", default=None)
+            status = "ok" if runtime is not None else "missing"
+            rows = await sp_module.range_get_async("plugin", config.source_plugin_id, None)
+            for session_key, record in parse_preferences(rows).annotations:
+                msg_id = record.get("msg_id")
+                if isinstance(msg_id, str) and msg_id:
+                    annotated.setdefault(session_digest(session_key), set()).add(msg_id)
+        except Exception as exc:
+            logger.warning("[DynamicsLearning] annotation window read failed type=%s",
+                           type(exc).__name__)
+            status = "unavailable"
+        payload = window_payload(runtime, annotated, now_wall=time.time(),
+                                 include_messages=include_messages)
+        payload["source_status"] = status
+        return payload
     async def attribution_payload(self, *, examples: int = 8) -> dict[str, Any]:
         """The error attribution chain, computed from the stored samples.
 

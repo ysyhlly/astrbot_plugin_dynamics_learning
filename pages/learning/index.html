@@ -53,8 +53,22 @@
                fails on a null element. -->
           <details id="qualityRaw" open>
             <summary>原始判定与计数（本插件计算，未经过模型）</summary>
-            <div id="quality" class="stack"></div>
+          <div id="quality" class="stack"></div>
           </details>
+        </section>
+
+        <section class="card" data-view="overview" aria-labelledby="hAnnotationWindow">
+          <h2 id="hAnnotationWindow">待标注窗口</h2>
+          <p class="hint">
+            能人工标注的只有本体消息图里还留着的消息（默认 500 条 / 60 分钟），
+            但标注记录本身是永久的，正文也随标注一起留在本体的共享首选项里。
+            这里告诉你还能标哪些、最旧的一条还剩多久，以及可以把当前窗口整段导出留档。
+          </p>
+          <div class="bar-actions">
+            <button id="btnAnnotationWindow" type="button" class="btn">刷新窗口</button>
+            <button id="btnExportWindow" type="button" class="btn">导出这段窗口</button>
+          </div>
+          <div id="annotationWindow" class="stack"><p class="empty">读取本体窗口…</p></div>
         </section>
 
         <section class="card" data-view="overview" aria-labelledby="hOverview">
@@ -193,7 +207,7 @@
       </main>
 
       <footer class="foot">
-        <span>Dynamics Learning v1.2.0 · Shadow Learning：只学习、只分析、只推荐。</span>
+        <span>Dynamics Learning v1.3.0 · Shadow Learning：只学习、只分析、只推荐。</span>
       </footer>
     </div>
     <script src="./app.js"></script>
