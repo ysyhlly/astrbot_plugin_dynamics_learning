@@ -27,6 +27,9 @@ POLICY_KEY = "learning_policies_v1"
 PUBLISHED_KEY = "learning_published_v1"
 CANDIDATE_KEY = "learning_candidate_v1"
 STATE_KEY = "learning_state_v1"
+# The model-written contract review, kept beside the data it describes: the
+# fingerprint inside it is what decides whether it still applies.
+REVIEW_KEY = "learning_contract_review_v1"
 STORE_SCHEMA_VERSION = 1
 MAX_SESSIONS_TRACKED = 2_000
 
@@ -262,6 +265,18 @@ class LearningStore:
     async def clear_published(self) -> None:
         await self.backend.delete_kv_data(PUBLISHED_KEY)
 
+    # ---- model-written contract review ---------------------------------
+
+    async def save_review(self, payload: Mapping[str, Any]) -> None:
+        await self.backend.put_kv_data(REVIEW_KEY, dict(payload))
+
+    async def load_review(self) -> dict[str, Any]:
+        raw = await self.backend.get_kv_data(REVIEW_KEY, {})
+        return dict(raw) if isinstance(raw, Mapping) else {}
+
+    async def clear_review(self) -> None:
+        await self.backend.delete_kv_data(REVIEW_KEY)
+
     # ---- run state -----------------------------------------------------
 
     async def load_state(self) -> dict[str, Any]:
@@ -298,6 +313,7 @@ def index_summary(index_rows: Iterable[Mapping[str, Any]], samples: Sequence[Lea
 
 __all__ = [
     "CANDIDATE_KEY", "KeyValueBackend", "LearningStore", "MemoryBackend", "POLICY_KEY", "PUBLISHED_KEY",
-    "SAMPLE_INDEX_KEY", "SAMPLE_KEY_PREFIX", "STATE_KEY", "STORE_SCHEMA_VERSION", "StoreStats",
+    "REVIEW_KEY", "SAMPLE_INDEX_KEY", "SAMPLE_KEY_PREFIX", "STATE_KEY", "STORE_SCHEMA_VERSION",
+    "StoreStats",
     "index_summary",
 ]

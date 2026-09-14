@@ -248,5 +248,23 @@
     "type": "int",
     "default": 20,
     "hint": "回退判定只对支撑达到该数的分组生效，低于它只列名字、不给数值。最小 1。"
+  },
+  "learning_review_enabled": {
+    "description": "数据契约状态由模型解读",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，「数据契约状态」面板由模型重写：它读的是本插件算出的计数与判定，只能引用摘要里出现过的数字，越界的数字会单独标出。模型不可用、超时或输出不可解析时自动回落成本插件自己的判定，面板不会空白。"
+  },
+  "learning_review_provider": {
+    "description": "解读所用模型 Provider（留空用当前对话模型）",
+    "type": "string",
+    "default": "",
+    "hint": "留空时用宿主当前的对话模型 Provider。建议固定一个：解读是固定的分析任务，跟着会话模型漂移会让同一批数据在不同时间得到不同结论。"
+  },
+  "learning_review_timeout": {
+    "description": "解读超时（秒）",
+    "type": "int",
+    "default": 45,
+    "hint": "超过该时间未返回即回落到本插件判定。结果按数据集指纹缓存，只有数据或契约面变化、或手动点「重新解读」时才会重新调用模型。范围 5~300。"
   }
 }

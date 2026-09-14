@@ -39,7 +39,10 @@
             每一行是学习层真正要用的一项能力，以及这批数据能不能支撑它。
             覆盖率低不代表系统差，代表记录里没有可以判断的证据；
             「不支持」是结论，不是错误。
+            这张表由模型解读：它读的是本插件算出的计数与判定，只能引用摘要里出现过的数字，
+            越界的数字会单独标出；模型不可用时自动回落到本插件自己的判定。
           </p>
+          <div id="review" class="stack"></div>
           <div id="quality" class="stack"></div>
         </section>
 
@@ -161,7 +164,7 @@
       </main>
 
       <footer class="foot">
-        <span>Dynamics Learning v1.0.0 · Shadow Learning：只学习、只分析、只推荐。</span>
+        <span>Dynamics Learning v1.1.0 · Shadow Learning：只学习、只分析、只推荐。</span>
       </footer>
     </div>
     <script src="./app.js"></script>

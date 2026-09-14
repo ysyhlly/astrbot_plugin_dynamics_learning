@@ -122,6 +122,14 @@ class LearningConfig:
     auto_analyze: bool = False
     auto_analyze_interval_minutes: int = 360
 
+    # Contract review: the panel reads the matrix through a model. On by default
+    # because that is what the panel is for; the deterministic table is still
+    # computed, still returned, and is what the page falls back to whenever the
+    # model is off, unreachable, or answers with something unreadable.
+    review_enabled: bool = True
+    review_provider_id: str = ""
+    review_timeout_seconds: int = 45
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
@@ -161,6 +169,9 @@ class LearningConfig:
             "max_iterations": self.max_iterations,
             "auto_analyze": self.auto_analyze,
             "auto_analyze_interval_minutes": self.auto_analyze_interval_minutes,
+            "review_enabled": self.review_enabled,
+            "review_provider_id": self.review_provider_id,
+            "review_timeout_seconds": self.review_timeout_seconds,
         }
 
     def with_overrides(self, **changes: Any) -> "LearningConfig":
@@ -258,6 +269,10 @@ def parse_learning_config(raw: Any) -> LearningConfig:
         auto_analyze=_as_bool(pick("learning_auto_analyze"), defaults.auto_analyze),
         auto_analyze_interval_minutes=_as_int(
             pick("learning_auto_analyze_minutes"), defaults.auto_analyze_interval_minutes, 15, 10_080),
+        review_enabled=_as_bool(pick("learning_review_enabled"), defaults.review_enabled),
+        review_provider_id=_as_text(pick("learning_review_provider"), defaults.review_provider_id, 128),
+        review_timeout_seconds=_as_int(
+            pick("learning_review_timeout"), defaults.review_timeout_seconds, 5, 300),
     )
 
 
@@ -279,4 +294,5 @@ _KNOWN_KEYS = (
     "learning_gate_max_label_age_days",
     "learning_rate", "learning_l2", "learning_iterations",
     "learning_auto_analyze", "learning_auto_analyze_minutes",
+    "learning_review_enabled", "learning_review_provider", "learning_review_timeout",
 )

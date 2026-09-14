@@ -15,6 +15,7 @@ const ENDPOINTS = {
   ingest: "ingest",
   analyze: "analyze",
   report: "report",
+  review: "review",
   policies: "policies",
   policy: "policy",
   export: "export",
@@ -46,7 +47,11 @@ const CONFIDENCE_LABEL = {
   moderate: "置信度中",
 };
 
-const state = { overview: null, report: null, quality: null, attribution: null, scopes: null, view: "overview" };
+const state = { overview: null, report: null, quality: null, attribution: null, scopes: null, review: null, view: "overview" };
+
+// Where the deterministic table lives in the markup: the review card borrows it
+// while a review exists and gives it back when one does not.
+const QUALITY_HOME = document.getElementById("quality")?.parentElement || null;
 
 function $(id) {
   return document.getElementById(id);
@@ -692,6 +697,110 @@ function traceLine(trace) {
   return `本体写了 ${rendered}（读取端支持 ${supported}，最新 ${trace.latest}）${unreadable}`;
 }
 
+// ---- the model-written contract review --------------------------------
+//
+// The matrix below is the input, not the answer: what a reader opens is the
+// model's reading of it. Every number in the reply was checked against the
+// digest it was given (the numbers rendered here come from that digest, not
+// from the reply), rows the model skipped are marked as the raw verdict, and
+// the deterministic table is folded in underneath rather than hidden.
+
+const VERDICT_CLASS = { empty: "", usable: "ok", partial: "warn", blocked: "bad" };
+
+function qualityNode() {
+  return $("quality");
+}
+
+function restoreQualityNode() {
+  const node = qualityNode();
+  if (node && QUALITY_HOME && node.parentElement !== QUALITY_HOME) {
+    QUALITY_HOME.appendChild(node);
+  }
+}
+
+function reviewTags(row) {
+  const tags = [];
+  if (row.source === "deterministic") tags.push('<span class="tag">原始判定</span>');
+  if (row.source === "model" && row.agrees === false) tags.push('<span class="tag warn">模型改判</span>');
+  return tags.length ? " " + tags.join(" ") : "";
+}
+
+function renderReview(data) {
+  const host = $("review");
+  if (!host) return;
+  const review = data && data.review;
+  if (!review) {
+    restoreQualityNode();
+    const reason = (data && data.reason) || "模型解读不可用。";
+    host.innerHTML = `<p class="hint">${esc(reason)}</p>`;
+    return;
+  }
+  const rows = (review.rows || []).map((row) => {
+    const cls = CAP_STATUS_CLASS[row.status] || "";
+    const detail = [row.explanation, row.next_action ? `下一步：${row.next_action}` : ""]
+      .filter(Boolean).map(esc).join("<br />");
+    return `<tr>
+      <td>${esc(row.label || row.capability)}<div class="sub">${esc(row.capability)}</div></td>
+      <td><span class="tag ${cls}">${esc(row.status_label || row.status)}</span>${reviewTags(row)}</td>
+      <td class="num">${row.coverage === null || row.coverage === undefined ? "—" : pct(row.coverage)}</td>
+      <td class="num">${esc(row.eligible)}/${esc(row.total)}</td>
+      <td>${detail || "—"}</td>
+    </tr>`;
+  }).join("");
+  const actions = (review.actions || []).map((line) => `<li>${esc(line)}</li>`).join("");
+  const caveats = (review.caveats || []).map((line) => `<li>${esc(line)}</li>`).join("");
+  const numbers = (review.unverified_numbers || []).length
+    ? `<p class="notice error">模型引用了摘要里没有的数字：${esc(review.unverified_numbers.join("、"))}
+       —— 这些数字没有展示，请以右侧计数为准。</p>`
+    : "";
+  const invented = (review.invented_capabilities || []).length
+    ? `<p class="hint">模型写了摘要里没有的能力名，已忽略：${esc(review.invented_capabilities.join("、"))}</p>`
+    : "";
+  const stamp = typeof review.generated_at === "number"
+    ? new Date(review.generated_at * 1000).toLocaleString()
+    : (data.generated_at ? new Date(data.generated_at * 1000).toLocaleString() : "");
+
+  host.innerHTML = `<article class="rec">
+      <h3>模型解读${review.verdict_label
+        ? ` · <span class="tag ${VERDICT_CLASS[review.verdict] || ""}">${esc(review.verdict_label)}</span>`
+        : ""}</h3>
+      <p class="rationale">${esc(review.headline || "")}</p>
+      ${numbers}
+      ${invented}
+      <div class="table-host"><table><thead><tr>
+        <th>能力</th><th>状态</th><th class="num">覆盖</th><th class="num">可用/合计</th><th>说明</th>
+      </tr></thead><tbody>${rows}</tbody></table></div>
+      ${actions ? `<h4>下一步</h4><ul class="bullets">${actions}</ul>` : ""}
+      ${caveats ? `<h4>前提</h4><ul class="bullets">${caveats}</ul>` : ""}
+      <p class="hint">
+        由 ${esc(review.model || data.provider_id || "当前模型")} 生成于 ${esc(stamp || "—")}${data.state === "cached" ? "（缓存）" : ""}；
+        计数与覆盖来自本插件，模型只决定这些行怎么读。
+        <button type="button" class="btn small" data-review-refresh="1">重新解读</button>
+      </p>
+    </article>`;
+  const detail = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.textContent = "原始判定与计数（本插件计算，未经过模型）";
+  detail.appendChild(summary);
+  const node = qualityNode();
+  if (node) detail.appendChild(node);
+  host.appendChild(detail);
+}
+
+async function loadReview({ refresh = false, quiet = false } = {}) {
+  const host = $("review");
+  if (!host) return;
+  if (!quiet) host.innerHTML = '<p class="empty">正在让模型解读这份数据契约…</p>';
+  try {
+    const data = await call(ENDPOINTS.review, { params: refresh ? { refresh: 1 } : {} });
+    state.review = data;
+    renderReview(data);
+  } catch (error) {
+    restoreQualityNode();
+    host.innerHTML = `<p class="hint">模型解读失败：${esc(error.message || error)}；下面是本插件自己的判定。</p>`;
+  }
+}
+
 function renderQuality(data) {
   const host = $("quality");
   if (!data) {
@@ -877,6 +986,9 @@ async function refresh() {
     renderEvaluation(state.report);
     renderPolicies(policies);
     renderQuality(quality);
+    // The panel a reader sees is the model reading; it loads after the
+    // deterministic payload so a slow or broken model never delays the page.
+    loadReview();
   } catch (error) {
     $("linkLamp").classList.remove("on");
     $("linkLabel").textContent = "未连接";
@@ -965,6 +1077,13 @@ function bind() {
     if (!(target instanceof HTMLElement)) return;
     if (target.dataset.scope) {
       loadScope(target.dataset.scope);
+      return;
+    }
+    if (target.dataset.reviewRefresh) {
+      withBusy(target, "解读中…", async () => {
+        await loadReview({ refresh: true, quiet: true });
+        notice("已重新解读当前数据契约。", "ok");
+      });
       return;
     }
     const version = target.dataset.policy;

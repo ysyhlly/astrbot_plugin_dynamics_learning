@@ -12,6 +12,7 @@ import os
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -60,9 +61,26 @@ def _install_astrbot_double() -> None:
     class Context:
         def __init__(self):
             self.routes: list[tuple] = []
+            # The model side of the double: a test sets these instead of standing
+            # up a provider. Nothing under test needs a real AstrBot to answer
+            # "what happens when the model is slow, silent or unreadable".
+            self.provider = None
+            self.llm_response: Any = None
+            self.llm_calls: list[dict] = []
 
         def register_web_api(self, route, handler, methods, desc):
             self.routes.append((route, handler, tuple(methods), desc))
+
+        def get_using_provider(self, umo=None):
+            return self.provider
+
+        async def llm_generate(self, *, chat_provider_id, prompt=None, system_prompt=None,
+                               **kwargs):
+            self.llm_calls.append({"provider_id": chat_provider_id, "prompt": prompt,
+                                   "system_prompt": system_prompt})
+            if isinstance(self.llm_response, BaseException):
+                raise self.llm_response
+            return self.llm_response
 
     class Request:
         args: dict = {}

@@ -93,6 +93,8 @@ class LearningWebAPI:
             ("overview", self.overview, ["GET"], "学习层状态、数据面与最近一次分析"),
             ("samples", self.samples, ["GET"], "分页查看学习样本（不含正文）"),
             ("quality", self.quality, ["GET"], "数据契约健康度：能力矩阵与原始记录统计"),
+        ("review", self.review, ["GET"],
+         "由模型重写数据契约解读（?refresh=1 重新解读；模型不可用时回落本插件判定）"),
             ("attribution", self.attribution, ["GET"],
              "错误归因链：每条消息归入唯一一层（收件人/候选生成/排序/参与准入/门禁/生成/发送）"),
             ("shadow", self.shadow, ["GET"],
@@ -161,6 +163,14 @@ class LearningWebAPI:
         except Exception as exc:
             logger.error("[DynamicsLearning] quality failed type=%s", type(exc).__name__)
             return _json_err("读取数据契约健康度失败", 500)
+
+    async def review(self):
+        try:
+            refresh = _query_param("refresh", "") not in ("", "0", "false", "False")
+            return _json_ok(await self.plugin.contract_review_payload(refresh=refresh))
+        except Exception as exc:
+            logger.error("[DynamicsLearning] review failed type=%s", type(exc).__name__)
+            return _json_err("生成数据契约解读失败", 500)
 
     async def attribution(self):
         try:

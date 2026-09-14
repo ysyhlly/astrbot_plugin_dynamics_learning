@@ -30,6 +30,9 @@ from .core.policy import (
     ACTION_STATUS, ACTIONS, BASE_POLICY, candidate_payload, normalize_status, published_payload,
 )
 from .core.quality import dataset_gate, quality_report
+from .core.review import (
+    REVIEW_SCHEMA_VERSION, build_digest, build_prompt, digest_fingerprint, parse_review,
+)
 from .core.report import analyze, policy_rows
 from .core.shadow import evaluate_shadow, rules_from_config
 from .core.shadow_coverage import evaluate_shadow_coverage
@@ -40,13 +43,29 @@ from .core.web_api import LearningWebAPI, PLUGIN_NAME
 
 AUTO_ANALYZE_MIN_INTERVAL = 900.0
 _MAX_SAMPLE_PAGE = 200
+# A provider that just failed is not asked again for this long, so a page left
+# open cannot turn one broken model call into one per refresh.
+REVIEW_RETRY_SECONDS = 90.0
+
+
+def _completion_text(response: Any) -> str:
+    """Best-effort text out of whatever the host's llm_generate returned."""
+    if response is None:
+        return ""
+    if isinstance(response, str):
+        return response
+    for name in ("completion_text", "text"):
+        value = getattr(response, name, None)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 @register(
     PLUGIN_NAME,
     "ysyhlly",
     "群间 · Dynamics Learning",
-    "v1.0.0",
+    "v1.1.0",
     "",
 )
 class DynamicsLearningPlugin(Star):
@@ -65,6 +84,8 @@ class DynamicsLearningPlugin(Star):
         self._analysis_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._shutting_down = False
+        self._review_failed_at = 0.0
+        self._review_failure_reason = ""
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -250,7 +271,7 @@ class DynamicsLearningPlugin(Star):
         policies = await self.store.load_policies()
         return {
             "plugin": PLUGIN_NAME,
-            "version": "v1.0.0",
+            "version": "v1.1.0",
             "config": config.as_dict(),
             "dataset": {
                 "samples": len(samples),
@@ -333,6 +354,144 @@ class DynamicsLearningPlugin(Star):
             samples, config=config,
             contract=contract if isinstance(contract, dict) else None)
         return payload
+
+    async def contract_review_payload(self, *, refresh: bool = False) -> dict[str, Any]:
+        """The contract panel, reread by a model.
+
+        The deterministic matrix is the input, not the answer: what a reader
+        opens is the model's reading of it, with every number checked back
+        against the digest it was given. Every failure — the feature is off, the
+        host has no provider, the call times out, the reply is prose — returns
+        the same shape with an empty review and the reason, because the page has
+        a complete fallback table and a blank panel would be a worse answer than
+        an uninterpreted one.
+        """
+        quality = await self.quality_payload()
+        digest = build_digest(quality)
+        fingerprint = digest_fingerprint(digest)
+        config = self.runtime_config()
+        payload: dict[str, Any] = {
+            "review_schema_version": REVIEW_SCHEMA_VERSION,
+            "fingerprint": fingerprint,
+            "state": "unavailable",
+            "reason": "",
+            "provider_id": "",
+            "generated_at": None,
+            "review": None,
+        }
+        if not config.review_enabled:
+            payload["state"] = "disabled"
+            payload["reason"] = ("模型解读已关闭（learning_review_enabled=false）；"
+                                 "下面是本插件自己的判定与计数。")
+            return payload
+
+        cached = await self.store.load_review()
+        if (not refresh and cached.get("fingerprint") == fingerprint
+                and isinstance(cached.get("review"), dict)):
+            payload.update(state="cached", generated_at=cached.get("generated_at"),
+                           provider_id=str(cached.get("provider_id") or ""),
+                           review=dict(cached["review"]))
+            return payload
+
+        # A provider that is down must not be called once per page refresh.
+        if not refresh and self._review_failed_at:
+            waited = time.time() - self._review_failed_at
+            if waited < REVIEW_RETRY_SECONDS:
+                payload["state"] = "failed"
+                payload["reason"] = self._review_failure_reason
+                return payload
+
+        provider_id, model = await self._review_provider()
+        if not provider_id:
+            payload["state"] = "unavailable"
+            payload["reason"] = "宿主没有可用的对话模型 Provider，无法生成模型解读。"
+            return payload
+        payload["provider_id"] = provider_id
+        payload["model"] = model
+
+        try:
+            reply = await asyncio.wait_for(
+                self._ask_review(digest, provider_id),
+                timeout=float(config.review_timeout_seconds))
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            return self._review_failed(
+                payload, f"模型在 {config.review_timeout_seconds} 秒内没有返回，已回落到本插件判定。")
+        except Exception as exc:
+            return self._review_failed(
+                payload, f"调用模型失败（{type(exc).__name__}），已回落到本插件判定。")
+
+        review = parse_review(reply, digest)
+        if review is None:
+            return self._review_failed(payload, "模型返回的不是可解析的 JSON 对象，已回落到本插件判定。")
+
+        self._review_failed_at = 0.0
+        self._review_failure_reason = ""
+        generated_at = time.time()
+        review["provider_id"] = provider_id
+        review["model"] = model
+        await self.store.save_review({
+            "review_schema_version": REVIEW_SCHEMA_VERSION,
+            "fingerprint": fingerprint,
+            "generated_at": generated_at,
+            "provider_id": provider_id,
+            "model": model,
+            "review": review,
+        })
+        payload.update(state="fresh", generated_at=generated_at, review=review)
+        return payload
+
+    def _review_failed(self, payload: dict[str, Any], reason: str) -> dict[str, Any]:
+        self._review_failed_at = time.time()
+        self._review_failure_reason = reason
+        payload["state"] = "failed"
+        payload["reason"] = reason
+        return payload
+
+    async def _review_provider(self) -> tuple[str, str]:
+        """The provider to ask, and its model name when the host knows it.
+
+        An explicit id wins: a review is a fixed analytical task, and letting the
+        panel follow whichever model a conversation happens to use means two
+        readers of the same page can get different tables with no way to tell
+        why. With nothing configured, the host's current chat provider is used,
+        because a plugin that cannot be configured still has to say something.
+        """
+        explicit = self.runtime_config().review_provider_id
+        if explicit:
+            return explicit, ""
+        context = getattr(self, "context", None)
+        getter = getattr(context, "get_using_provider", None)
+        if not callable(getter):
+            return "", ""
+        try:
+            provider = getter(None)
+        except TypeError:
+            provider = getter()
+        except Exception:
+            return "", ""
+        if inspect.isawaitable(provider):
+            provider = await provider
+        if provider is None:
+            return "", ""
+        meta = getattr(provider, "meta", None)
+        try:
+            info = meta() if callable(meta) else None
+        except Exception:
+            info = None
+        return str(getattr(info, "id", "") or ""), str(getattr(info, "model", "") or "")
+
+    async def _ask_review(self, digest: dict[str, Any], provider_id: str) -> str:
+        context = getattr(self, "context", None)
+        generate = getattr(context, "llm_generate", None)
+        if not callable(generate):
+            raise RuntimeError("AstrBot context does not expose llm_generate")
+        system_prompt, prompt = build_prompt(digest)
+        response = generate(chat_provider_id=provider_id, prompt=prompt, system_prompt=system_prompt)
+        if inspect.isawaitable(response):
+            response = await response
+        return _completion_text(response)
 
     async def attribution_payload(self, *, examples: int = 8) -> dict[str, Any]:
         """The error attribution chain, computed from the stored samples.
