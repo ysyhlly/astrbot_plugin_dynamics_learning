@@ -1,0 +1,13 @@
+diff --git a/core/routing_trace.py b/core/routing_trace.py
+index 08ba48a..f0c6b03 100644
+--- a/core/routing_trace.py
++++ b/core/routing_trace.py
+@@ -188,7 +188,7 @@ def _shadow_block(shadow):
+         "changed": bool(block.get("changed")),
+         "reason": str(block.get("reason") or "")[:32],
+     }
+-    for name in ("score", "baseline_margin", "shadow_margin"):
++    for name in ("score", "baseline_margin", "shadow_margin", "recorded_at"):
+         value = finite_number(block.get(name))
+         if value is not None:
+             outcome[name] = value

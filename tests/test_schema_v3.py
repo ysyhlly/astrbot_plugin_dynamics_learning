@@ -239,7 +239,9 @@ def test_a_suppressed_send_is_not_a_missed_reply():
 
 
 def test_an_unrecognised_suppression_stage_is_unattributable():
-    samples = build_dataset([(SESSION, suppressed_record("m1", reason="brand_new_gate"))])
+    record = suppressed_record("m1", reason="brand_new_gate")
+    record["decision_trace"]["outcome"].pop("stage", None)
+    samples = build_dataset([(SESSION, record)])
     outcome = next(sample for sample in samples if sample.task == TASK_REPLY_OUTCOME)
 
     assert outcome.error_type == "unattributable"

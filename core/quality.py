@@ -207,15 +207,17 @@ def _replay_split(samples: Sequence[LearningSample]) -> dict[str, int]:
     return, and an ambient turn is scored from the recorded additive total.
     """
     counts = {"total": len(samples), "eligible": 0, "explicit": 0, "no_prior_bot": 0,
-              "no_score": 0}
+              "no_score": 0, "unknown_prior_bot": 0}
     for sample in samples:
         features = sample.features
         if features.get("ctx_explicit", 0.0) >= 0.5:
             counts["explicit"] += 1
-        elif features.get("ctx_prior_bot", 0.0) < 0.5:
-            counts["no_prior_bot"] += 1
         elif not sample.contribution_total_recorded:
             counts["no_score"] += 1
+        elif features.get("ctx_prior_bot", -1.0) < 0:
+            counts["unknown_prior_bot"] += 1
+        elif features.get("ctx_prior_bot", 0.0) < 0.5:
+            counts["no_prior_bot"] += 1
         else:
             counts["eligible"] += 1
     return counts
@@ -227,11 +229,13 @@ def _replay_reasons(counts: Mapping[str, int]) -> list[str]:
         reasons.append(f"{counts['explicit']} 条是结构化直判（明确指代、回复、称呼等短路证据），"
                        "判定不经过分数，阈值移动对它没有影响")
     if counts["no_prior_bot"]:
-        reasons.append(f"{counts['no_prior_bot']} 条没有前置机器人消息，"
+        reasons.append(f"{counts['no_prior_bot']} 条没有可确认的前置机器人证据，"
                        "本体在该条件下提前返回，分数不参与判定")
+    if counts.get("unknown_prior_bot", 0):
+        reasons.append(f"{counts['unknown_prior_bot']} 条缺失前序机器人判定证据，已排除出阈值回放指标")
     if counts["no_score"]:
         reasons.append(f"{counts['no_score']} 条没有记录 participation.contribution_total，"
-                       "加性分数无法复现，阈值回放只能沿用原判定")
+                       "加性分数无法复现，已排除出阈值回放指标")
     return reasons
 
 
@@ -499,7 +503,7 @@ _COUNTER_FIELDS = (
     "shadow_present", "shadow_absent",
     "contribution_total_present", "contribution_total_absent",
     "contribution_total_unknown", "sessions", "distinct_group_id_sessions",
-    "ai_assisted", "human_only",
+    "admission_undecided", "ai_assisted", "human_only", "label_source_declared",
 )
 _COUNTER_MAPS = ("annotation_schema_versions", "routing_schema_versions", "scope_sources",
                  "suppression_reasons", "candidate_evidence_levels")
@@ -580,16 +584,27 @@ class RawContractStats:
     shadow_present: int = 0
     shadow_absent: int = 0
 
+    # Records that carry a human reply label but no recorded admission decision —
+    # an empty `participation` block, which is what a rebuilt trace looks like for
+    # a debounced turn's non-final fragment. Those records produce no
+    # `reply_admission` sample (reading the absence as `weak` would invent a
+    # `missed_reply`), so the count is kept here: a corpus that never shrinks
+    # silently is the whole reason this plane exists.
+    admission_undecided: int = 0
+
     contribution_total_present: int = 0
     contribution_total_absent: int = 0
     contribution_total_unknown: int = 0
 
-    # How much of a label is model output. The host marks a record when the
-    # values a human saved are the ones a model drafted; the learning layer
-    # reports the split rather than deciding for the reader whether that is
-    # still human truth.
+    # How much of a label is model output. The host marks a record when the values
+    # a human saved are the ones a model drafted (`accepted_from: "ai"`, when available). The key is read when it
+    # is there and *nothing is claimed when it is not*, because a host that writes
+    # no source at all has not said "a human typed this" — and counting every
+    # undeclared record as human-only produced a panel that reported 100% human
+    # labels for a corpus that never declared anything.
     ai_assisted: int = 0
     human_only: int = 0
+    label_source_declared: int = 0
 
     sessions: int = 0
     scope_sources: dict[str, int] = field(default_factory=dict)
@@ -629,10 +644,18 @@ class RawContractStats:
             self.shadow_absent += 1
         _bump(self.candidate_evidence_levels, observed.candidate_evidence)
         self._observe_outcome(observed.outcome)
-        if raw.get("accepted_from") == "ai":
-            self.ai_assisted += 1
-        else:
-            self.human_only += 1
+        # A human reply label with no recorded admission decision is the one case
+        # where a labelled record produces no sample; it is counted here so the
+        # contract plane accounts for every row the sample plane dropped.
+        if isinstance(raw.get("expected_reply"), bool) and not observed.admission_recorded:
+            self.admission_undecided += 1
+        source = raw.get("accepted_from")
+        if isinstance(source, str) and source:
+            self.label_source_declared += 1
+            if source == "ai":
+                self.ai_assisted += 1
+            elif source in {"human", "manual"}:
+                self.human_only += 1
 
     def _observe_participation(self, participation: Any) -> None:
         value = (participation.get("contribution_total")
@@ -738,8 +761,10 @@ class RawContractStats:
                 "absent": self.contribution_total_absent,
                 "no_trace": self.contribution_total_unknown,
             },
+            "admission_undecided": self.admission_undecided,
             "ai_assisted": self.ai_assisted,
             "human_only": self.human_only,
+            "label_source_declared": self.label_source_declared,
             "sessions": self.sessions,
             "scope_sources": dict(self.scope_sources),
             "distinct_group_id_sessions": self.distinct_group_id_sessions,

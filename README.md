@@ -1,5 +1,11 @@
 # 群间 · Dynamics Learning
 
+当前版本：**v1.3.2**。本版修复评测口径、缺失数据处理和页面交互，详见 [Changelog](CHANGELOG.md)。
+
+Shadow 活跃时段依赖宿主保留 `recorded_at`。本次发布附带
+[宿主配套补丁](docs/chat-dynamics-shadow-recorded-at.patch)，用于仍缺失该字段的宿主版本；
+学习层更新不会自动修改宿主。已丢失时间戳的历史记录无法补造，需采集新记录。
+
 > ChatDynamics 的**行为学习层**。让群聊系统根据真实群聊里的人工标注和长期运行结果，
 > 逐渐学会更准确地判断话题、对话对象和参与时机。
 

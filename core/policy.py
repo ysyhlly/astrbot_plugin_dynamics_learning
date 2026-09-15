@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 
-from .trace import DecisionTrace
+from .trace import LEVELS, DecisionTrace
 
 # 2 adds the state machine, the validation results and the compatibility block.
 POLICY_SCHEMA_VERSION = 2
@@ -201,6 +201,39 @@ def transition_error(current: str, target: str) -> str:
     rendered = "、".join(allowed) if allowed else "（终态，不可再变）"
     return (f"策略状态不能从 {normalize_status(current)} 变为 {normalize_status(target)}；"
             f"允许的目标：{rendered}")
+
+
+# The moves the console offers, in the order it offers them, with the words it
+# uses. Declared here for the same reason `ACTIONS` is: the page renders this
+# list, and a second copy in JavaScript would be a second vocabulary — one that
+# can drift into offering a button the store refuses.
+CONSOLE_ACTIONS: tuple[tuple[str, str], ...] = (
+    ("validate", "标记已验证"),
+    ("shadow", "影子观察"),
+    ("accept", "采纳"),
+    ("ignore", "忽略"),
+    ("rollback", "回滚"),
+)
+CONSOLE_ACTION_LABEL = dict(CONSOLE_ACTIONS)
+
+
+def available_actions(current: str) -> list[str]:
+    """Which console actions this record's status actually permits.
+
+    Two kinds of button are left out. An illegal arrow — promoting a record that
+    was never validated — would only produce a 400 the reader has to interpret.
+    And an action whose target *is* the current status is a no-op that reads as
+    "this did something", because the store answers it with the same record.
+    """
+    source = normalize_status(current)
+    available: list[str] = []
+    for action, _label in CONSOLE_ACTIONS:
+        target = ACTION_STATUS[action]
+        if target == source or not can_transition(source, target):
+            continue
+        available.append(action)
+    return available
+
 
 SOURCE_RECIPIENT_SWEEP = "recipient_threshold_sweep"
 SOURCE_TOPIC_SWEEP = "topic_threshold_sweep"
@@ -452,7 +485,7 @@ POLICY_CONTRACT_VERSION = 1
 
 # The version stamped into `source.learning_version`. Kept in step with
 # `register(...)` in main.py and metadata.yaml.
-LEARNING_VERSION = "1.3.1"
+LEARNING_VERSION = "1.3.2"
 
 
 def baseline_config_hash(policy: Mapping[str, float]) -> str:
@@ -540,10 +573,13 @@ def published_policy(candidate: PolicyCandidate, *,
         "changed": [name for name in PARAM_NAMES if abs(resolved[name] - base[name]) > 1e-9],
         "target_error": candidate.target_error,
         "confidence": candidate.confidence,
-        # Whether anything was ever observed *beside* live behaviour. False is
+        # Candidate records do not persist matching live shadow observations.
+        # A lifecycle transition is not evidence of traffic. False is
         # not a failure; it is the difference between "it won offline" and "it
         # was watched", and the host gets to see which one it is being handed.
-        "shadow_observed": bool(candidate.forward_result),
+        "shadow_observed": False,
+        "shadow_entered": any(row.get("to") == STATUS_SHADOW
+                              for row in candidate.status_history),
         "evidence": {
             "holdout": dict(candidate.holdout_result),
             "forward": dict(candidate.forward_result),
@@ -618,12 +654,21 @@ def decide(
     policy: Mapping[str, float],
     *,
     model_score: float | None = None,
+    score_recorded: bool = True,
 ) -> ReplayDecision:
     """Replay one trace under a policy.
 
     `model_score`, when given, replaces the additive score for ambient turns
     with a fitted probability in [0, 1]. Structural (explicit) turns and the
     no-prior-bot early return are threshold-independent, exactly as in the host.
+
+    `score_recorded=False` says the host never wrote an additive score for this
+    turn (`LearningSample.contribution_total_recorded`). No threshold move can be
+    shown to change such a turn, so the *recorded* decision is replayed instead:
+    reading the missing total as `0.0` decides the turn silently, and every number
+    built on it — accuracy, F1, the target-error rate, the guard checks, the
+    fitted scorer — would be a measurement of this plugin's default rather than of
+    the host's behaviour. `model_score` is ignored for the same reason.
     """
     policy = normalize_policy(policy)
     strong = float(policy["strong_addressivity_threshold"])
@@ -637,6 +682,14 @@ def decide(
     if trace.is_explicit:
         targeted = bool(trace.bot_targeted)
         return ReplayDecision(targeted, "strong" if targeted else "weak",
+                              float(trace.participation_score or 0.0), topic_committed)
+
+    if not score_recorded or trace.prior_bot_proxy < 0:
+        # "Not recorded" is not "zero": keep the decision the host actually made.
+        targeted = bool(trace.bot_targeted)
+        level = (trace.participation_level if trace.participation_level in LEVELS
+                 else ("strong" if targeted else "weak"))
+        return ReplayDecision(targeted, level,
                               float(trace.participation_score or 0.0), topic_committed)
 
     if trace.prior_bot_proxy == 0:
@@ -732,7 +785,8 @@ def sequences_equal(left: Sequence[float], right: Sequence[float], tol: float = 
 
 
 __all__ = [
-    "ACTION_STATUS", "ACTIONS", "ALLOWED_TRANSITIONS", "BASE_POLICY", "ERROR_FALSE_BOT",
+    "ACTION_STATUS", "ACTIONS", "ALLOWED_TRANSITIONS", "BASE_POLICY", "CONSOLE_ACTIONS",
+    "CONSOLE_ACTION_LABEL", "ERROR_FALSE_BOT",
     "ERROR_FRAGMENTATION", "ERROR_MISSED_BOT", "ERROR_MISSED_REPLY", "ERROR_PREMATURE_REPLY",
     "ERROR_UNDELIVERED_REPLY", "ERROR_UNSOLICITED_REPLY", "ERROR_WRONG_MERGE", "PARAM_NAMES",
     "LEARNING_VERSION", "PARAM_SPECS", "POLICY_CONTRACT_VERSION", "POLICY_SCHEMA_VERSION",
@@ -740,7 +794,8 @@ __all__ = [
     "ReplayDecision", "SOURCE_MANUAL", "SOURCE_RECIPIENT_SWEEP", "SOURCE_TOPIC_SWEEP",
     "STATUS_ALIASES", "STATUS_LABEL", "STATUS_PROPOSED", "STATUS_PROMOTED", "STATUS_REJECTED",
     "STATUS_ROLLED_BACK", "STATUS_SHADOW", "STATUS_SUPERSEDED", "STATUS_VALIDATED", "STATUSES",
-    "TARGETED_EXPLICIT_CODES", "TARGET_ERROR_BY_DIRECTION", "ambient_score", "baseline_config_hash",
+    "TARGETED_EXPLICIT_CODES", "TARGET_ERROR_BY_DIRECTION", "ambient_score", "available_actions",
+    "baseline_config_hash",
     "bounded_target",
     "can_transition", "candidate_from", "candidate_payload", "clamp_cumulative", "clamp_param", "decide", "drift_from",
     "next_version", "normalize_policy", "normalize_status", "policy_deltas", "policy_summary",

@@ -28,7 +28,7 @@ Two vocabularies, deliberately separate:
   filing them under "gate".
 
 One rule the rest of the plugin depends on: a suppression is only ever a
-**gate** suppression when the reason says so. "The bot did not reply" is not
+**gate** suppression when the host explicitly names that stage or a known reason says so. "The bot did not reply" is not
 evidence about *why*.
 """
 from __future__ import annotations
@@ -267,7 +267,7 @@ def _assemble(*, value: str, delivered: bool | None, reason: str,
         resolved_stage = reason_stage(reason) if reason else ""
     if not resolved_stage:
         resolved_stage = VALUE_STAGE.get(value, STAGE_UNKNOWN)
-    if resolved_stage == STAGE_GATE and reason and reason_stage(reason) != STAGE_GATE:
+    if stage not in STAGES and resolved_stage == STAGE_GATE and reason and reason_stage(reason) != STAGE_GATE:
         # The host said "suppressed" but named a reason this plugin does not
         # recognise as a gate code. That is a stage nobody can vouch for.
         resolved_stage = STAGE_UNKNOWN
@@ -304,8 +304,8 @@ def parse_outcome(*sources: Any) -> FinalOutcome:
     rather than merged, so two disagreeing sources cannot produce a third answer
     that neither of them stated.
     """
-    for source in sources:
-        found = from_mapping(source, source=SOURCE_TRACE)
+    for index, source in enumerate(sources):
+        found = from_mapping(source, source=SOURCE_TRACE if index == 0 else SOURCE_RECORD)
         if found.recorded:
             return found
     return EMPTY
@@ -316,7 +316,7 @@ def parse_record_outcome(record: Mapping[str, Any]) -> FinalOutcome:
     if not isinstance(record, Mapping):
         return EMPTY
     trace = record.get("decision_trace")
-    first = trace if isinstance(trace, Mapping) else record
+    first = trace if isinstance(trace, Mapping) else {}
     return parse_outcome(first, record)
 
 

@@ -121,7 +121,7 @@ def test_binary_report_f1_matches_its_definition():
 
 def test_error_types_name_the_direction_of_the_mistake():
     missed = make_record("m1", trace=make_trace(evidence=[("ambient_baseline", "baseline", 0.2)],
-                                                bot_targeted=False),
+                                                bot_targeted=False, participation_level="weak"),
                          bot_targeted=True, expected_reply=True)
     # The host admitted a reply (level strong) but the human says it should not
     # have: that is a premature reply, not a missed one.

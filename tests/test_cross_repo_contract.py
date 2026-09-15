@@ -127,8 +127,8 @@ def test_a_delivered_turn_records_an_outcome_sample_that_is_correct():
     assert attribute(samples)[0].bucket == buckets.OK
 
 
-def test_an_unattributed_ending_reads_as_unattributable_not_as_a_gate():
-    """A reason the reader does not know must not be filed under the gate."""
+def test_an_explicit_host_stage_survives_an_unknown_reason():
+    """An explicit host stage is evidence even for a newly introduced reason."""
     trace = _host_trace(
         participation={"score": 0.8, "level": "strong", "should_reply": None},
         outcome={"final_outcome": "suppressed", "delivered": False,
@@ -137,7 +137,7 @@ def test_an_unattributed_ending_reads_as_unattributable_not_as_a_gate():
     samples = build_dataset([(SESSION, _annotation_record(trace))])
     row = attribute(samples)[0]
 
-    assert row.bucket == buckets.UNATTRIBUTABLE
+    assert row.bucket == buckets.GATE_SUPPRESSION
 
 
 def test_a_not_attempted_turn_is_a_participation_error_when_reply_was_expected():

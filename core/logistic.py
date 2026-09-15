@@ -86,7 +86,9 @@ class LogisticModel:
 
     def aligned(self, names: Sequence[str]) -> "LogisticModel":
         """Re-order onto `names`, zero-filling anything the model never saw."""
-        lookup = dict(zip(self.feature_names, self.weights))
+        lookup: dict[str, float] = {}
+        for name, weight in zip(self.feature_names, self.weights):
+            lookup[name] = lookup.get(name, 0.0) + float(weight)
         return LogisticModel(
             weights=tuple(float(lookup.get(name, 0.0)) for name in names),
             bias=self.bias, feature_names=tuple(names), schema_version=self.schema_version,

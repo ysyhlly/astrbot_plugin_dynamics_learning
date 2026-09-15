@@ -20,9 +20,8 @@ from typing import Any, Mapping, Sequence
 
 ANNOTATION_WINDOW_SCHEMA_VERSION = 1
 
-# Used only when the host snapshot does not report its own limits (a host older
-# than the field). They are the host defaults, repeated here so the page can say
-# something useful instead of "unknown".
+# Legacy public constants retained for import compatibility. Missing host limits
+# are unavailable; these defaults must never be used to invent a deadline.
 FALLBACK_MAX_NODES = 500
 FALLBACK_TTL_SECONDS = 3600.0
 
@@ -81,9 +80,10 @@ def window_payload(runtime: Any, annotated: Mapping[str, set[str]], *,
     """
     runtime = runtime if isinstance(runtime, Mapping) else {}
     graph = runtime.get("graph") if isinstance(runtime.get("graph"), Mapping) else {}
-    max_nodes = int(_number(graph.get("max_nodes")) or fallback_max_nodes)
+    max_nodes = _number(graph.get("max_nodes"))
+    max_nodes = int(max_nodes) if max_nodes is not None and max_nodes > 0 else None
     ttl_seconds = _number(graph.get("ttl_seconds"))
-    ttl_seconds = fallback_ttl_seconds if ttl_seconds is None else ttl_seconds
+    ttl_seconds = ttl_seconds if ttl_seconds is not None and ttl_seconds >= 0 else None
     to_wall = _wall_clock(runtime)
 
     rows: list[dict[str, Any]] = []
@@ -116,7 +116,7 @@ def window_payload(runtime: Any, annotated: Mapping[str, set[str]], *,
             "newest_wall": newest,
             "span_seconds": (newest - oldest) if (oldest is not None and newest is not None) else None,
             "idle_seconds": (now_wall - newest) if newest is not None else None,
-            "expires_in_seconds": ((oldest + ttl_seconds) - now_wall) if oldest is not None else None,
+            "expires_in_seconds": ((oldest + ttl_seconds) - now_wall) if oldest is not None and ttl_seconds is not None else None,
             "cap_pressure": round(len(nodes) / max_nodes, 3) if max_nodes else None,
         }
         if include_messages:
@@ -135,7 +135,7 @@ def window_payload(runtime: Any, annotated: Mapping[str, set[str]], *,
         "annotation_window_schema_version": ANNOTATION_WINDOW_SCHEMA_VERSION,
         "generated_at": now_wall,
         "limits": {"max_nodes": max_nodes, "ttl_seconds": ttl_seconds,
-                   "reported_by_host": bool(graph)},
+                   "reported_by_host": max_nodes is not None and ttl_seconds is not None},
         "sessions": rows,
         "totals": totals,
         "hint": _hint(rows, totals, ttl_seconds),
@@ -163,14 +163,14 @@ def _message_rows(nodes: Sequence[Mapping[str, Any]], labelled: set[str],
 
 
 def _hint(rows: Sequence[Mapping[str, Any]], totals: Mapping[str, int],
-          ttl_seconds: float) -> str:
+          ttl_seconds: float | None) -> str:
     if not rows:
         return ("本体的运行快照里还没有会话：确认 ChatDynamics 正在运行、生效群里有消息，再刷新一次。")
     if not totals["unlabelled"]:
         return ("这段窗口里的消息都已经标注过了。等新消息进来再回来看。")
     soonest = min((row["expires_in_seconds"] for row in rows
                    if row.get("expires_in_seconds") is not None), default=None)
-    where = "" if soonest is None else _deadline_phrase(soonest, ttl_seconds)
+    where = "本体未报告保留期限，无法计算清理时间；" if ttl_seconds is None else ("" if soonest is None else _deadline_phrase(soonest, ttl_seconds))
     return (f"窗口里有 {totals['unlabelled']} 条还没标注（带正文 {totals['with_text']} 条）。"
             + where
             + "标注记录是永久的，未标注的消息会随本体的消息图一起被清理 —— 要标就现在标。")

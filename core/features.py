@@ -30,8 +30,29 @@ _ROUTER_FEATURES = (
 _IDENTITY_FEATURES = ("id_mention", "id_vocative", "id_subject", "id_any_reference")
 _CONTEXT_FEATURES = ("ctx_prior_bot", "ctx_explicit", "ctx_mode_persona")
 
+def _unique(names: tuple[str, ...]) -> tuple[str, ...]:
+    """Drop a repeated name, keeping its first position.
+
+    `st_pending_hover` and `st_active_interlocutor` are produced twice on
+    purpose-built lists: once as the strength of an ambient evidence code and once
+    as a decoded state flag. A duplicate here is not cosmetic — the vector would
+    carry the same input twice, the coefficient would split across two slots that
+    can never be told apart, and `LogisticModel.aligned` maps names to weights
+    through a dict, so re-aligning a stored model would silently keep only the
+    last of the two weights and change what the model scores.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return tuple(ordered)
+
+
 # The exact-name list a stored model is validated against.
-FEATURE_NAMES: tuple[str, ...] = (
+FEATURE_NAMES: tuple[str, ...] = _unique((
     *(f"ev_{code}" for code in _AMBIENT_SORTED),
     *(f"st_{code}" for code in _AMBIENT_SORTED),
     *_STATE_FEATURES,
@@ -39,7 +60,7 @@ FEATURE_NAMES: tuple[str, ...] = (
     *_IDENTITY_FEATURES,
     *_CONTEXT_FEATURES,
     *(f"fam_{family}" for family in sorted(EVIDENCE_FAMILIES)),
-)
+))
 FEATURE_INDEX = {name: index for index, name in enumerate(FEATURE_NAMES)}
 
 

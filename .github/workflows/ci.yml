@@ -1,0 +1,40 @@
+name: Tests and release checks
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
+    defaults:
+      run:
+        working-directory: astrbot_plugin_dynamics_learning
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: astrbot_plugin_dynamics_learning
+      - uses: actions/checkout@v4
+        with:
+          repository: ysyhlly/astrbot_plugin_chat_dynamics
+          ref: 53b4bffba9273bcdb766cf87f9df5a726e86ee6b
+          path: astrbot_plugin_chat_dynamics
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Apply companion host contract fix
+        run: git -C ../astrbot_plugin_chat_dynamics apply ../astrbot_plugin_dynamics_learning/docs/chat-dynamics-shadow-recorded-at.patch
+      - run: python -m pytest -q
+      - run: python -m ruff check .
+      - run: node tests/frontend_regression.cjs
+      - run: python scripts/check_release.py
+      - run: python scripts/build_release.py

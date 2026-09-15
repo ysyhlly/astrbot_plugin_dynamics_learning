@@ -27,7 +27,8 @@ from .core.attribution import attribution_report
 from .core.config import LearningConfig, parse_learning_config
 from .core.ingest import IngestResult, collect_from_host, parse_export, parse_preferences
 from .core.policy import (
-    ACTION_STATUS, ACTIONS, BASE_POLICY, candidate_payload, normalize_status, published_payload,
+    ACTION_STATUS, ACTIONS, BASE_POLICY, CONSOLE_ACTIONS, available_actions, candidate_payload,
+    normalize_status, published_payload,
 )
 from .core.quality import dataset_gate, quality_report
 from .core.reply_review import (
@@ -71,7 +72,7 @@ def _completion_text(response: Any) -> str:
     PLUGIN_NAME,
     "ysyhlly",
     "群间 · Dynamics Learning",
-    "v1.3.1",
+    "v1.3.2",
     "",
 )
 class DynamicsLearningPlugin(Star):
@@ -229,7 +230,8 @@ class DynamicsLearningPlugin(Star):
         async with self._lock:
             samples = await self.load_samples(refresh=True)
             policies = await self.store.load_policies()
-            result = analyze(
+            result = await asyncio.to_thread(
+                analyze,
                 samples,
                 config=self.runtime_config(),
                 existing_versions=[row.version for row in policies],
@@ -242,6 +244,8 @@ class DynamicsLearningPlugin(Star):
                 # policy was validated against has no basis for `active`.
                 host_version=str(self._last_diagnostics.get("host_version") or "") or None,
             )
+            if self._shutting_down:
+                return self.report_payload_sync()
             payload = _trim(result.as_dict())
             self._last_report = payload
             await self.store.patch_state(last_report=payload, last_analysis_at=time.time())
@@ -282,7 +286,7 @@ class DynamicsLearningPlugin(Star):
         policies = await self.store.load_policies()
         return {
             "plugin": PLUGIN_NAME,
-            "version": "v1.3.1",
+            "version": "v1.3.2",
             "config": config.as_dict(),
             "dataset": {
                 "samples": len(samples),
@@ -328,8 +332,15 @@ class DynamicsLearningPlugin(Star):
                 "session_hash": row.session_hash[:12],
                 "msg_id": _redact(row.msg_id),
                 "task": row.task,
-                "predicted": _redact(row.predicted),
-                "expected": _redact(row.expected),
+                # The label columns travel **unredacted**, which is the point of
+                # them: predicted/expected are drawn from a closed vocabulary
+                # (bot / other / reply / silent / a topic id), never from message
+                # text. Running them through _redact masks every value to
+                # asterisks -- "bot" and "other" both render as five stars -- so
+                # the page ends up with a table nobody can read. Redaction
+                # belongs on the identity columns above, and nowhere else.
+                "predicted": row.predicted,
+                "expected": row.expected,
                 "correct": row.correct,
                 "confidence": round(float(row.confidence), 4),
                 "error_type": row.error_type,
@@ -337,7 +348,11 @@ class DynamicsLearningPlugin(Star):
                 "codes": list(row.trace.get("evidence_summary", {}).get("codes", ()))[:12]
                 if isinstance(row.trace.get("evidence_summary"), dict) else [],
             } for row in window],
-            "note": "样本不含消息正文；身份字段按首尾保留脱敏。",
+            "note": "样本不含消息正文；会话与消息 id 按首尾保留脱敏，预测与标注是标签本身。",
+            "label_vocabulary": {"recipient": ["bot", "other"],
+                                 "reply_admission": ["reply", "silent"],
+                                 "reply_outcome": ["reply", "silent"],
+                                 "topic": ["话题 id，或 NEW:<msg_id>"]},
         }
 
     async def quality_payload(self) -> dict[str, Any]:
@@ -737,7 +752,16 @@ class DynamicsLearningPlugin(Star):
             key = normalize_status(row.status)
             counts[key] = counts.get(key, 0) + 1
         published = published_payload(policies)
-        return {"total": len(policies), "rows": policy_rows(policies),
+        rows = policy_rows(policies)
+        # Which buttons a row may offer is a property of its *current* status,
+        # and the store is the only thing that knows it. Deriving it here means
+        # the page never renders an arrow the state machine would refuse — the
+        # alternative is a 400 the reader has to read as a UI bug.
+        for policy_row in rows:
+            policy_row["available_actions"] = available_actions(policy_row.get("status") or "")
+        return {"total": len(policies), "rows": rows,
+                "actions": [{"action": action, "label": label}
+                            for action, label in CONSOLE_ACTIONS],
                 "status_counts": counts,
                 # The published face travels with the records so the page can
                 # show what was offered to the host next to what this plugin
@@ -806,10 +830,17 @@ class DynamicsLearningPlugin(Star):
             await self.store.save_policies([])
             await self.store.clear_published()
             await self.store.clear_candidate()
+            await self.store.clear_review()
             await self.store.save_state({})
             self._samples = []
             self._last_report = None
             self._last_diagnostics = {}
+            self._last_contract = {}
+            self._reply_review_cache = {}
+            self._review_failed_at = 0.0
+            self._review_failure_reason = ""
+            self._reply_review_failed_at = 0.0
+            self._reply_review_failure_reason = ""
         return {"removed_samples": removed, "note": "已清空本插件的样本与报告。"}
 
 
@@ -840,10 +871,15 @@ def _as_float(value: Any) -> float | None:
 
 
 def _redact(value: Any) -> str:
-    """Keep identity fields out of the page while staying recognisable.
+    """Keep **identity** fields out of the page while staying recognisable.
 
     Matches the host console's convention: short values are masked entirely and
     longer ones keep only their head and tail.
+
+    Identity only. This is deliberately not applied to the label columns
+    (predicted / expected): they hold vocabulary tokens and topic ids, and the
+    masking rule turns every one of them into asterisks — "bot" and "other"
+    become indistinguishable — which is a table that cannot be read.
     """
     text = str(value or "")
     if not text:

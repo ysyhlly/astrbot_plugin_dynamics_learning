@@ -253,13 +253,13 @@ def run_tuning(
         return run
     split = split_by_session(samples, holdout_ratio=config.holdout_ratio)
     holdout = [sample for sample in split.holdout if sample.task == task]
-    if not split.holdout or len(holdout) < config.min_samples_for_evaluation:
+    baseline_score = score_task(holdout, baseline, task)
+    support = len(holdout) - baseline_score.unreplayable
+    if not split.holdout or support < config.min_samples_for_evaluation:
         run.decision = DECISION_INSUFFICIENT
-        run.stop_reason = (f"留出集该任务只有 {len(holdout)} 条，"
+        run.stop_reason = (f"留出集该任务只有 {support} 条可评测样本，"
                            f"低于 {config.min_samples_for_evaluation} 条，迭代不下结论")
         return run
-
-    baseline_score = score_task(holdout, baseline, task)
 
     current = dict(baseline)
     previous_score = baseline_score
@@ -482,6 +482,9 @@ def _finalise(run: TuneRun, samples: Sequence[LearningSample], config: LearningC
     # it — is a different kind of evidence, and this plugin cannot produce it.
     status = STATUS_VALIDATED if run.promoted else STATUS_PROPOSED
     last = run.steps[-1] if run.steps else None
+    split = split_by_session(samples, holdout_ratio=config.holdout_ratio)
+    holdout = [sample for sample in split.holdout if sample.task == task]
+    support = len(holdout) - score_task(holdout, run.final_policy, task).unreplayable
     candidate = candidate_from(
         run.final_policy, baseline=baseline, source="iterative_tuning",
         rationale=(f"{run.task} 迭代调参：{run.adopted_steps} 步采纳，"
@@ -490,22 +493,22 @@ def _finalise(run: TuneRun, samples: Sequence[LearningSample], config: LearningC
             "decision": run.decision, "steps": len(run.steps),
             "adopted_steps": run.adopted_steps, "rules": run.rules.as_dict(),
             "high_confidence": run.high_confidence,
+            "holdout_support": support,
             "deltas": policy_deltas(baseline, run.final_policy),
         },
         existing_versions=existing_versions, now=now,
     )
     run.candidate = candidate.with_fields(
-        status=status,
         target_error=(last.target_error if last is not None else "") or "",
         collateral_regressions=tuple(
             name for name, row in ((last.collateral or {}).items() if last else ())
             if isinstance(row, Mapping) and row.get("is_target") is False
             and row.get("improved") is False),
-        confidence=confidence_for(run.rules.max_steps and run.adopted_steps or 0,
-                                  min_samples=1),
+        confidence=confidence_for(support, min_samples=config.min_samples_for_evaluation),
         holdout_result={
             "decision": run.decision,
             "primary_metric": run.primary_metric,
+            "support": support,
             "adopted_steps": run.adopted_steps,
             "cumulative_delta": (last.cumulative_delta if last is not None else None),
             "target_error_cumulative": (last.target_error_cumulative

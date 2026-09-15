@@ -29,7 +29,7 @@ desc: |
   候选逐条证据与最终发送结果才可用；schema 2 记录会被明确标成
   outcome_unavailable 与 candidate_evidence_partial，不会假装有这些字段。
   画像的作用域当前等于会话：本体契约没有提供跨会话的群身份。
-version: v1.3.1
+version: v1.3.2
 author: ysyhlly
 astrbot_version: ">=4.16,<5"
 tags:

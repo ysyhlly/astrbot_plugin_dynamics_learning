@@ -56,6 +56,10 @@ class RecipientLearning:
     ambient_samples: int = 0
     explicit_samples: int = 0
     early_return_samples: int = 0
+    # Ambient turns whose additive total the host never wrote. They are counted
+    # here, and excluded from the sweep and the fit, because `base_score` is 0.0
+    # for them: a fabricated feature and a fabricated cut to sweep against.
+    unscored_samples: int = 0
     degraded_samples: int = 0
     accuracy: dict[str, Any] = field(default_factory=dict)
     confusion: dict[str, Any] = field(default_factory=dict)
@@ -73,6 +77,7 @@ class RecipientLearning:
             "samples": self.samples, "sessions": self.sessions,
             "ambient_samples": self.ambient_samples, "explicit_samples": self.explicit_samples,
             "early_return_samples": self.early_return_samples,
+            "unscored_samples": self.unscored_samples,
             "degraded_samples": self.degraded_samples,
             "accuracy": self.accuracy, "confusion": self.confusion,
             "error_types": self.error_types, "positive_rate": self.positive_rate,
@@ -91,7 +96,7 @@ def _is_explicit(sample: LearningSample) -> bool:
 
 def _is_ambient(sample: LearningSample) -> bool:
     """A scored ambient turn: neither structural nor the host's early return."""
-    return not _is_explicit(sample) and sample.features.get("ctx_prior_bot", 1.0) >= 1.0
+    return not _is_explicit(sample) and sample.features.get("ctx_prior_bot", 0.0) >= 1.0
 
 
 def evidence_lift(samples: Sequence[LearningSample], base_rate: float) -> list[EvidenceLift]:
@@ -142,27 +147,37 @@ def learn(samples: Sequence[LearningSample], *, config: LearningConfig | None = 
     if report.early_return_samples:
         report.notes.append(
             f"{report.early_return_samples} 条为无前序 Bot 消息的提前返回，同样与阈值无关。")
-    if len(ambient) < config.min_samples_for_recommendation:
+    # Only ambient turns the host actually scored can be swept or fitted: for the
+    # rest `base_score` is 0.0, which is this plugin's default rather than a
+    # measurement. The replay keeps their recorded decision (see
+    # `core.policy.decide`), so they are counted and set aside here.
+    scored = [sample for sample in ambient if sample.contribution_total_recorded]
+    report.unscored_samples = len(ambient) - len(scored)
+    if report.unscored_samples:
         report.notes.append(
-            f"环境层样本 {len(ambient)} 条，低于建议阈值 {config.min_samples_for_recommendation} 条，"
-            "本轮只出统计与诊断，不出参数建议。")
+            f"{report.unscored_samples} 条环境层样本没有记录 participation.contribution_total，"
+            "加性分数无法复现，因此不参与阈值扫描与拟合（回放时沿用它原本的判定）。")
+    if len(scored) < config.min_samples_for_recommendation:
+        report.notes.append(
+            f"可回放的环境层样本 {len(scored)} 条，低于建议阈值 "
+            f"{config.min_samples_for_recommendation} 条，本轮只出统计与诊断，不出参数建议。")
         report.evidence_lift = evidence_lift(ambient, _base_rate(ambient))
         return report
 
     base_rate = _base_rate(ambient)
     report.evidence_lift = evidence_lift(ambient, base_rate)
 
-    labels = [sample.expected == BOT for sample in ambient]
-    vectors = [vector(sample.features) for sample in ambient]
+    labels = [sample.expected == BOT for sample in scored]
+    vectors = [vector(sample.features) for sample in scored]
     report.model = fit(vectors, labels, feature_names=FEATURE_NAMES,
                        l2_strength=config.l2_strength, learning_rate=config.learning_rate,
                        iterations=config.max_iterations)
 
-    recorded = [float(sample.features.get("base_score", 0.0)) for sample in ambient]
+    recorded = [float(sample.features.get("base_score", 0.0)) for sample in scored]
     report.threshold_sweep = sweep_threshold(recorded, labels, metric="f1")
 
     report.recommendations.extend(_threshold_recommendations(
-        report=report, ambient=ambient, config=config, base_rate=base_rate))
+        report=report, ambient=scored, config=config, base_rate=base_rate))
     report.recommendations.extend(_diagnostics(report, base_rate))
     return report
 

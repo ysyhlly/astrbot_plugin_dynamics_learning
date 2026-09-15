@@ -48,7 +48,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 from .candidates import CandidateRecord, parse_candidates
-from .outcome import EMPTY as OUTCOME_EMPTY, FinalOutcome, parse_outcome
+from .outcome import EMPTY as OUTCOME_EMPTY, FinalOutcome, from_mapping, SOURCE_RECORD
 
 # ---- the two protocol versions, named so they can never be confused -----
 #
@@ -330,6 +330,24 @@ class DecisionTrace:
         return self.shadow.recorded
 
     @property
+    def admission_recorded(self) -> bool:
+        """Whether the host recorded an admission decision for this turn.
+
+        True when a level was written (`strong` / `hover` / `weak`) or when the
+        turn is structural — an explicit mention short-circuits the policy, so its
+        answer exists without a score.
+
+        False means the participation block is empty. That is the shape a rebuilt
+        trace takes for a debounced turn's non-final fragment, and it is *not*
+        "the router declined": reading the absence as `weak` invents the router's
+        answer, and every count derived from it (a `missed_reply`, an accuracy, a
+        target-error rate) then measures this plugin's default instead. This one
+        predicate is what the sample layer and the contract plane both ask, so the
+        two cannot disagree about which records can be scored.
+        """
+        return self.participation_level in LEVELS or self.is_explicit
+
+    @property
     def codes(self) -> frozenset[str]:
         return frozenset(item.code for item in self.evidence)
 
@@ -350,7 +368,7 @@ class DecisionTrace:
 
     @property
     def prior_bot_proxy(self) -> int:
-        """1 when the host produced a scored (non short-circuit, non early-return) turn.
+        """1 for scored evidence, 0 for the early-return signature, -1 if unknown.
 
         The host's `ParticipationPolicy.evaluate` returns early with only
         `ambient_baseline` (plus an optional `human_quote` penalty) when the
@@ -359,7 +377,7 @@ class DecisionTrace:
         """
         codes = self.codes
         if not codes:
-            return 1
+            return -1
         return 0 if codes <= {"ambient_baseline", "human_quote"} else 1
 
     def to_contract(self) -> dict[str, Any]:
@@ -537,7 +555,8 @@ def _read_candidates(raw: Mapping[str, Any]) -> tuple[tuple[CandidateRecord, ...
 
 
 def _read_outcome(raw: Mapping[str, Any]) -> FinalOutcome:
-    return parse_outcome(raw, _section(raw, "routing"))
+    outcome = from_mapping(raw)
+    return outcome if outcome.recorded else from_mapping(_section(raw, "routing"))
 
 
 def _read_shadow(raw: Mapping[str, Any]) -> ShadowDecision:
@@ -732,7 +751,9 @@ def trace_from_sample_record(record: Mapping[str, Any]) -> DecisionTrace:
         # The outcome is written after the snapshot was frozen, so it is
         # normally one level up — the trace is checked first only so that a host
         # which *does* freeze it wins over a stale copy beside it.
-        fallback = parse_outcome(routing, record)
+        fallback = from_mapping(routing, source=SOURCE_RECORD)
+        if not fallback.recorded:
+            fallback = from_mapping(record, source=SOURCE_RECORD)
         if fallback.recorded:
             changes["outcome"] = fallback
     return replace(trace, **changes) if changes else trace

@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from astrbot_plugin_dynamics_learning.core.window import (
-    FALLBACK_MAX_NODES, FALLBACK_TTL_SECONDS, MAX_TEXT_IN_EXPORT, session_digest,
+    MAX_TEXT_IN_EXPORT, session_digest,
     window_payload,
 )
 
@@ -98,8 +98,8 @@ def test_a_host_that_does_not_report_its_limits_is_not_reported_as_if_it_had():
 
     payload = window_payload(runtime, {}, now_wall=NOW)
 
-    assert payload["limits"] == {"max_nodes": FALLBACK_MAX_NODES,
-                                 "ttl_seconds": FALLBACK_TTL_SECONDS,
+    assert payload["limits"] == {"max_nodes": None,
+                                 "ttl_seconds": None,
                                  "reported_by_host": False}
 
 

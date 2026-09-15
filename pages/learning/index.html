@@ -12,6 +12,12 @@
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
+    <noscript>
+      <p class="notice error">
+        这个页面完全由 JavaScript 渲染：脚本被拦截或加载失败时，下面只会是一片空卡片。
+        请允许本页运行脚本，然后从 AstrBot 面板的插件页入口重新打开。
+      </p>
+    </noscript>
     <a class="skip-link" href="#main">跳到主内容</a>
     <div class="wrap">
       <header class="bar">
@@ -31,22 +37,32 @@
 
       <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
 
-      <nav class="tabs" aria-label="视图">
-        <button type="button" class="tab active" data-view-btn="overview" aria-current="true">总览</button>
-        <button type="button" class="tab" data-view-btn="scopes" aria-current="false">会话画像</button>
+      <nav class="tabs" role="tablist" aria-label="视图">
+        <button type="button" class="tab active" id="tab-overview" role="tab"
+                data-view-btn="overview" aria-selected="true" aria-controls="panel-overview">总览</button>
+        <button type="button" class="tab" id="tab-scopes" role="tab"
+                data-view-btn="scopes" aria-selected="false" aria-controls="panel-scopes">会话画像</button>
       </nav>
 
       <main id="main">
+        <div id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" tabindex="-1">
         <section class="card" data-view="overview" aria-labelledby="hQuality">
           <h2 id="hQuality">数据契约状态</h2>
           <p class="hint">
             每一行是学习层真正要用的一项能力，以及这批数据能不能支撑它。
+            这张表由本插件确定性计算；下面「数据门槛」决定这批数据能不能出策略，它不会被折叠。
             覆盖率低不代表系统差，代表记录里没有可以判断的证据；
             「不支持」是结论，不是错误。
             这张表由模型解读：它读的是本插件算出的计数与判定，只能引用摘要里出现过的数字，
             越界的数字会单独标出；模型不可用时自动回落到本插件自己的判定。
           </p>
           <div id="review" class="stack"></div>
+          <!-- The pre-learning gate is deliberately *outside* the <details>
+               below. It answers "will this batch produce a policy at all", and
+               it used to be folded away the moment the model review succeeded:
+               the one conclusion on the page that must not be collapsible was
+               the one that disappeared. -->
+          <div id="datasetGate" class="stack"></div>
           <!-- The deterministic table lives here and is never moved into the
                review card: moving a node into a parent that is later replaced
                with innerHTML destroys it, and every later render of it then
@@ -73,8 +89,7 @@
 
         <section class="card" data-view="overview" aria-labelledby="hOverview">
           <h2 id="hOverview">学习概览</h2>
-          <div id="overview" class="grid">加载中…</div>
-          <div id="candidates" class="stack"></div>
+          <div id="overview" class="grid"></div>
         </section>
 
         <section class="card" data-view="overview" aria-labelledby="hShadow">
@@ -131,13 +146,18 @@
         <section class="card" data-view="overview" aria-labelledby="hErrors">
           <h2 id="hErrors">错误分布与话题候选归因</h2>
           <div id="errors" class="table-host"></div>
+          <!-- 话题候选归因 used to render inside 学习概览 while this heading
+               promised it. A heading and its content in two different cards is
+               a table of contents that lies. -->
+          <div id="candidates" class="stack"></div>
         </section>
 
         <section class="card" data-view="overview" aria-labelledby="hRec">
           <h2 id="hRec">系统建议</h2>
           <p class="hint">
             参数建议都指向 ChatDynamics 的真实配置键，并已按单次变化上限截断。
-            标记「采纳」只写入本插件的策略记录，不会改动 ChatDynamics 配置。
+            把建议变成一条策略记录要先过离线评测，所以这里的按钮只负责跳到「策略版本」——
+            那里才有可采纳的版本号。标记「采纳」只写入本插件的策略记录，不会改动 ChatDynamics 配置。
           </p>
           <div id="recs" class="stack"></div>
         </section>
@@ -162,8 +182,13 @@
           <div id="eval" class="stack"></div>
         </section>
 
-        <section class="card" data-view="overview" aria-labelledby="hPolicies">
+        <section class="card" id="policiesCard" data-view="overview" aria-labelledby="hPolicies">
           <h2 id="hPolicies">策略版本</h2>
+          <p class="hint">
+            这一列按钮按每条记录的<strong>当前状态</strong>给出：状态机不允许的迁移不会渲染，
+            省得点了才报错。只有「采纳」会让记录出现在 /published，
+            而是否采用仍由 ChatDynamics 决定 —— 这里不会改动本体的任何配置。
+          </p>
           <div id="policies" class="stack"></div>
         </section>
 
@@ -180,10 +205,17 @@
               </select>
             </label>
             <button id="btnSamples" type="button" class="btn">加载样本</button>
+            <div class="pager">
+              <button id="btnSamplesPrev" type="button" class="btn small" disabled>上一页</button>
+              <span id="samplesPage" class="pager-label">第 — 页</span>
+              <button id="btnSamplesNext" type="button" class="btn small" disabled>下一页</button>
+            </div>
           </div>
           <div id="samples" class="table-host"></div>
         </section>
 
+        </div>
+        <div id="panel-scopes" role="tabpanel" aria-labelledby="tab-scopes" tabindex="-1" hidden>
         <section class="card" data-view="scopes" aria-labelledby="hScopes" hidden>
           <h2 id="hScopes">会话画像</h2>
           <p class="hint">
@@ -204,10 +236,11 @@
             <p class="empty">在上面的列表里点「查看」。</p>
           </div>
         </section>
+        </div>
       </main>
 
       <footer class="foot">
-        <span>Dynamics Learning v1.3.1 · Shadow Learning：只学习、只分析、只推荐。</span>
+        <span id="footVersion">Dynamics Learning · Shadow Learning：只学习、只分析、只推荐。</span>
       </footer>
     </div>
     <script src="./app.js"></script>

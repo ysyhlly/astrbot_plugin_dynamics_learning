@@ -49,7 +49,33 @@ const CONFIDENCE_LABEL = {
   moderate: "置信度中",
 };
 
-const state = { overview: null, report: null, quality: null, attribution: null, scopes: null, review: null, replyReview: null, annotationWindow: null, view: "overview" };
+const state = {
+  overview: null, report: null, quality: null, attribution: null, scopes: null,
+  review: null, replyReview: null, annotationWindow: null, view: "overview",
+  // The sample browser pages server-side; the page only ever holds one page.
+  samplesPage: 1, samplesTotal: 0, samplesTask: "",
+};
+
+// "下载一个 JSON" is one behaviour, so it is one function: the anchor is
+// attached before it is clicked (a detached anchor is unreliable outside
+// Chrome) and the object URL is released on a later turn, not synchronously
+// under the click that is still starting the download.
+function downloadJson(payload, filename) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+function stamp() {
+  return new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+}
 
 function $(id) {
   return document.getElementById(id);
@@ -65,24 +91,46 @@ function esc(value) {
 }
 
 function num(value, digits = 3) {
-  const n = Number(value);
+  const n = value == null || value === "" ? NaN : Number(value);
   return Number.isFinite(n) ? n.toFixed(digits) : "—";
 }
 
 function pct(value) {
-  const n = Number(value);
+  const n = value == null || value === "" ? NaN : Number(value);
   return Number.isFinite(n) ? (n * 100).toFixed(1) + "%" : "—";
 }
 
+// One status line for the whole page. It takes **plain text** — several call
+// sites used to hand it an esc() result, which then landed in textContent and
+// rendered as &amp; / &lt;. Escaping belongs at the innerHTML boundary only.
 function notice(message, kind = "") {
   const el = $("notice");
   if (!message) {
     el.hidden = true;
+    el.textContent = "";
     return;
   }
   el.hidden = false;
   el.className = "notice" + (kind ? " " + kind : "");
   el.textContent = message;
+  // A message the reader cannot dismiss is a message that stays wrong forever.
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "notice-close";
+  close.setAttribute("aria-label", "关闭提示");
+  close.textContent = "×";
+  close.addEventListener("click", () => notice(""));
+  el.appendChild(close);
+}
+
+// The page is a report, not an editor: a failed section must not blank the
+// other twelve. Each host is rendered independently and a failure lands in the
+// host it belongs to, where the reader is already looking.
+function sectionError(hostId, label, error) {
+  const host = $(hostId);
+  if (host) {
+    host.innerHTML = '<p class="notice error">' + esc(label) + "失败：" + esc(String(error.message || error)) + "</p>";
+  }
 }
 
 function bridge() {
@@ -103,21 +151,33 @@ async function waitForBridge(timeoutMs = 4000) {
   }
 }
 
-async function call(endpoint, { method = "GET", params, body } = {}) {
+async function call(endpoint, { method = "GET", params, body, timeoutMs = 120000 } = {}) {
   const api = bridge();
   if (!api) {
     throw new Error("没有找到 AstrBot 插件页桥接（window.AstrBotPluginPage）："
       + "请从 AstrBot 面板的插件页入口打开本页，不要直接打开 index.html 文件。");
   }
-  const raw = method === "POST"
-    ? await api.apiPost(endpoint, body || {})
-    : await api.apiGet(endpoint, params || {});
+  let timer;
+  let raw;
+  try {
+    raw = await Promise.race([
+      Promise.resolve().then(() => method === "POST"
+        ? api.apiPost(endpoint, body || {}) : api.apiGet(endpoint, params || {})),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("请求超时；服务端可能仍在处理，请刷新检查结果。")), timeoutMs); }),
+    ]);
+  } finally { clearTimeout(timer); }
   const payload = typeof raw === "string" ? JSON.parse(raw) : raw;
   if (!payload || typeof payload !== "object") throw new Error("空响应");
   if (payload.status === "error" || payload.ok === false) {
     throw new Error(payload.error || payload.message || "请求失败");
   }
   return payload.data !== undefined ? payload.data : payload;
+}
+
+function moment(epoch) {
+  const value = epoch == null || epoch === "" ? NaN : Number(epoch);
+  if (!Number.isFinite(value) || value <= 0) return "还没有";
+  return new Date(value * 1000).toLocaleString();
 }
 
 function statCard(key, value, note) {
@@ -136,15 +196,36 @@ function renderOverview(data) {
     statCard("策略记录", data.policies ?? 0, "采纳不会改动本体配置"),
     statCard("数据来源", url || "未配置", data.diagnostics && data.diagnostics.available === false
       ? "共享首选项不可用" : "只读共享首选项"),
+    // Freshness was computed by the API from the start and never shown; a report
+    // with no "as of when" is a report the reader has to guess about.
+    statCard("上次导入", moment(data.last_ingest_at), "共享首选项被读取的时间"),
+    statCard("上次分析", moment(data.last_analysis_at), data.has_report ? "报告已生成" : "还没有运行过"),
   ].join("");
 
-  const diag = data.diagnostics || {};
-  if (diag.available === false) {
-    notice("读取 ChatDynamics 共享首选项失败：" + esc(diag.error || "未知原因"), "error");
-  } else if (diag.records !== undefined) {
-    notice(`上次导入：${diag.records} 条标注，${diag.runtime_sessions || 0} 个会话，`
-      + `无法归属 ${diag.unknown_sessions || 0} 条，格式异常 ${diag.malformed || 0} 条。`);
+  // The console version comes from the API rather than a literal in the
+  // markup: three copies of the version number is three chances to disagree.
+  const foot = $("footVersion");
+  if (foot && data.version) {
+    foot.textContent = `Dynamics Learning ${data.version} · Shadow Learning：只学习、只分析、只推荐。`;
   }
+  return diagnosticLine(data);
+}
+
+// What the last import did, as a sentence. Returned rather than written, so the
+// caller decides whether it outranks whatever the reader just asked for.
+function diagnosticLine(data) {
+  const diag = (data && data.diagnostics) || {};
+  if (diag.available === false) {
+    return { text: "读取 ChatDynamics 共享首选项失败：" + (diag.error || "未知原因"), kind: "error" };
+  }
+  if (diag.records !== undefined) {
+    return {
+      text: `上次导入：${diag.records} 条标注，${diag.runtime_sessions || 0} 个会话，`
+        + `无法归属 ${diag.unknown_sessions || 0} 条，格式异常 ${diag.malformed || 0} 条。`,
+      kind: "",
+    };
+  }
+  return null;
 }
 
 function renderWindow(report) {
@@ -167,6 +248,29 @@ function renderWindow(report) {
   }
 }
 
+// The learner names its errors in snake_case tokens. The attribution card above
+// has carried Chinese labels for the same vocabulary all along; this table used
+// to print the tokens raw, so one page described one mistake in two languages.
+const ERROR_LABEL = {
+  correct: "正确",
+  missed_bot: "漏认收件人（该认成机器人）",
+  false_bot: "误认收件人（不该认成机器人）",
+  wrong_recipient: "收件人判错",
+  missed_reply: "漏回（该回没回）",
+  premature_reply: "抢话（不该回却回了）",
+  wrong_reply: "回复判错",
+  wrong_topic: "话题归属错误",
+  topic_miss: "候选生成缺失",
+  topic_rank: "候选排序错误",
+  undelivered_reply: "该发出但没发出",
+  unsolicited_reply: "不该发出却发出了",
+  unknown: "未知",
+};
+
+function errorLabel(kind) {
+  return ERROR_LABEL[kind] || kind;
+}
+
 function renderErrors(report) {
   const host = $("errors");
   const errors = (report && report.errors) || {};
@@ -176,13 +280,17 @@ function renderErrors(report) {
     return;
   }
   const rows = [];
+  let total = 0;
   for (const [task, counts] of entries) {
     for (const [kind, count] of Object.entries(counts)) {
-      rows.push(`<tr><td>${esc(TASK_LABEL[task] || task)}</td><td>${esc(kind)}</td>
+      total += Number(count) || 0;
+      rows.push(`<tr><td>${esc(TASK_LABEL[task] || task)}</td>
+        <td>${esc(errorLabel(kind))}<div class="sub">${esc(kind)}</div></td>
         <td class="num">${esc(count)}</td></tr>`);
     }
   }
-  host.innerHTML = `<table><thead><tr><th>任务</th><th>错误类型</th><th class="num">数量</th></tr></thead>
+  host.innerHTML = `<p class="hint">共 ${total} 条错误样本。错误类型的中文是本页的读法，下面是记录里的原始值。</p>
+    <table><thead><tr><th>任务</th><th>错误类型</th><th class="num">数量</th></tr></thead>
     <tbody>${rows.join("")}</tbody></table>`;
 }
 
@@ -202,10 +310,14 @@ function renderRecommendations(report) {
     const verdictTag = verdict
       ? `<span class="tag ${(VERDICT_LABEL[verdict] || {}).cls || ""}">评测：${esc((VERDICT_LABEL[verdict] || {}).text || verdict)}</span>`
       : "";
+    // A recommendation has a parameter but no policy version, and accepting one
+    // is a state-machine move the store performs on a version. So the card does
+    // not offer "采纳" — it offered one anyway until now, and the click only
+    // ever produced a notice explaining that it could not. The honest control
+    // is the one that takes the reader to where adopting actually happens.
     const actions = row.kind === "config_param" && row.actionable
       ? `<div class="actions">
-           <button class="btn small" data-accept="${esc(row.param)}" data-after="${esc(row.after)}">采纳</button>
-           <button class="btn small" data-ignore="${esc(row.param)}">忽略</button>
+           <a class="btn small" href="#policiesCard" data-goto-policies="1">去「策略版本」采纳</a>
          </div>`
       : "";
     return `<article class="rec ${kind}">
@@ -237,7 +349,10 @@ function money(value) {
 }
 
 function ratio(value) {
-  return value === null || value === undefined ? "—" : (value >= 0 ? "+" : "") + pct(value);
+  if (value === null || value === undefined) return "—";
+  const n = value == null || value === "" ? NaN : Number(value);
+  if (!Number.isFinite(n)) return "—";  // pct() renders "—"; a sign in front of it is noise
+  return (n >= 0 ? "+" : "") + pct(n);
 }
 
 function renderCandidates(report) {
@@ -653,9 +768,30 @@ function renderPolicies(data) {
       <td>${esc(row.source)}</td>
       <td>${(row.deltas || []).map((d) => `${esc(d.param)} ${num(d.before)}→${num(d.after)}`).join("<br />") || "—"}</td>
       <td class="sub">${policyEvidence(row)}</td>
-      <td>${POLICY_ACTIONS.map((item) => `<button class="btn small" data-policy="${esc(row.version)}" data-action="${item.action}">${item.label}</button>`).join("")}</td>
+      <td>${POLICY_ACTIONS.filter(item => (row.available_actions || []).includes(item.action)).map((item) => `<button class="btn small" data-policy="${esc(row.version)}" data-action="${item.action}">${item.label}</button>`).join("")}</td>
     </tr>`;
     }).join("")}</tbody></table>`;
+}
+
+let samplesRequest = 0;
+async function loadSamples(page, task) {
+  const request = ++samplesRequest;
+  $("btnSamplesPrev").disabled = true;
+  $("btnSamplesNext").disabled = true;
+  try {
+    const data = await call(ENDPOINTS.samples, { params: { task, page, page_size: 50 } });
+    if (request !== samplesRequest) return;
+    state.samplesPage = data.page || page;
+    state.samplesTotal = data.total || 0;
+    state.samplesTask = task;
+    renderSamples(data);
+  } finally {
+    if (request === samplesRequest) {
+      $("samplesPage").textContent = `第 ${state.samplesPage} 页 / 共 ${Math.max(1, Math.ceil(state.samplesTotal / 50))} 页`;
+      $("btnSamplesPrev").disabled = state.samplesPage <= 1;
+      $("btnSamplesNext").disabled = state.samplesPage * 50 >= state.samplesTotal;
+    }
+  }
 }
 
 function renderSamples(data) {
@@ -790,17 +926,23 @@ function renderReview(data) {
   setQualityRawOpen(false);
 }
 
+const sectionRequests = { review: 0, replyReview: 0, annotationWindow: 0 };
 async function loadReview({ refresh = false, quiet = false } = {}) {
+  const request = ++sectionRequests.review;
   const host = $("review");
   if (!host) return;
   if (!quiet) host.innerHTML = '<p class="empty">正在让模型解读这份数据契约…</p>';
   try {
     const data = await call(ENDPOINTS.review, { params: refresh ? { refresh: 1 } : {} });
+    if (request !== sectionRequests.review) return;
     state.review = data;
     renderReview(data);
+    if (!data.review) throw new Error(data.reason || "模型解读暂不可用");
   } catch (error) {
+    if (request !== sectionRequests.review) return;
     setQualityRawOpen(true);
     host.innerHTML = `<p class="hint">模型解读失败：${esc(error.message || error)}；下面是本插件自己的判定。</p>`;
+    throw error;
   }
 }
 
@@ -877,16 +1019,21 @@ function renderReplyReview(data) {
       本插件不保存正文，复盘结果也不落盘。${esc((data && data.text_policy) || "")}</p>`;
 }
 
-async function loadReplyReview() {
+async function loadReplyReview({ refresh = false } = {}) {
+  const request = ++sectionRequests.replyReview;
   const host = $("replyReview");
   if (!host) return;
   host.innerHTML = `<p class="empty">正在让模型逐条复盘…</p>`;
   try {
-    const data = await call(ENDPOINTS.replyReview, { params: { refresh: 1 } });
+    const data = await call(ENDPOINTS.replyReview, { params: refresh ? { refresh: 1 } : {} });
+    if (request !== sectionRequests.replyReview) return;
     state.replyReview = data;
     renderReplyReview(data);
+    if (!data.review) throw new Error(data.reason || "回复复盘暂不可用");
   } catch (error) {
+    if (request !== sectionRequests.replyReview) return;
     host.innerHTML = `<p class="hint">回复复盘失败：${esc(error.message || error)}</p>`;
+    throw error;
   }
 }
 // ---- the annotation window ---------------------------------------------
@@ -898,7 +1045,7 @@ async function loadReplyReview() {
 // are what keeps a message text.
 
 function humanDuration(seconds) {
-  const value = Number(seconds);
+  const value = seconds == null || seconds === "" ? NaN : Number(seconds);
   if (!Number.isFinite(value) || value < 0) return "—";
   if (value < 90) return Math.round(value) + " 秒";
   if (value < 5400) return Math.round(value / 60) + " 分钟";
@@ -906,13 +1053,13 @@ function humanDuration(seconds) {
 }
 
 function wallMoment(epoch) {
-  const value = Number(epoch);
+  const value = epoch == null || epoch === "" ? NaN : Number(epoch);
   if (!Number.isFinite(value)) return "—";
   return new Date(value * 1000).toLocaleString();
 }
 
 function windowDeadline(seconds) {
-  const value = Number(seconds);
+  const value = seconds == null || seconds === "" ? NaN : Number(seconds);
   if (!Number.isFinite(value)) return "—";
   if (value <= 0) return "已超期，随时清理";
   return "约 " + humanDuration(value) + " 后";
@@ -937,11 +1084,11 @@ function renderAnnotationWindow(data) {
       <td class="num">${esc(windowDeadline(row.expires_in_seconds))}</td>
       <td>${esc(wallMoment(row.oldest_wall))}</td>
     </tr>`).join("");
-  const retention = `${limits.max_nodes ?? "—"} 条 / ${Math.round(Number(limits.ttl_seconds || 0) / 60)} 分钟`;
+  const retention = `${limits.max_nodes ?? "—"} 条 / ${humanDuration(limits.ttl_seconds)}`;
   host.innerHTML = `<div class="grid">
       ${statCard("窗口内消息", totals.messages ?? 0, `带正文 ${totals.with_text ?? 0} 条`)}
       ${statCard("还没标注", totals.unlabelled ?? 0, `已标注 ${totals.annotated ?? 0} 条`)}
-      ${statCard("本体保留规则", retention, limits.reported_by_host ? "由本体快照报出" : "本体未报出，按默认值估")}
+      ${statCard("本体保留规则", retention, limits.reported_by_host ? "由本体快照报出" : "本体未报出，保留规则未知")}
     </div>
     <p class="rationale">${esc(data.hint || "")}</p>
     <div class="table-host"><table><thead><tr>
@@ -952,29 +1099,24 @@ function renderAnnotationWindow(data) {
 }
 
 async function loadAnnotationWindow() {
+  const request = ++sectionRequests.annotationWindow;
   const host = $("annotationWindow");
   if (!host) return;
   try {
     const data = await call(ENDPOINTS.annotationWindow);
+    if (request !== sectionRequests.annotationWindow) return;
     state.annotationWindow = data;
     renderAnnotationWindow(data);
   } catch (error) {
+    if (request !== sectionRequests.annotationWindow) return;
     host.innerHTML = `<p class="hint">读取待标注窗口失败：${esc(error.message || error)}</p>`;
+    throw error;
   }
 }
 
 async function exportAnnotationWindow(button) {
   const data = await call(ENDPOINTS.annotationWindow, { params: { export: 1 } });
-  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `chat_dynamics_annotation_window_${stamp}.json`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
+  downloadJson(data, `chat_dynamics_annotation_window_${stamp()}.json`);
 }
 function renderQuality(data) {
   const host = $("quality");
@@ -1124,53 +1266,46 @@ async function loadScopes() {
 
 function setView(view) {
   state.view = view;
+  document.querySelectorAll('[role="tabpanel"]').forEach(panel => { panel.hidden = panel.id !== `panel-${view}`; });
   document.querySelectorAll("[data-view]").forEach((section) => {
     section.hidden = section.dataset.view !== view;
   });
   document.querySelectorAll("[data-view-btn]").forEach((button) => {
     const active = button.dataset.viewBtn === view;
     button.classList.toggle("active", active);
-    button.setAttribute("aria-current", active ? "true" : "false");
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
   });
 }
 
-async function refresh() {
-  try {
-    const [overview, report, policies, quality, attribution, shadow] = await Promise.all([
-      call(ENDPOINTS.overview),
-      call(ENDPOINTS.report),
-      call(ENDPOINTS.policies),
-      call(ENDPOINTS.quality),
-      call(ENDPOINTS.attribution),
-      call(ENDPOINTS.shadow),
-    ]);
-    state.overview = overview;
-    state.report = report.report;
-    state.quality = quality;
-    state.attribution = attribution;
-    $("linkLamp").classList.add("on");
-    $("linkLabel").textContent = "已连接";
-    renderOverview(overview);
-    renderAttribution(attribution);
-    renderShadow(shadow);
-    renderWindow(state.report);
-    renderErrors(state.report);
-    renderRecommendations(state.report);
-    renderCandidates(state.report);
-    renderTuning(state.report);
-    renderEvaluation(state.report);
-    renderPolicies(policies);
-    renderQuality(quality);
-    // No model, no cost: the window is two host reads, so it loads with the page.
-    loadAnnotationWindow();
-    // The panel a reader sees is the model reading; it loads after the
-    // deterministic payload so a slow or broken model never delays the page.
-    loadReview();
-  } catch (error) {
-    $("linkLamp").classList.remove("on");
-    $("linkLabel").textContent = "未连接";
-    notice(String(error.message || error), "error");
-  }
+let refreshPending = null;
+function refresh() {
+  if (refreshPending) return refreshPending;
+  refreshPending = refreshSections().finally(() => { refreshPending = null; });
+  return refreshPending;
+}
+async function refreshSections() {
+  const sections = [
+    [ENDPOINTS.overview, ["overview"], data => { state.overview = data; renderOverview(data); }],
+    [ENDPOINTS.report, ["window", "errors", "recommendations", "candidates", "tuning", "eval"], data => {
+      state.report = data.report;
+      for (const render of [renderWindow, renderErrors, renderRecommendations, renderCandidates, renderTuning, renderEvaluation]) render(state.report);
+    }],
+    [ENDPOINTS.policies, ["policies"], renderPolicies],
+    [ENDPOINTS.quality, ["quality"], data => { state.quality = data; renderQuality(data); }],
+    [ENDPOINTS.attribution, ["attribution"], data => { state.attribution = data; renderAttribution(data); }],
+    [ENDPOINTS.shadow, ["shadow"], renderShadow],
+  ];
+  const results = await Promise.allSettled(sections.map(async ([endpoint, hosts, render]) => {
+    try { render(await call(endpoint)); }
+    catch (error) { hosts.forEach(host => sectionError(host, endpoint, error)); throw error; }
+  }));
+  const failed = results.filter(result => result.status === "rejected");
+  $("linkLamp").classList.toggle("on", failed.length === 0);
+  $("linkLabel").textContent = failed.length ? "部分加载失败" : "已连接";
+  loadAnnotationWindow().catch(error => notice(error.message, "error"));
+  loadReview().catch(error => notice(error.message, "error"));
+  if (failed.length) throw new Error(`${failed.length} 个区块加载失败：${failed.map(result => result.reason.message).join("；")}`);
 }
 
 async function withBusy(button, label, task) {
@@ -1188,6 +1323,15 @@ async function withBusy(button, label, task) {
 }
 
 function bind() {
+  document.querySelector('[role="tablist"]').addEventListener("keydown", event => {
+    const tabs = [...document.querySelectorAll("[data-view-btn]")];
+    const index = tabs.indexOf(document.activeElement);
+    if (index < 0 || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+      : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    tabs[next].focus(); tabs[next].click();
+  });
   $("btnRefresh").addEventListener("click", () => withBusy($("btnRefresh"), "刷新中…", async () => {
     await refresh();
     notice("");
@@ -1197,7 +1341,7 @@ function bind() {
     const result = await call(ENDPOINTS.ingest, { method: "POST", body: { source: "host" } });
     if (result.ok === false) {
       notice("读取 ChatDynamics 共享首选项失败："
-        + esc((result.diagnostics || {}).error || "未知原因"), "error");
+        + ((result.diagnostics || {}).error || "未知原因"), "error");
     } else {
       notice(`导入完成：${result.annotations} 条标注 → ${result.imported_samples} 条学习样本，`
         + `覆盖 ${result.sessions} 个会话，累计 ${result.stored_samples} 条。`, "ok");
@@ -1213,21 +1357,17 @@ function bind() {
 
   $("btnExport").addEventListener("click", () => withBusy($("btnExport"), "导出中…", async () => {
     const payload = await call(ENDPOINTS.export);
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = "dynamics_learning.json";
-    anchor.click();
-    URL.revokeObjectURL(url);
+    downloadJson(payload, "dynamics_learning.json");
     notice("已导出 JSON。", "ok");
   }));
 
   $("btnSamples").addEventListener("click", () => withBusy($("btnSamples"), "加载中…", async () => {
-    const task = $("taskFilter").value;
-    renderSamples(await call(ENDPOINTS.samples, { params: { task, page: 1, page_size: 50 } }));
+    await loadSamples(1, $("taskFilter").value);
   }));
 
+  for (const [id, offset] of [["btnSamplesPrev", -1], ["btnSamplesNext", 1]]) {
+    $(id).addEventListener("click", () => loadSamples(state.samplesPage + offset, state.samplesTask).catch(error => notice(error.message, "error")));
+  }
   document.querySelectorAll("[data-view-btn]").forEach((button) => {
     button.addEventListener("click", async () => {
       const view = button.dataset.viewBtn || "overview";
@@ -1308,7 +1448,7 @@ async function main() {
       /* the page still renders; refresh() reports the real failure */
     }
   }
-  await refresh();
+  await refresh().catch(error => notice(error.message, "error"));
 }
 
 main();

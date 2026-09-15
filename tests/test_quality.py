@@ -565,8 +565,9 @@ def test_the_raw_plane_counts_draft_assistance_from_the_records():
     rows = [
         _runtime([{"session_key": SESSION, "umo": SESSION}]),
         _annotations(SESSION, [
-            _ambient("m1"),
+            {**_ambient("m1"), "accepted_from": "human"},
             {**_ambient("m2"), "accepted_from": "ai", "label_source": "human"},
+            _ambient("m3"),
         ]),
     ]
 
@@ -574,5 +575,6 @@ def test_the_raw_plane_counts_draft_assistance_from_the_records():
 
     assert contract["ai_assisted"] == 1
     assert contract["human_only"] == 1
+    assert contract["label_source_declared"] == 2
     assert any("起草" in line for line in contract_findings(contract))
 

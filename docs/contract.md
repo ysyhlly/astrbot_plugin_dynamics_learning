@@ -134,8 +134,8 @@ mode, weights_version
    也就是 `ParticipationPolicy.evaluate` 裁剪前的分数。本插件用它复现任意
    `strong_addressivity_threshold` 下的判定，而不重新推导任何权重。若本体改为不写
    这个字段，阈值回放会退化为不可用。
-2. **`level` 不是「是否回复」。** 宿主把 `should_reply` 恒置为 `null`（没有最终发送
-   决策）。因此「回复」在本插件里被拆成两个任务：**回复准入**以「`level == strong`」为
+2. **`level` 不是「是否回复」。** 宿主初始 `should_reply` 为 `null`；规则模式在门禁后
+   可写入准入布尔值，它仍不证明最终发送成功。因此「回复」被拆成两个任务：**回复准入**以「`level == strong`」为
    预测目标，**最终发送**以 schema 3 的 `outcome.delivered` 为预测目标。只有前者是路由
    判定；被作息压掉的发送属于后者，不会被算成路由漏回复。
 
@@ -152,9 +152,11 @@ mode, weights_version
         "final_score": 0.68,
         "rank": 2,
         "evidence": {
-          "semantic": 0.74,
-          "reply_edge": 0.0,
-          "participant_overlap": 0.81,
+          "centroid": 0.74,
+          "exemplar": 0.70,
+          "recent": 0.68,
+          "lineage": 0.0,
+          "participant": 0.81,
           "recency": 0.62,
           "lexical": 0.43
         }
@@ -180,9 +182,9 @@ mode, weights_version
 `outcome` 写在 `decision_trace` 里或写在标注记录同级（`record["outcome"]`）都可以：
 最终结果是在快照冻结之后才知道的，写到哪一层都接受，读取顺序是 trace 优先、记录兜底。
 
-**抑制原因是开放词表。** 本体新增一个 `reason_code` 时，本插件不会把它归进「门禁压制」，
-而是记成 `unknown` 并计数 —— 加一个原因应当表现为一个未分类的码，而不是一次静默的
-门禁压制。已知词表镜像 `decision_gate` / `arbiter` 实际产出的字符串，见 `core/outcome.py`。
+**抑制原因是开放词表。** 本体新增 `reason_code` 时，优先保留宿主明确声明的有效阶段；
+没有声明阶段且本地词表也不认识原因时，记成 `unknown`。已知词表镜像
+`decision_gate` / `arbiter` 实际产出的字符串，见 `core/outcome.py`。
 
 **没有结果 ≠ 没有发送。** `delivered: false` 且没写原因时，值是 `not_delivered`、阶段是
 `unknown`：在「被压掉」和「生成失败」之间替本体做选择，就是本插件在发明一个本体没说过
@@ -209,9 +211,11 @@ Topic Learner 目前看到的是「最终归属 + 候选集 + 每个候选的证
         "final_score": 0.68,
         "rank": 2,
         "evidence": {
-          "semantic": 0.74,
-          "reply_edge": 0.0,
-          "participant_overlap": 0.81,
+          "centroid": 0.74,
+          "exemplar": 0.70,
+          "recent": 0.68,
+          "lineage": 0.0,
+          "participant": 0.81,
           "recency": 0.62,
           "lexical": 0.43
         }
@@ -340,6 +344,9 @@ Topic Learner 目前看到的是「最终归属 + 候选集 + 每个候选的证
 发的是**解析后的全部参数**而不是增量：只发增量的消费者得自己补全其余项，而那个补全
 会静默变成它实际应用的值。`shadow_observed` 说明这份策略有没有经过影子观察 —— 没有
 不是失败，它是「赢在离线」和「被看着跑过」的区别，本体有权知道拿到的是哪一种。
+当前策略记录没有持久化与该策略匹配的真实影子流量证据，因此 `shadow_observed`
+保守返回 `false`；前向留出集和状态切换均不能证明在线观察。`shadow_entered` 仅表示
+状态历史曾进入影子阶段。实际流量和带标签比较请查看 `/shadow`。
 
 ### 三个版本号，互不推导
 
@@ -595,3 +602,14 @@ consumer 使用。每个策略携带 `eligible_modes`：非 promoted 仅 shadow�
 
 两份 KV 在插件初始化、分析结果写入和状态变更时从当前策略记录重新生成；回滚与
 替代会撤回候选，清空存储同时删除两份 KV。该读取面不会写入本体配置。
+
+### 读取兼容与缺失字段
+
+缺少 `accepted_from` 时标注来源未知，不计为纯人工；仅明确 `human` / `manual` 计入
+`human_only`，明确 `ai` 计入 `ai_assisted`。不能由宿主版本号推断它是否写过该字段。
+
+运行快照版本与 trace schema 独立。读取器对 `sessions[].session_key` 做结构校验，未知运行版本仍可恢复会话，同时通过 `runtime_version` / `runtime_version_supported` 报告版本差异。
+
+当前宿主运行快照未写出 `graph` 限额；缺失时窗口返回 null 限额、截止时间和容量压力，不把默认值当作实际配置。
+
+最终结果优先取 trace，其次取标注记录，`source` 分别为 `trace` / `record`。宿主显式报告的有效 `stage` 优先于本地 reason 字典；未知 reason 且没有显式阶段时仍为 unknown。shadow trace 保留判定时的 `recorded_at`，缺失时不补造时间。

@@ -170,6 +170,8 @@ class LearningConfig:
             "shadow_ci_floor": self.shadow_ci_floor,
             "shadow_min_sessions": self.shadow_min_sessions,
             "shadow_min_active_hours": self.shadow_min_active_hours,
+            "shadow_subgroup_max_regression": self.shadow_subgroup_max_regression,
+            "shadow_subgroup_min_support": self.shadow_subgroup_min_support,
             "gate_min_samples": self.gate_min_samples,
             "gate_min_sessions": self.gate_min_sessions,
             "gate_min_positive_rate": self.gate_min_positive_rate,

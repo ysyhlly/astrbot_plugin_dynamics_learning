@@ -556,9 +556,19 @@ def samples_from_annotation(
     # "Should this message enter the reply flow?" The prediction is the host's
     # own routing admission cut. Under schema 2 that is all there was, which is
     # why this task used to be called plain `reply`.
+    #
+    # The sample exists only when the host actually recorded a decision to compare
+    # against (`trace.admission_recorded`). A rebuilt trace with an empty
+    # participation block — a debounced turn's non-final fragment is the common
+    # case — carries no level, and reading that absence as `silent` would invent a
+    # `missed_reply` for a message no router ever ruled on. That is the same
+    # mistake the admission/outcome split exists to prevent, so the record yields
+    # no admission sample instead; the count travels on the contract plane
+    # (`admission_undecided`) so the corpus never shrinks silently.
     expected_reply = record.get("expected_reply")
-    if isinstance(expected_reply, bool):
-        predicted_reply = REPLY if trace.participation_level == "strong" else SILENT
+    if isinstance(expected_reply, bool) and trace.admission_recorded:
+        predicted_reply = REPLY if (trace.participation_level == "strong"
+                                    or (trace.is_explicit and trace.bot_targeted)) else SILENT
         expected_reply_label = REPLY if expected_reply else SILENT
         produced.append(make(
             TASK_REPLY_ADMISSION, predicted_reply, expected_reply_label,

@@ -139,7 +139,7 @@ def _runtime_host_version(payload: Any) -> str:
 
 
 def _runtime_sessions(payload: Any) -> list[dict[str, Any]]:
-    if not isinstance(payload, Mapping) or payload.get("version") != RUNTIME_VERSION:
+    if not isinstance(payload, Mapping):
         return []
     sessions = payload.get("sessions")
     if not isinstance(sessions, list):
@@ -234,6 +234,8 @@ def parse_preferences(rows: Any) -> IngestResult:
         "trace_schema_versions": dict(stats.routing_schema_versions),
         "host_version": _runtime_host_version(runtime_payload),
         "runtime_present": runtime_payload is not None,
+        "runtime_version": runtime_payload.get("version") if isinstance(runtime_payload, Mapping) else None,
+        "runtime_version_supported": isinstance(runtime_payload, Mapping) and runtime_payload.get("version") == RUNTIME_VERSION,
         "runtime_sessions": len(sessions),
         "annotation_keys": stats.annotation_keys,
         "records": kept,

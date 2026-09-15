@@ -156,7 +156,7 @@ def split_by_time(samples: Sequence[LearningSample], *, ratio: float) -> Split:
 
 def _ambient(sample: LearningSample) -> bool:
     return (sample.features.get("ctx_explicit", 0.0) == 0.0
-            and sample.features.get("ctx_prior_bot", 1.0) >= 1.0)
+            and sample.features.get("ctx_prior_bot", 0.0) >= 1.0)
 
 
 def _replay_trace(sample: LearningSample) -> Any:
@@ -214,7 +214,16 @@ def _replay_trace(sample: LearningSample) -> Any:
 
 def _decision(sample: LearningSample, policy: Mapping[str, float],
               model_score: float | None) -> ReplayDecision:
-    return decide(_replay_trace(sample), policy, model_score=model_score)
+    return decide(_replay_trace(sample), policy, model_score=model_score,
+                  score_recorded=sample.contribution_total_recorded)
+
+
+def _unreplayable(sample: LearningSample) -> bool:
+    """Exclude missing scores/context; explicit decisions need neither."""
+    if sample.features.get("ctx_explicit", 0.0) >= 0.5:
+        return False
+    return (not sample.contribution_total_recorded
+            or sample.features.get("ctx_prior_bot", -1.0) < 0.0)
 
 
 def _topic_rows(samples: Sequence[LearningSample]) -> list[TopicPairRow]:
@@ -234,9 +243,12 @@ class TaskScore:
     support: int
     metrics: dict[str, Any]
     errors: dict[str, ErrorRate]
+    # Rows excluded from support because the additive score is unavailable.
+    unreplayable: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {"task": self.task, "support": self.support, "metrics": self.metrics,
+                "unreplayable": self.unreplayable,
                 "errors": {key: row.as_dict() for key, row in self.errors.items()}}
 
 
@@ -262,7 +274,11 @@ def score_task(rows: Sequence[LearningSample], policy: Mapping[str, float], task
 
     if task == TASK_RECIPIENT:
         recipient_pairs: list[tuple[bool, bool]] = []
+        unreplayable = 0
         for sample in rows:
+            if _unreplayable(sample):
+                unreplayable += 1
+                continue
             score = (model.score(vector(sample.features))
                      if model is not None and _ambient(sample) else None)
             decision = _decision(sample, policy, score)
@@ -270,15 +286,21 @@ def score_task(rows: Sequence[LearningSample], policy: Mapping[str, float], task
         return TaskScore(task, len(recipient_pairs),
                          binary_report(binary_counts(recipient_pairs)),
                          binary_error_rates(recipient_pairs, positive_kind=ERROR_MISSED_BOT,
-                                            negative_kind=ERROR_FALSE_BOT))
+                                            negative_kind=ERROR_FALSE_BOT),
+                         unreplayable=unreplayable)
 
     reply_pairs: list[tuple[bool, bool]] = []
+    unreplayable = 0
     for sample in rows:
+        if _unreplayable(sample):
+            unreplayable += 1
+            continue
         decision = _decision(sample, policy, None)
         reply_pairs.append((decision.reply_label == REPLY, sample.expected == REPLY))
     return TaskScore(task, len(reply_pairs), binary_report(binary_counts(reply_pairs)),
                      binary_error_rates(reply_pairs, positive_kind=ERROR_MISSED_REPLY,
-                                        negative_kind=ERROR_PREMATURE_REPLY))
+                                        negative_kind=ERROR_PREMATURE_REPLY),
+                     unreplayable=unreplayable)
 
 
 def score_outcome(rows: Sequence[LearningSample]) -> TaskScore:
@@ -306,6 +328,9 @@ class TaskEvaluation:
     task: str
     train: int = 0
     holdout: int = 0
+    # Holdout rows excluded because additive score or prior-bot evidence is missing.
+    # These rows never contribute to metric support or the sample-size gate.
+    unreplayable: int = 0
     primary_metric: str = ""
     target_error: str | None = None
     baseline: dict[str, Any] = field(default_factory=dict)
@@ -332,6 +357,7 @@ class TaskEvaluation:
 
     def as_dict(self) -> dict[str, Any]:
         return {"task": self.task, "train": self.train, "holdout": self.holdout,
+                "unreplayable": self.unreplayable,
                 "primary_metric": self.primary_metric, "target_error": self.target_error,
                 "baseline": self.baseline, "candidate": self.candidate, "deltas": self.deltas,
                 "errors": self.errors, "verdict": self.verdict, "reasons": list(self.reasons),
@@ -401,7 +427,12 @@ def _evaluate_recipient(
         return None
     evaluation = TaskEvaluation(task=TASK_RECIPIENT, train=len(train_all), holdout=len(holdout_all),
                                 primary_metric=PRIMARY_METRIC[TASK_RECIPIENT])
-    ambient_train = [sample for sample in train_all if _ambient(sample)]
+    ambient_all = [sample for sample in train_all if _ambient(sample)]
+    # A turn whose additive total the host never wrote has `base_score` 0.0 — this
+    # plugin's default, not a measurement — so it cannot calibrate a cut on that
+    # score. The replay keeps its recorded decision (see `core.policy.decide`) and
+    # it is counted next to the fitted numbers rather than swept against.
+    ambient_train = [sample for sample in ambient_all if sample.contribution_total_recorded]
     labels = [sample.expected == BOT for sample in ambient_train]
     base_threshold = baseline["strong_addressivity_threshold"]
 
@@ -422,6 +453,7 @@ def _evaluate_recipient(
                                            trained=additive["threshold"],
                                            baseline=base_threshold, config=config)
         evaluation.fitted = {"ambient_train": len(ambient_train), "calibrated_on": "train",
+                             "unscored_train": len(ambient_all) - len(ambient_train),
                              "additive_sweep": {key: value for key, value in additive.items()
                                                 if key != "curve"}}
     candidate_policy = {**baseline, "strong_addressivity_threshold": threshold}
@@ -469,7 +501,11 @@ def _evaluate_reply(
     evaluation = TaskEvaluation(task=TASK_REPLY_ADMISSION, train=len(train), holdout=len(holdout),
                                 primary_metric=PRIMARY_METRIC[TASK_REPLY_ADMISSION])
     candidate_policy = dict(baseline)
-    if TASK_RECIPIENT in changes:
+    # The key is the *parameter*, not the task: `changes` is keyed by
+    # parameter name, so testing `TASK_RECIPIENT in changes` was always false
+    # and this task was silently scored baseline-against-baseline — every delta
+    # exactly 0.0, and a guard check that could never fire.
+    if "strong_addressivity_threshold" in changes:
         candidate_policy["strong_addressivity_threshold"] = changes["strong_addressivity_threshold"]
     # Reply admission reads the same cut, so the candidate is scored on the
     # additive path that the recipient candidate would actually export. No
@@ -533,6 +569,8 @@ def _fill(evaluation: TaskEvaluation, task: str, holdout: Sequence[LearningSampl
     cand_score = score_task(holdout, candidate, task, model=model)
     evaluation.baseline = dict(base_score.metrics)
     evaluation.candidate = dict(cand_score.metrics)
+    # Same rows on both sides: this is a property of the record, not of the policy.
+    evaluation.unreplayable = base_score.unreplayable
     evaluation.deltas = _deltas(base_score.metrics, cand_score.metrics, REPORTED_METRICS[task])
     evaluation.target_error = target_error
     evaluation.errors = compare_error_rates(base_score.errors, cand_score.errors,
@@ -616,6 +654,8 @@ def _binary_predictions(rows: Sequence[LearningSample], task: str,
     """`(session, predicted, expected)` for a binary task under one policy."""
     result: list[tuple[str, bool, bool]] = []
     for sample in rows:
+        if _unreplayable(sample):
+            continue
         if task == TASK_RECIPIENT:
             score = (model.score(vector(sample.features))
                      if model is not None and _ambient(sample) else None)
@@ -779,7 +819,8 @@ def evaluate_dataset(
             target_error=report.target_error or "",
             collateral_regressions=tuple(guard_failures(
                 report, max_regression=config.evaluation_max_regression)),
-            confidence=confidence_for(sum(row.holdout for row in report.tasks.values()),
+            confidence=confidence_for(sum(max(0, row.holdout - row.unreplayable)
+                                          for row in report.tasks.values()),
                                       min_samples=config.min_samples_for_evaluation),
             compatibility=contract_compatibility(samples),
             target=target_facts(host_version, baseline),
@@ -813,6 +854,7 @@ def holdout_record(report: EvaluationReport) -> dict[str, Any]:
         "tasks": {
             task: {
                 "holdout": row.holdout,
+                "unreplayable": row.unreplayable,
                 "primary_metric": row.primary_metric,
                 "baseline": dict(row.baseline),
                 "candidate": dict(row.candidate),
@@ -1065,9 +1107,10 @@ def _verdict(report: EvaluationReport, config: LearningConfig,
     reproducibility test — and any fingerprint built on it — meaningless.
     """
     evaluated = list(report.tasks.values())
-    underpowered = [row for row in evaluated if row.holdout < config.min_samples_for_evaluation]
+    underpowered = [row for row in evaluated if max(0, row.holdout - row.unreplayable)
+                    < config.min_samples_for_evaluation]
     if underpowered:
-        names = "、".join(f"{row.task}({row.holdout})" for row in underpowered)
+        names = "、".join(f"{row.task}({max(0, row.holdout - row.unreplayable)})" for row in underpowered)
         report.verdict = VERDICT_INSUFFICIENT
         report.reasons.append(
             f"留出集样本不足：「{names}」低于 {config.min_samples_for_evaluation} 条，"
