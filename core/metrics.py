@@ -17,12 +17,26 @@ from .samples import (
 )
 from .trace import known_topic_label
 
+METRIC_SCHEMA_VERSION = 2
+
 SAMPLE_NOTE = "仅统计人工标注样本，不代表真实准确率"
 PAIR_NOTE = "话题指标按会话内标注配对计算，对标签重命名不变"
 
 
 def ratio(numerator: float, denominator: float) -> float | None:
     return numerator / denominator if denominator else None
+
+
+def f1_score(tp: float, fp: float, fn: float) -> float | None:
+    """Zero is a defined failure; only a zero denominator is undefined."""
+    return ratio(2 * tp, 2 * tp + fp + fn)
+
+
+def pair_accuracy(counts: Mapping[str, float]) -> float | None:
+    """Agreement of pair relations, including correctly separated pairs."""
+    pairs = counts.get("pairs", 0.0)
+    return ratio(pairs - counts.get("wrong_merge", 0.0)
+                 - counts.get("fragmentation", 0.0), pairs)
 
 
 def rounded(value: float | None, digits: int = 4) -> float | None:
@@ -50,7 +64,7 @@ def binary_report(counts: Mapping[str, int]) -> dict[str, Any]:
     tp, fp, tn, fn = (int(counts.get(key, 0)) for key in ("tp", "fp", "tn", "fn"))
     precision = ratio(tp, tp + fp)
     recall = ratio(tp, tp + fn)
-    f1 = None if not precision or not recall else 2 * precision * recall / (precision + recall)
+    f1 = f1_score(tp, fp, fn)
     total = tp + fp + tn + fn
     return {
         "support": total, "tp": tp, "fp": fp, "tn": tn, "fn": fn,
@@ -88,12 +102,14 @@ def topic_pair_metrics(sessions: Sequence[Sequence[tuple[str, str]]]) -> dict[st
             fragment += bool(same_truth and not same_prediction)
     precision = ratio(tp, tp + merge)
     recall = ratio(tp, tp + fragment)
-    f1 = None if not precision or not recall else 2 * precision * recall / (precision + recall)
+    f1 = f1_score(tp, merge, fragment)
     return {
         "pairs": pairs, "true_positive": tp, "wrong_merge": merge, "fragmentation": fragment,
         "precision": rounded(precision), "recall": rounded(recall), "f1": rounded(f1),
         # Fraction of labelled pairs whose predicted relation matches the truth.
-        "pair_accuracy": rounded(ratio(tp, pairs)),
+        "pair_accuracy": rounded(pair_accuracy({"pairs": pairs, "wrong_merge": merge,
+                                                 "fragmentation": fragment})),
+        "metric_schema_version": METRIC_SCHEMA_VERSION,
         "note": PAIR_NOTE,
     }
 
@@ -207,7 +223,11 @@ def task_report(samples: Sequence[LearningSample]) -> dict[str, Any]:
         report["recipient"]["confusion"] = binary_report(binary_counts(
             (sample.predicted == "bot", sample.expected == "bot") for sample in recipients))
         report["recipient"]["error_types"] = error_distribution(recipients)
-    admissions = [s for s in samples if s.task == TASK_REPLY_ADMISSION]
+    admissions = [s for s in samples if s.task == TASK_REPLY_ADMISSION
+                  and s.rule_reply_supervision_eligible]
+    report["reply_admission_excluded"] = sum(s.task == TASK_REPLY_ADMISSION
+                                            and not s.rule_reply_supervision_eligible
+                                            for s in samples)
     if admissions:
         report["reply_admission"] = binary_report(binary_counts(
             (sample.predicted == "reply", sample.expected == "reply") for sample in admissions))
@@ -243,7 +263,7 @@ def within_window(samples: Sequence[LearningSample], *, now: float, days: int) -
 
 
 __all__ = [
-    "ErrorRate", "PAIR_NOTE", "SAMPLE_NOTE", "binary_counts", "binary_error_rates",
+    "METRIC_SCHEMA_VERSION", "f1_score", "pair_accuracy", "ErrorRate", "PAIR_NOTE", "SAMPLE_NOTE", "binary_counts", "binary_error_rates",
     "binary_report", "compare_error_rates", "error_distribution", "label_confusion",
     "predicted_distribution", "ratio", "rounded", "sample_accuracy", "target_error_relative",
     "task_report", "topic_pair_metrics", "within_window",

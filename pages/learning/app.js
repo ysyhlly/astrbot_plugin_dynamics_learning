@@ -148,18 +148,34 @@ async function withBusy(button, label, task) {
   }
 }
 
+function invalidateResources(keys = Object.keys(resources)) {
+  for (const key of keys) {
+    const entry = resources[key] || (resources[key] = {});
+    entry.stale = true; entry.epoch = (entry.epoch || 0) + 1;
+  }
+}
+async function refreshAfterMutation() {
+  invalidateResources();
+  if (refreshPending) await refreshPending.catch(() => {});
+  await refresh();
+}
+async function changePolicy(version, action, expectedRevision) {
+  await call(ENDPOINTS.policy, { method: "POST", body: { version, action, expected_revision: expectedRevision } });
+  invalidateResources(["policies", "overview"]);
+  await Promise.all([loadResource("policies", { force: true }), loadResource("overview", { force: true })]);
+  notice(`策略 ${version} 的状态已更新；是否在线采用由 ChatDynamics 决定。`, "ok");
+}
+
 async function ingestData() {
   const result = await call(ENDPOINTS.ingest, { method: "POST", body: { source: "host" } });
-  for (const entry of Object.values(resources)) { entry.stale = true; entry.epoch = (entry.epoch || 0) + 1; }
   state.samples = null; state.samplesScope = "";
   if (result.ok === false) throw new Error("导入失败，请检查数据来源。");
-  await refresh();
+  await refreshAfterMutation();
   notice(`已导入 ${result.annotations} 条标注，生成 ${result.imported_samples} 条样本。`, "ok");
 }
 async function analyzeData() {
   await call(ENDPOINTS.analyze, { method: "POST", body: { with_evaluation: true } });
-  for (const entry of Object.values(resources)) { entry.stale = true; entry.epoch = (entry.epoch || 0) + 1; }
-  await refresh();
+  await refreshAfterMutation();
   notice("分析完成，可前往评测查看结果。", "ok");
 }
 
@@ -178,7 +194,7 @@ function bind() {
     else navigate(action);
   });
   on("btnExport", "导出中…", async () => {
-    downloadJson(await call(ENDPOINTS.export), "dynamics_learning.json"); notice("数据已导出。", "ok");
+    downloadJson(await call(ENDPOINTS.export), "dynamics_learning.json"); notice("诊断数据已导出；此文件不能用于恢复策略和状态。", "ok");
   });
   on("btnScopes", "更新中…", () => loadScopes({ force: true }));
   on("btnSamples", "读取中…", () => loadSamples(1, $("taskFilter").value));
@@ -244,11 +260,8 @@ function bind() {
     if (target.dataset.reviewRefresh) { withBusy(target, "解读中…", () => loadReview({ refresh: true })); return; }
     const { policy: version, action } = target.dataset;
     if (version && action) {
-      withBusy(target, "处理中…", async () => {
-        await call(ENDPOINTS.policy, { method: "POST", body: { version, action } });
-        await Promise.all([loadResource("policies", { force: true }), loadResource("overview", { force: true })]);
-        notice(`策略 ${version} 的状态已更新；是否在线采用由 ChatDynamics 决定。`, "ok");
-      }); return;
+      withBusy(target, "处理中…", () => changePolicy(version, action,
+        target.dataset.revision === undefined ? undefined : Number(target.dataset.revision))); return;
     }
     if (target.dataset.accept) { navigate("policies"); notice("请审阅策略证据后，使用该版本允许的操作。"); }
   });

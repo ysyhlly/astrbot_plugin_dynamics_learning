@@ -30,7 +30,7 @@ function fixture() {
     vm.runInContext(source.replace(/\bmain\(\);\s*$/, ''), sandbox, {filename: script});
   }
   return {get, run: code => vm.runInContext(code, sandbox),
-    api: apiGet => {sandbox.window.AstrBotPluginPage = {apiGet};}};
+    api: apiGet => {sandbox.window.AstrBotPluginPage = {apiGet, apiPost: apiGet};}};
 }
 function deferred() {
   let resolve, reject;
@@ -182,5 +182,57 @@ const A = 'a'.repeat(64), B = 'b'.repeat(64);
   assert.match(heading, /拒绝/);
   assert.doesNotMatch(heading, /可采纳/);
   assert.match(f.get('eval').innerHTML, /cross-validation failed/);
+  const postRefresh = fixture(), beforeWrite = deferred();
+  let overviewReads = 0;
+  postRefresh.api(endpoint => {
+    if (endpoint === 'overview') {
+      overviewReads++;
+      return overviewReads === 1 ? beforeWrite.promise : {dataset: {samples: 21}};
+    }
+    return {rows: []};
+  });
+  const preMutationRefresh = postRefresh.run('refresh()');
+  await tick();
+  const postMutationRefresh = postRefresh.run('refreshAfterMutation()');
+  beforeWrite.resolve({dataset: {samples: 1}});
+  await Promise.all([preMutationRefresh, postMutationRefresh]);
+  assert.equal(overviewReads, 2, 'mutation must not reuse the pre-write refresh');
+  assert.equal(postRefresh.run('state.overview.dataset.samples'), 21);
+
+  // A policy write must invalidate an older policy GET, preserve optimistic
+  // revision, and issue another GET before reporting successful refresh.
+  const mutation = fixture(), oldPolicy = deferred();
+  let policyReads = 0, posted;
+  mutation.api((endpoint, params) => {
+    if (endpoint === 'policy') { posted = params; return {}; }
+    if (endpoint === 'policies') {
+      policyReads++;
+      return policyReads === 1 ? oldPolicy.promise : {rows: [{version: 'new-policy'}]};
+    }
+    return {dataset: {samples: 12}};
+  });
+  const pendingPolicy = mutation.run('loadResource("policies")');
+  await tick();
+  const writePolicy = mutation.run('changePolicy("v1", "ignore", 4)');
+  await tick();
+  oldPolicy.resolve({rows: [{version: 'old-policy'}]});
+  await Promise.all([pendingPolicy, writePolicy]);
+  assert.equal(policyReads, 2);
+  assert.match(mutation.get('policies').innerHTML, /new-policy/);
+  assert.doesNotMatch(mutation.get('policies').innerHTML, /old-policy/);
+  assert.equal(posted.expected_revision, 4);
+  f.run('renderEvaluation({stale:true,evaluation:{verdict:"accepted"}})');
+  assert.match(f.get('eval').innerHTML, /已过期/);
+  assert.match(f.get('eval').innerHTML, /基线来源未验证/);
+  f.run('renderEvaluation({evaluation:{candidate:{target:{baseline_source:"default_reference"}}}})');
+  assert.match(f.get('eval').innerHTML, /默认参考配置/);
+  f.run('renderEvaluation({evaluation:{candidate:{target:{baseline_source:"host_effective",baseline_verified:true}}}})');
+  assert.match(f.get('eval').innerHTML, /宿主有效配置/);
+  assert.doesNotMatch(f.get('eval').innerHTML, /默认参考配置/);
+  f.run('renderShadow({rows:2,legacy_rows:1,experiments:[{identity:{experiment_id:"exp-a",candidate_hash:"candidate-a",baseline_hash:"baseline-a",host_version:"v1",policy_id:"p1"},table:{labelled:1},gate:{ok:false,checks:[{status:"block",detail:"insufficient evidence"}]}}]})');
+  assert.match(f.get('shadow').innerHTML, /exp-a/);
+  assert.match(f.get('shadow').innerHTML, /candidate-a/);
+  assert.match(f.get('shadow').innerHTML, /insufficient evidence/);
+  assert.match(f.get('shadow').innerHTML, /不能用于晋级/);
   console.log('frontend regression checks passed');
 })().catch(error => {console.error(error); process.exitCode = 1;});

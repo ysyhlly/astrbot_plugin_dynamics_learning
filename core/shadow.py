@@ -33,7 +33,8 @@ from typing import Any, Mapping, Sequence
 from .bootstrap import Unit, bootstrap_delta
 from .samples import REPLY, TASK_REPLY_ADMISSION, LearningSample
 
-SHADOW_SCHEMA_VERSION = 1
+SHADOW_SCHEMA_VERSION = 2
+IDENTITY_FIELDS = ("experiment_id", "candidate_hash", "host_version", "baseline_hash", "policy_id")
 
 # What the plan asks of a first shadow run before anything may go active. They
 # are defaults, not laws: every one is a knob on `ActiveRules`.
@@ -95,6 +96,35 @@ def evaluate_shadow(
     """
     resolved = rules or ActiveRules()
     rows = shadow_rows(samples)
+    overview = _evaluate_rows(rows, rules=resolved, min_samples=min_samples)
+    groups: dict[tuple[str, ...], list[ShadowRow]] = {}
+    legacy = 0
+    for row in rows:
+        identity = tuple(getattr(row, key) for key in IDENTITY_FIELDS)
+        if not all(identity):
+            legacy += 1
+            continue
+        groups.setdefault(identity, []).append(row)
+    experiments = [dict(identity=dict(zip(IDENTITY_FIELDS, identity)),
+                        **_evaluate_rows(group, rules=resolved, min_samples=min_samples))
+                   for identity, group in sorted(groups.items())]
+    overview["experiments"] = experiments
+    overview["legacy_rows"] = legacy
+    # Aggregate figures remain useful for exploration, never for activation.
+    if len(experiments) == 1 and not legacy:
+        overview["gate"] = experiments[0]["gate"]
+        overview["identity"] = experiments[0]["identity"]
+    else:
+        check = _gate_check("experiment_identity", GATE_BLOCK,
+                            "Select one complete experiment identity before activation.")
+        overview["gate"] = {"ok": False, "checks": overview["gate"]["checks"] + [check],
+                            "blocked_by": ["experiment_identity"]}
+    return overview
+
+
+def _evaluate_rows(rows: Sequence[ShadowRow], *, rules: ActiveRules,
+                   min_samples: int) -> dict[str, Any]:
+    resolved = rules
     labelled = [row for row in rows if row.labelled]
     table = disagreement_table(rows)
     interval = bootstrap_delta(_units(rows), metric="accuracy",
@@ -334,6 +364,10 @@ class ShadowRow:
     reason: str = ""
     score: float | None = None
     expected_reply: bool | None = None
+    experiment_id: str = ""
+    candidate_hash: str = ""
+    host_version: str = ""
+    baseline_hash: str = ""
 
     @property
     def labelled(self) -> bool:
@@ -354,6 +388,7 @@ class ShadowRow:
             "msg_id": self.msg_id,
             "decision_at": self.decision_at,
             "policy_id": self.policy_id,
+            **{key: getattr(self, key) for key in IDENTITY_FIELDS},
             "baseline_reply": self.baseline_reply,
             "shadow_reply": self.shadow_reply,
             "changed": self.changed,
@@ -371,19 +406,20 @@ def shadow_rows(samples: Sequence[LearningSample]) -> list[ShadowRow]:
     reading would count the same comparison up to four times and report a
     disagreement rate that depends on how many labels a human happened to leave.
     """
-    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
     for sample in samples:
         shadow = sample.shadow
         if not shadow.recorded:
             continue
-        key = (sample.session_hash, sample.msg_id)
+        key = (sample.session_hash, sample.msg_id, *(getattr(shadow, field) for field in IDENTITY_FIELDS))
         entry = grouped.setdefault(key, {"shadow": shadow, "expected": None, "at": 0.0})
         if sample.task == TASK_REPLY_ADMISSION and isinstance(sample.expected, str):
             entry["expected"] = sample.expected == REPLY
         if shadow.recorded_at:
             entry["at"] = float(shadow.recorded_at)
     rows: list[ShadowRow] = []
-    for (session_hash, msg_id), entry in grouped.items():
+    for key, entry in grouped.items():
+        session_hash, msg_id = key[:2]
         shadow = entry["shadow"]
         rows.append(ShadowRow(
             session_hash=session_hash, msg_id=msg_id, decision_at=entry["at"],
@@ -391,6 +427,7 @@ def shadow_rows(samples: Sequence[LearningSample]) -> list[ShadowRow]:
             shadow_reply=shadow.shadow_reply, changed=shadow.changed,
             reason=shadow.reason, score=shadow.score,
             expected_reply=entry["expected"],
+            **{key: getattr(shadow, key) for key in IDENTITY_FIELDS if key != "policy_id"},
         ))
     rows.sort(key=lambda row: (row.session_hash, row.msg_id))
     return rows

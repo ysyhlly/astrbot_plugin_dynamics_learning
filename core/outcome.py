@@ -67,14 +67,16 @@ VALUE_LABEL = {
 # ---- which stage the outcome belongs to --------------------------------
 
 STAGE_ADMISSION = "admission"
+STAGE_PERSONA = "persona"
 STAGE_GATE = "gate"
 STAGE_GENERATION = "generation"
 STAGE_DELIVERY = "delivery"
 STAGE_UNKNOWN = "unknown"
 
-STAGES = (STAGE_ADMISSION, STAGE_GATE, STAGE_GENERATION, STAGE_DELIVERY, STAGE_UNKNOWN)
+STAGES = (STAGE_ADMISSION, STAGE_PERSONA, STAGE_GATE, STAGE_GENERATION, STAGE_DELIVERY, STAGE_UNKNOWN)
 STAGE_LABEL = {
     STAGE_ADMISSION: "参与准入",
+    STAGE_PERSONA: "角色决定",
     STAGE_GATE: "门禁",
     STAGE_GENERATION: "生成",
     STAGE_DELIVERY: "发送",
@@ -197,10 +199,13 @@ class FinalOutcome:
         return self.is_failure and self.stage == STAGE_GATE
 
     def as_dict(self) -> dict[str, Any]:
+        value_label = VALUE_LABEL.get(self.value, self.value)
+        if self.value == VALUE_SUPPRESSED and self.stage != STAGE_GATE:
+            value_label = "角色选择沉默" if self.stage == STAGE_PERSONA else "未发送（受约束）"
         return {
             "recorded": self.recorded,
             "value": self.value,
-            "value_label": VALUE_LABEL.get(self.value, self.value),
+            "value_label": value_label,
             "delivered": self.delivered,
             "suppression_reason": self.suppression_reason,
             "stage": self.stage,
@@ -235,6 +240,10 @@ def _from_block(block: Any, source: str) -> FinalOutcome | None:
         raw_value = block.get("value")
     if raw_value is None:
         raw_value = block.get("outcome")
+    if raw_value == "in_flight":
+        # A pending attempt is not a final negative, even if the host's
+        # provisional block says delivered=false while generation is running.
+        return FinalOutcome(recorded=True, stage=STAGE_GENERATION, source=source)
     delivered = _optional_bool(block.get("delivered"))
     reason = _text(block.get("suppression_reason") or block.get("reason"))
     stage = _text(block.get("stage"), 32)
@@ -324,7 +333,7 @@ __all__ = [
     "ADMISSION_REASONS", "DELIVERY_REASONS", "EMPTY", "FAILURE_VALUES", "GATE_REASONS",
     "GENERATION_REASONS", "NESTED_KEY", "SOURCE_LABEL", "SOURCE_NONE", "SOURCE_RECORD",
     "SOURCE_TRACE", "STAGES", "STAGE_ADMISSION", "STAGE_DELIVERY", "STAGE_GATE",
-    "STAGE_GENERATION", "STAGE_LABEL", "STAGE_UNKNOWN", "VALUE_DELIVERED",
+    "STAGE_GENERATION", "STAGE_PERSONA", "STAGE_LABEL", "STAGE_UNKNOWN", "VALUE_DELIVERED",
     "VALUE_DELIVERY_FAILED", "VALUE_GENERATION_FAILED", "VALUE_LABEL", "VALUE_NOT_ATTEMPTED",
     "VALUE_NOT_DELIVERED", "VALUE_STAGE", "VALUE_SUPPRESSED", "VALUE_UNKNOWN", "VALUES",
     "FinalOutcome", "from_mapping", "parse_outcome", "parse_record_outcome", "reason_stage",

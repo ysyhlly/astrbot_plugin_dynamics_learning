@@ -45,7 +45,8 @@ def check_release(root: Path = ROOT) -> str:
     if not re.search(r"(?:当前版本|Current version)[^\n]*" + re.escape(version) + r"(?![\d.])", readme, re.I):
         raise ValueError("README must declare the current release version")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-    headings = re.findall(r"^##\s+(\S+)", changelog, re.M)
+    headings = [heading for heading in re.findall(r"^##\s+(\S+)", changelog, re.M)
+                if heading.lower() not in {"unreleased", "未发布"}]
     if not headings or headings[0] != version:
         raise ValueError("The first CHANGELOG release must match metadata")
     return version

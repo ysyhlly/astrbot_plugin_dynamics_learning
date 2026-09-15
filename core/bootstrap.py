@@ -24,6 +24,8 @@ import random
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from .metrics import METRIC_SCHEMA_VERSION, f1_score, pair_accuracy
+
 DEFAULT_ITERATIONS = 600
 DEFAULT_SEED = 7
 DEFAULT_ALPHA = 0.05
@@ -44,16 +46,11 @@ def _binary_accuracy(counts: Mapping[str, float]) -> float | None:
 
 
 def _binary_f1(counts: Mapping[str, float]) -> float | None:
-    tp = counts.get("tp", 0.0)
-    precision = _ratio(tp, tp + counts.get("fp", 0.0))
-    recall = _ratio(tp, tp + counts.get("fn", 0.0))
-    if not precision or not recall:
-        return None
-    return 2 * precision * recall / (precision + recall)
+    return f1_score(counts.get("tp", 0.0), counts.get("fp", 0.0), counts.get("fn", 0.0))
 
 
 def _pair_accuracy(counts: Mapping[str, float]) -> float | None:
-    return _ratio(counts.get("true_positive", 0.0), counts.get("pairs", 0.0))
+    return pair_accuracy(counts)
 
 
 METRICS: dict[str, Metric] = {
@@ -125,6 +122,7 @@ def bootstrap_delta(
     function = _metric(metric)
     result: dict[str, Any] = {
         "metric": metric,
+        "metric_schema_version": METRIC_SCHEMA_VERSION,
         "units": len(units),
         "iterations": 0,
         "requested_iterations": max(1, int(iterations)),

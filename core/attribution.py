@@ -45,7 +45,7 @@ from .candidates import (
     ATTRIBUTION_NOT_RECORDED, ATTRIBUTION_RANKING_ERROR,
 )
 from .outcome import EMPTY as OUTCOME_EMPTY, STAGE_DELIVERY, STAGE_GATE, STAGE_GENERATION
-from .outcome import FinalOutcome
+from .outcome import FinalOutcome, STAGE_PERSONA
 from .recommendation import CONFIDENCE_INSUFFICIENT, confidence_for
 from .samples import (
     BOT, REPLY, TASK_RECIPIENT, TASK_REPLY_ADMISSION, TASK_REPLY_OUTCOME, TASK_TOPIC,
@@ -221,12 +221,14 @@ def _execution_failure(chain: MessageChain, admission_ok: bool) -> tuple[str, st
         # failure. Neither is an execution finding.
         return None
     reason = final.suppression_reason or "未记录的原因"
+    if final.stage == STAGE_PERSONA:
+        return buckets.UNATTRIBUTABLE, "记录显示角色决定保持沉默；最终回复偏好不能证明规则阈值错误"
     if final.stage == STAGE_GATE:
-        return buckets.GATE_SUPPRESSION, f"准入判定正确，但门禁以 {reason} 压掉了发送"
+        return buckets.GATE_SUPPRESSION, f"记录显示门禁以 {reason} 压掉了发送"
     if final.stage == STAGE_GENERATION:
-        return buckets.GENERATION_FAILURE, f"准入判定正确，生成阶段失败（{reason}）"
+        return buckets.GENERATION_FAILURE, f"记录显示生成阶段失败（{reason}）"
     if final.stage == STAGE_DELIVERY:
-        return buckets.DELIVERY_FAILURE, f"准入判定正确，发送阶段失败（{reason}）"
+        return buckets.DELIVERY_FAILURE, f"记录显示发送阶段失败（{reason}）"
     return (buckets.UNATTRIBUTABLE,
             "该回复但没有发送出去，而记录没有说明停在哪一环"
             "（既没有可识别的压制原因，也没有阶段字段）")
@@ -249,8 +251,10 @@ def classify(chain: MessageChain) -> Attribution:
             failures.append(found)
 
     admission = chain.admission
-    admission_ok = admission is None or admission.correct
-    if admission is not None and not admission.correct:
+    admission_ok = (admission is None or admission.correct
+                    or not admission.rule_reply_supervision_eligible)
+    if (admission is not None and admission.rule_reply_supervision_eligible
+            and not admission.correct):
         failures.append((buckets.PARTICIPATION_ERROR,
                          f"标注 expected_reply={admission.expected == REPLY}，"
                          f"记录的路由准入判定为 {admission.predicted}"))
@@ -258,6 +262,9 @@ def classify(chain: MessageChain) -> Attribution:
     execution = _execution_failure(chain, admission_ok)
     if execution is not None:
         failures.append(execution)
+    elif admission is not None and not admission.rule_reply_supervision_eligible:
+        failures.append((buckets.UNATTRIBUTABLE,
+                         "回复标签未限定规则阶段，角色选择或执行约束不能归因为阈值错误"))
 
     final = chain.final
     primary = failures[0] if failures else (buckets.OK, "")

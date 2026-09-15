@@ -291,7 +291,7 @@ def test_a_legacy_reply_row_loads_as_the_admission_task():
 
 
 def test_the_sample_schema_version_is_declared_as_three():
-    assert SAMPLE_SCHEMA_VERSION == 3
+    assert SAMPLE_SCHEMA_VERSION == 4
 
 
 @pytest.mark.parametrize("task", [TASK_RECIPIENT, TASK_TOPIC, TASK_REPLY_ADMISSION,

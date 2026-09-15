@@ -136,12 +136,9 @@ async def test_policies_are_versioned_and_immutable_by_copy():
     # promoted is two arrows away from proposed, and the store refuses to skip.
     with pytest.raises(ValueError):
         await store.update_policy_status(candidate.version, "promoted")
-    updated = await store.update_policy_status(candidate.version, "validated")
-    assert updated is not None and updated.status == "validated"
-    assert (await store.load_policies())[0].status == "validated"
-    promoted = await store.update_policy_status(candidate.version, "promoted")
-    assert promoted is not None and promoted.status == "promoted"
-    assert promoted.status_history[-1]["to"] == "promoted"
+    with pytest.raises(ValueError, match="最终验证证据"):
+        await store.update_policy_status(candidate.version, "validated")
+    assert (await store.load_policies())[0].status == "proposed"
     assert await store.update_policy_status("policy_v99", "validated") is None
     assert POLICY_KEY in backend.data
 
@@ -197,3 +194,109 @@ async def test_a_host_module_without_the_contract_is_reported_not_used():
     assert result.records == 0
     assert result.diagnostics["available"] is False
     assert result.diagnostics["error"] == "astrbot shared preferences unavailable"
+
+
+def test_confirmed_empty_sessions_are_distinct_from_unknown_or_unreadable():
+    session = "empty"
+    runtime = _preference("panel_runtime_v1", {"version": 1, "sessions": [{"session_key": session}]})
+    key = "topic_annotations_v1_" + session_hash(session)
+    assert parse_preferences([runtime, _preference(key, [])]).confirmed_sessions == {session}
+    assert parse_preferences([runtime]).confirmed_sessions == set()
+    assert parse_preferences([runtime, _preference(key, {})]).confirmed_sessions == set()
+    assert parse_preferences([runtime, _preference(key, [None])]).confirmed_sessions == set()
+    assert parse_export({"sessions": [{"session_key": session, "records": []}]}).confirmed_sessions == {session}
+
+
+def test_analysis_export_is_explicitly_not_a_backup():
+    result = parse_export({"schema": "dynamics_learning_export_v1", "samples": []})
+    assert result.diagnostics["available"] is False
+    assert "not a restorable" in result.diagnostics["error"]
+
+
+@pytest.mark.asyncio
+async def test_policy_pending_write_recovers_all_offers_after_failure():
+    from astrbot_plugin_dynamics_learning.core.store import POLICY_PENDING_KEY, PUBLISHED_KEY, CANDIDATE_KEY
+
+    class FailOnce(MemoryBackend):
+        fail = True
+
+        async def put_kv_data(self, key, value):
+            if key == CANDIDATE_KEY and self.fail:
+                self.fail = False
+                raise OSError("simulated interrupted publication")
+            await super().put_kv_data(key, value)
+
+    backend = FailOnce()
+    store = LearningStore(backend)
+    with pytest.raises(OSError):
+        await store.save_policies([])
+    assert POLICY_PENDING_KEY in backend.data
+    assert await store.load_policies() == []
+    assert POLICY_PENDING_KEY not in backend.data
+    assert backend.data[POLICY_KEY]["revision"] == backend.data[PUBLISHED_KEY]["revision"] == backend.data[CANDIDATE_KEY]["revision"]
+
+
+@pytest.mark.asyncio
+async def test_policy_mutation_refuses_stale_revision():
+    store = LearningStore(MemoryBackend())
+    with pytest.raises(ValueError, match="revision conflict"):
+        await store.update_policy_status("missing", "promoted", expected_revision="stale")
+
+
+def test_partial_export_does_not_claim_a_complete_session():
+    row = {**ambient_record("m1", seed=1), "session_key": "s"}
+    result = parse_export([row])
+    assert result.partial_sessions == {"s"}
+    assert not result.confirmed_sessions
+    for payload in ({"schema": "unknown", "sessions": []}, [None], 42, []):
+        assert parse_export(payload).diagnostics["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_policy_transition_requires_matching_identity_and_final_gate():
+    from dataclasses import replace
+    from astrbot_plugin_dynamics_learning.core.policy import candidate_from, baseline_config_hash
+    candidate = candidate_from({"topic_commit_threshold": 0.62})
+    identity = {"metric_schema_version": 2,
+                "candidate_hash": baseline_config_hash(candidate.params),
+                "baseline_hash": baseline_config_hash(candidate.baseline),
+                "dataset_fingerprint": "dataset-a"}
+    candidate = replace(candidate, training_dataset={"fingerprint": "dataset-a"},
+                        holdout_result={"split": identity}, forward_result={"split": identity},
+                        target={"baseline_config_hash": identity["baseline_hash"]},
+                        evidence={"metric_schema_version": 2, "final_validation": {"verdict": "accepted"}, "dataset_gate_ok": True})
+    store = LearningStore(MemoryBackend())
+    await store.append_policy(candidate)
+    assert (await store.update_policy_status(candidate.version, "validated")).status == "validated"
+    assert (await store.update_policy_status(candidate.version, "promoted")).status == "promoted"
+    for evidence in ({"final_validation": {"verdict": "rejected"}, "dataset_gate_ok": True},
+                     {"final_validation": {"verdict": "accepted"}, "dataset_gate_ok": False}):
+        await store.save_policies([replace(candidate, evidence=evidence)])
+        with pytest.raises(ValueError, match="最终验证证据"):
+            await store.update_policy_status(candidate.version, "validated")
+
+
+@pytest.mark.asyncio
+async def test_batch_import_writes_index_once_and_skips_unchanged_shards():
+    class CountingBackend(MemoryBackend):
+        index_reads = 0
+
+        async def get_kv_data(self, key, default=None):
+            if key == SAMPLE_INDEX_KEY:
+                self.index_reads += 1
+            return await super().get_kv_data(key, default)
+
+    backend = CountingBackend()
+    store = LearningStore(backend)
+    sessions = {key: build_dataset([(key, ambient_record("m1", seed=1))]) for key in ("a", "b", "c")}
+    stats = await store.replace_sessions(sessions, now=1)
+    assert backend.writes == 4  # Three shards plus one index.
+    assert backend.index_reads == 1
+    assert stats.sessions == 3
+    await store.replace_sessions(sessions, now=2)
+    assert backend.writes == 5  # Only the index, no identical shard rewrites.
+    assert backend.index_reads == 2
+    await store.replace_sessions({"a": [], "b": sessions["b"]}, now=3)
+    assert backend.writes == 6
+    assert backend.deletes == 1
+    assert {row.session_key for row in await store.load_samples()} == {"b", "c"}

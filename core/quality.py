@@ -36,6 +36,7 @@ confident name.
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
@@ -114,7 +115,7 @@ OUTCOME_LEVEL_NOTE = (
     "最终发送结果不可回放：门禁（作息/降温/媒体）、生成与平台发送都不在记录轨迹里，"
     "所以它只作为事实报告，不参与任何阈值回放"
 )
-TIMESTAMP_NOTE = "样本时间戳是人工标注时刻（annotated_at），不是消息发生时间"
+TIMESTAMP_NOTE = "timestamp 保留标注时刻语义；event_at、ingested_at 分别记录事件与导入时刻，缺失时间不推断"
 
 
 @dataclass(frozen=True)
@@ -207,10 +208,12 @@ def _replay_split(samples: Sequence[LearningSample]) -> dict[str, int]:
     return, and an ambient turn is scored from the recorded additive total.
     """
     counts = {"total": len(samples), "eligible": 0, "explicit": 0, "no_prior_bot": 0,
-              "no_score": 0, "unknown_prior_bot": 0}
+              "no_score": 0, "unknown_prior_bot": 0, "non_rule_supervision": 0}
     for sample in samples:
         features = sample.features
-        if features.get("ctx_explicit", 0.0) >= 0.5:
+        if sample.task == TASK_REPLY_ADMISSION and not sample.rule_reply_supervision_eligible:
+            counts["non_rule_supervision"] += 1
+        elif features.get("ctx_explicit", 0.0) >= 0.5:
             counts["explicit"] += 1
         elif not sample.contribution_total_recorded:
             counts["no_score"] += 1
@@ -225,6 +228,8 @@ def _replay_split(samples: Sequence[LearningSample]) -> dict[str, int]:
 
 def _replay_reasons(counts: Mapping[str, int]) -> list[str]:
     reasons: list[str] = []
+    if counts.get("non_rule_supervision"):
+        reasons.append(f"{counts['non_rule_supervision']} 条回复标签属于角色、门禁或未知阶段，不能监督规则阈值")
     if counts["explicit"]:
         reasons.append(f"{counts['explicit']} 条是结构化直判（明确指代、回复、称呼等短路证据），"
                        "判定不经过分数，阈值移动对它没有影响")
@@ -448,6 +453,26 @@ def capabilities(samples: Sequence[LearningSample], *,
 
 # ---- dataset facts ------------------------------------------------------
 
+def label_freshness(samples: Sequence[LearningSample], *, now: float,
+                    max_age_days: float) -> dict[str, Any]:
+    """Count known label times; ingestion and event clocks cannot refresh labels.
+
+    Legacy timestamp is an annotation-clock alias, retained for old stored rows.
+    Future, nonfinite and absent values supply no freshness evidence.
+    """
+    times = [row.annotated_at or row.timestamp for row in samples]
+    valid = [value for value in times
+             if math.isfinite(value) and 0 < value <= now]
+    recent = sum(now - value <= max_age_days * 86400 for value in valid)
+    total = len(samples)
+    missing = total - len(valid)
+    return {"recent_count": recent, "recent_ratio": recent / total if total else 0.0,
+            "missing_count": missing, "missing_ratio": missing / total if total else 0.0,
+            "known_count": len(valid), "max_age_days": max_age_days,
+            "newest_age_days": (now - max(valid)) / 86400 if valid else None,
+            "clock": "annotated_at"}
+
+
 def dataset_health(samples: Sequence[LearningSample]) -> dict[str, Any]:
     """Headline counts, each one a fact about the samples that exist.
 
@@ -458,6 +483,7 @@ def dataset_health(samples: Sequence[LearningSample]) -> dict[str, Any]:
     timestamps = [sample.timestamp for sample in samples if sample.timestamp]
     return {
         "samples": len(samples),
+        "independent_messages": len({(s.session_hash, s.msg_id) for s in samples}),
         "sessions": len({sample.session_hash for sample in samples}),
         "scopes": len({sample.scope_hash for sample in samples}),
         "scope_level": "session",
@@ -927,6 +953,7 @@ def quality_report(
         "trace": trace_schema_block(samples, contract),
         "generated_at": stamp,
         "dataset": dataset_health(samples),
+        "freshness": label_freshness(samples, now=stamp, max_age_days=LearningConfig().gate_max_label_age_days),
         "capabilities": {name: row.as_dict() for name, row in found.items()},
         "blocked": _blocked_lines(found),
         "contract": dict(contract) if isinstance(contract, Mapping) else None,
@@ -1062,20 +1089,16 @@ def dataset_gate(
         value=round(outcome_coverage, 4) if outcome_coverage is not None else None,
         threshold=0.5))
 
-    timestamps = [row.timestamp for row in rows if row.timestamp]
-    age_days = ((stamp - max(timestamps)) / 86_400.0) if timestamps else None
+    freshness = label_freshness(rows, now=stamp,
+                                max_age_days=settings.gate_max_label_age_days)
+    age_days = freshness["newest_age_days"]
+    recent = freshness["recent_count"]
     checks.append(_gate_row(
-        "label_age",
-        GATE_OK if (age_days is not None
-                    and age_days <= settings.gate_max_label_age_days) else GATE_BLOCK,
-        (f"最新一条标注在 {age_days:.1f} 天前"
-         + ("（门槛 {:.0f} 天）。".format(settings.gate_max_label_age_days)
-            if age_days <= settings.gate_max_label_age_days
-            else "，超过 {} 天：群里的行为习惯可能已经变了，"
-                 "先补一段新标注再学习。".format(settings.gate_max_label_age_days)))
-        if age_days is not None else "没有任何带时间戳的标注。",
+        "label_age", GATE_OK if recent >= settings.gate_min_samples else GATE_BLOCK,
+        f"近期标注 {recent}/{total} 条；缺失或无效时间 {freshness['missing_count']} 条。",
         value=round(age_days, 2) if age_days is not None else None,
         threshold=settings.gate_max_label_age_days))
+    checks[-1]["freshness"] = freshness
 
     versions: dict[str, int] = {}
     for row in rows:

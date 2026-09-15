@@ -13,7 +13,7 @@ import json
 import pytest
 
 from astrbot_plugin_dynamics_learning.core.reply_review import (
-    VERDICT_AGREED_SILENT, VERDICT_MISSED, VERDICT_OVER_REPLIED, VERDICT_UNDECIDED,
+    VERDICT_AGREED_SILENT, VERDICT_REPLY_PREFERENCE, VERDICT_OVER_REPLIED, VERDICT_UNDECIDED,
     build_digest, compare, message_facts, parse_reply_review, select_messages,
 )
 from astrbot_plugin_dynamics_learning.core.samples import session_hash
@@ -131,12 +131,13 @@ def test_a_judgement_is_placed_beside_the_facts_it_was_not_shown():
     row = review["rows"][0]
 
     assert row["model_should_reply"] is True and row["decided"] is True
-    assert row["verdict"] == VERDICT_MISSED
-    assert row["verdict_label"] == "模型认为漏回"
+    assert row["verdict"] == VERDICT_REPLY_PREFERENCE
+    assert row["rule_error_confirmed"] is False
     assert row["vs_human"] == "agree" and row["vs_human_label"] == "与人工一致"
     assert row["human_expected_reply"] is True and row["delivered"] is False
     assert row["host_level"] == "strong" and row["outcome_recorded"] is True
-    assert review["counts"]["decided"] == 1 and review["counts"]["missed"] == 1
+    assert review["counts"]["decided"] == 1 and review["counts"]["missed"] == 0
+    assert review["counts"]["reply_preference"] == 1
     assert review["patterns"] == ["提问被忽略"]
 
 
@@ -167,7 +168,9 @@ def test_without_a_recorded_outcome_the_host_admission_is_compared_instead():
     row = review["rows"][0]
 
     assert row["outcome_recorded"] is False
-    assert row["verdict"] == VERDICT_MISSED, "the model wanted a reply, the router did not admit it"
+    assert row["verdict"] == "admission_difference"
+    assert row["comparison_basis"] == "rule_admission"
+    assert review["counts"]["missed"] == 0
     assert row["vs_human"] == "unknown"
 
 
@@ -306,7 +309,7 @@ async def test_text_reaches_the_model_and_reaches_no_storage(wired):
     prompt = context.llm_calls[0]["prompt"]
     assert "在吗" in prompt
     assert "expected_reply" not in prompt and "umo:group:1" not in prompt
-    assert payload["review"]["rows"][0]["verdict"] == VERDICT_MISSED
+    assert payload["review"]["rows"][0]["verdict"] == VERDICT_REPLY_PREFERENCE
     stored = json.dumps(plugin._kv, ensure_ascii=False, default=str)
     assert "在吗" not in stored, "message text must not be written to the plugin store"
 

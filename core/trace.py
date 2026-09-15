@@ -165,6 +165,10 @@ class ShadowDecision:
 
     recorded: bool = False
     policy_id: str = ""
+    experiment_id: str = ""
+    candidate_hash: str = ""
+    host_version: str = ""
+    baseline_hash: str = ""
     baseline_threshold: float | None = None
     shadow_threshold: float | None = None
     baseline_reply: bool = False
@@ -183,6 +187,7 @@ class ShadowDecision:
         return {
             "recorded": self.recorded,
             "policy_id": self.policy_id,
+            **{key: getattr(self, key) for key in ("experiment_id", "candidate_hash", "host_version", "baseline_hash")},
             "baseline_threshold": self.baseline_threshold,
             "shadow_threshold": self.shadow_threshold,
             "baseline_reply": self.baseline_reply,
@@ -215,11 +220,12 @@ def parse_shadow(raw: Any) -> ShadowDecision:
     return ShadowDecision(
         recorded=True,
         policy_id=policy_id,
+        **{key: _text(raw.get(key), 256) for key in ("experiment_id", "candidate_hash", "host_version", "baseline_hash")},
         baseline_threshold=_optional_finite(raw.get("baseline_threshold")),
         shadow_threshold=_optional_finite(raw.get("shadow_threshold")),
         baseline_reply=baseline,
         shadow_reply=shadow,
-        changed=bool(raw.get("changed")) or baseline != shadow,
+        changed=baseline != shadow,
         score=_optional_finite(raw.get("score")),
         baseline_margin=_optional_finite(raw.get("baseline_margin")),
         shadow_margin=_optional_finite(raw.get("shadow_margin")),

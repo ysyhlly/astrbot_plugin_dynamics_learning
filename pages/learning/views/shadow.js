@@ -103,6 +103,21 @@ function renderOperationalShadow(data) {
     + distribution("判定时段（UTC）", data.by_hour) + `</details>`;
 }
 
+function shadowExperiments(data) {
+  const experiments = data.experiments || [];
+  const rows = experiments.map(experiment => {
+    const identity = experiment.identity || {}, gate = experiment.gate || {};
+    const table = experiment.table || {};
+    return `<tr><td>${esc(identity.experiment_id || "—")}<div class="sub">策略 ${esc(identity.policy_id || "—")} · 宿主 ${esc(identity.host_version || "—")}</div>
+      <details><summary>候选与基线身份</summary><p>候选 ${esc(identity.candidate_hash || "—")}</p><p>基线 ${esc(identity.baseline_hash || "—")}</p></details></td>
+      <td class="num">${esc(table.labelled ?? 0)}</td><td class="num">${esc(table.changed ?? 0)}</td><td class="num">${esc(table.net_gain ?? 0)}</td>
+      <td><span class="tag ${gate.ok ? "ok" : "bad"}">${gate.ok ? "已通过" : "未通过"}</span><div class="sub">${(gate.checks || []).filter(check => check.status !== "ok").map(check => esc(check.detail || check.name)).join("<br />")}</div></td></tr>`;
+  }).join("");
+  return `<h3>独立实验结果</h3><p class="hint">每项仅使用同一实验、候选、宿主版本、基线和策略的记录。汇总统计仅供诊断；身份不完整的旧记录 ${esc(data.legacy_rows ?? 0)} 条不能用于晋级。</p>`
+    + (rows ? `<div class="table-host"><table><thead><tr><th>实验身份</th><th>已标注</th><th>分歧</th><th>净收益</th><th>晋级门槛</th></tr></thead><tbody>${rows}</tbody></table></div>`
+      : '<p class="empty">尚无身份完整的独立实验。</p>');
+}
+
 function renderShadow(data) {
   renderOperationalShadow(data && data.operational);
   const host = $("shadow");
@@ -125,7 +140,7 @@ function renderShadow(data) {
       <td>` + esc(row.detail) + `</td>
     </tr>`).join("");
   const net = table.net_gain ?? 0;
-  host.innerHTML = `<div class="grid">
+  host.innerHTML = shadowExperiments(data) + `<h3>记录总览</h3><div class="grid">
       ` + statCard("记录 shadow 的消息", data.rows,
         "其中带人工标签 " + labelled + " 条；只有带标签的才能判对错") + `
       ` + statCard("策略产生分歧", table.changed ?? 0,

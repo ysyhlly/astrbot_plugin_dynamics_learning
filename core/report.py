@@ -16,8 +16,9 @@ from .attribution import attribution_report
 from .autotune import DECISION_LABEL, TuneRules, TuneRun, run_all as run_tuning
 from .config import LearningConfig
 from .evaluator import (
-    VERDICT_ACCEPTED, EvaluationReport, evaluate_dataset, forward_evaluation, promotion_check,
+    VERDICT_ACCEPTED, EvaluationReport, evaluate_dataset,
 )
+from .evaluation_pipeline import EvaluationContext
 from .policy import STATUS_PROPOSED, STATUS_VALIDATED
 from .metrics import SAMPLE_NOTE, within_window
 from .quality import dataset_gate
@@ -72,7 +73,8 @@ class AnalysisResult:
 
     @property
     def promoted_runs(self) -> list[TuneRun]:
-        return [row for row in self.tuning if row.promoted]
+        return [row for row in self.tuning if row.promoted and row.candidate is not None
+                and row.candidate.status == STATUS_VALIDATED]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -102,6 +104,7 @@ def dataset_summary(samples: Sequence[LearningSample]) -> dict[str, Any]:
              for task in ANALYSED_TASKS}
     return {
         "samples": len(samples),
+        "independent_messages": len({(s.session_hash, s.msg_id) for s in samples}),
         "sessions": len({sample.session_hash for sample in samples}),
         # Reported next to sessions rather than merged into it: under the current
         # host contract a scope *is* a session, and a number that silently equals
@@ -169,7 +172,8 @@ def _annotate(recommendation: Recommendation, verdict: str | None,
         if tuning is not None:
             evidence["tuning_decision"] = tuning.decision
             evidence["tuning_label"] = DECISION_LABEL.get(tuning.decision, tuning.decision)
-            if not tuning.promoted:
+            if (not tuning.promoted or tuning.candidate is None
+                    or tuning.candidate.status != STATUS_VALIDATED):
                 downgrade = True
                 evidence["downgrade_reason"] = "迭代调参未达到采纳门槛"
             elif tuning.final_policy is not None:
@@ -197,6 +201,7 @@ def analyze(
     rules: TuneRules | None = None,
     now: float | None = None,
     host_version: str | None = None,
+    baseline_source: str = "default_reference",
 ) -> AnalysisResult:
     config = config or LearningConfig()
     stamp = now if now is not None else time.time()
@@ -208,65 +213,38 @@ def analyze(
     result.overview = overview(samples, now=stamp)
     result.errors = error_breakdown(samples)
     result.attribution = attribution_report(samples, min_samples=config.min_samples_for_evaluation)
-    result.recipient = learn_recipient(samples, config=config)
-    result.topic = learn_topic(samples, config=config)
-
+    context = EvaluationContext.reserve(
+        samples, config=config, now=stamp, host_version=host_version,
+        baseline_source=baseline_source, evaluation_enabled=with_evaluation,
+        dataset_gate_ok=bool(result.dataset_gate.get("ok", True)))
+    development = context.development
+    result.recipient = learn_recipient(development, config=config)
+    result.topic = learn_topic(development, config=config)
     evaluation: EvaluationReport | None = None
-    forward: EvaluationReport | None = None
     if with_evaluation:
-        evaluation = evaluate_dataset(samples, config=config, baseline_policy=baseline_policy,
+        evaluation = evaluate_dataset(development, config=config, baseline_policy=baseline_policy,
                                       existing_versions=existing_versions, now=stamp,
                                       host_version=host_version)
         result.evaluation = evaluation
-        if config.require_forward_validation:
-            forward = forward_evaluation(samples, config=config, baseline_policy=baseline_policy,
-                                         existing_versions=existing_versions, now=stamp,
-                                         host_version=host_version)
-            result.forward = forward
-        check = promotion_check(evaluation, forward, config=config)
-        result.promotion = check.as_dict()
-        if check.reasons:
-            result.notes.append("采纳门槛：" + check.reasons[0])
-    verdict = evaluation.verdict if evaluation is not None else None
 
-    # Tuning runs first: it is what decides promotion, and its verdict is what
-    # the in-sample proposals have to be reconciled against below.
+    # Tuning proposes parameters; only context.finalize decides final eligibility.
     if with_tuning:
-        result.tuning = run_tuning(samples, config=config, baseline_policy=baseline_policy,
+        result.tuning = run_tuning(development, config=config, baseline_policy=baseline_policy,
                                    rules=rules, existing_versions=existing_versions, now=stamp)
-        for tuning in result.tuning:
-            label = DECISION_LABEL.get(tuning.decision, tuning.decision)
-            suffix = f"（{tuning.adopted_steps} 步采纳）" if tuning.adopted_steps else ""
-            result.notes.append(f"{tuning.task} 迭代调参结论：{label}{suffix}；{tuning.stop_reason}")
-        # The tuning runs only saw the session holdout. A candidate they marked
-        # validated still has to clear the forward holdout and the interval, so
-        # the combination is applied *after* them rather than inside each run —
-        # one gate, one answer, and no way for two runs to disagree about it.
-        gate = result.promotion or {}
-        if gate.get("verdict") != VERDICT_ACCEPTED:
-            reason = (gate.get("reasons") or ["未通过采纳门槛"])[0]
-            for tuning in result.tuning:
-                if tuning.candidate is None:
-                    continue
-                if tuning.candidate.status != STATUS_VALIDATED:
-                    continue
-                tuning.candidate = tuning.candidate.with_status(
-                    STATUS_PROPOSED, now=stamp, reason=reason[:200])
-            if result.evaluation is not None and result.evaluation.candidate is not None \
-                    and result.evaluation.candidate.status == STATUS_VALIDATED:
-                result.evaluation.candidate = result.evaluation.candidate.with_status(
-                    STATUS_PROPOSED, now=stamp, reason=reason[:200])
-            if result.tuning:
-                result.notes.append("迭代结论本可采纳，但整体门槛未通过：" + reason)
-        promoted = result.promoted_runs
-        if promoted:
-            result.notes.append(
-                "达到采纳门槛的任务：" + "、".join(row.task for row in promoted)
-                + "。采纳只写入本插件的策略记录，不会改动 ChatDynamics 配置。")
-    elif evaluation is not None and evaluation.verdict == VERDICT_ACCEPTED and evaluation.candidate:
-        result.notes.append(
-            f"离线评测判定候选 {evaluation.candidate.version} 可采纳；"
-            "采纳只写入本插件的策略记录，不会改动 ChatDynamics 配置。")
+    if evaluation is not None and evaluation.candidate is not None:
+        _, result.evaluation, result.forward, result.promotion = context.finalize(evaluation.candidate)
+    for run in result.tuning:
+        if run.candidate is not None:
+            run.candidate, _, _, final_gate = context.finalize(run.candidate)
+            if run.candidate.status != STATUS_VALIDATED:
+                run.decision = "reject" if final_gate["verdict"] == "rejected" else "insufficient"
+                run.stop_reason += "；最终冻结验证未通过"
+        label = DECISION_LABEL.get(run.decision, run.decision)
+        suffix = f"（{run.adopted_steps} 步采纳）" if run.adopted_steps else ""
+        result.notes.append(f"{run.task} 迭代调参结论：{label}{suffix}；{run.stop_reason}")
+    if result.promotion.get("reasons"):
+        result.notes.append("最终采纳门槛：" + result.promotion["reasons"][0])
+    verdict = (result.promotion.get("verdict") if with_evaluation else None)
 
     tuning_by_task = {row.task: row for row in result.tuning}
     proposals: list[Recommendation] = []

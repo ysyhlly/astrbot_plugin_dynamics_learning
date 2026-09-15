@@ -149,13 +149,13 @@ def test_a_non_delivery_with_no_stage_is_unattributable():
     assert row.bucket not in buckets.SYSTEM_EVENTS
 
 
-def test_an_unadmitted_turn_that_was_never_sent_stays_a_participation_error():
-    """The outcome is negative, but the link that failed is the admission."""
+def test_gate_outcome_does_not_turn_final_reply_label_into_rule_supervision():
+    """A final preference cannot diagnose a threshold error before a recorded gate."""
     row = bucket_of(chain_record("m1", expected_reply=True, level="weak",
                                  outcome=outcome_block("suppressed", delivered=False,
                                                        reason="asleep_ambient")))
 
-    assert row.bucket == buckets.PARTICIPATION_ERROR
+    assert row.bucket == buckets.GATE_SUPPRESSION
     assert buckets.GATE_SUPPRESSION not in row.also_failed
 
 

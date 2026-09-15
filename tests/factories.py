@@ -554,3 +554,18 @@ def suppressed_record(msg_id, *, reason="asleep_ambient", expected_reply=True,
         **kwargs)
     return make_record(msg_id, trace=trace, predicted_topic="UNKNOWN", expected_topic="UNKNOWN",
                        expected_reply=expected_reply, annotated_at=annotated_at)
+
+
+def evidenced_policy(params=None):
+    """Consistent offline evidence fixture for storage/state tests, not evaluator tests."""
+    from dataclasses import replace
+    from astrbot_plugin_dynamics_learning.core.policy import candidate_from, baseline_config_hash
+    candidate = candidate_from(params or {"strong_addressivity_threshold": 0.67})
+    identity = {"metric_schema_version": 2,
+                "candidate_hash": baseline_config_hash(candidate.params),
+                "baseline_hash": baseline_config_hash(candidate.baseline),
+                "dataset_fingerprint": "fixture-dataset"}
+    return replace(candidate, training_dataset={"fingerprint": "fixture-dataset"},
+                   holdout_result={"split": identity}, forward_result={"split": identity},
+                   target={"baseline_config_hash": identity["baseline_hash"]},
+                   evidence={"metric_schema_version": 2, "final_validation": {"verdict": "accepted"}, "dataset_gate_ok": True})

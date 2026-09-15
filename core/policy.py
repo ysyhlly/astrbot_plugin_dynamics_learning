@@ -512,6 +512,30 @@ def baseline_config_hash(policy: Mapping[str, float]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
+def validate_candidate_evidence(candidate: PolicyCandidate) -> list[str]:
+    """Return identity failures; callers must not persist a validated mismatch."""
+    from .metrics import METRIC_SCHEMA_VERSION
+
+    failures: list[str] = []
+    if candidate.evidence.get("metric_schema_version") != METRIC_SCHEMA_VERSION:
+        failures.append("metric_schema_version")
+    expected = {"metric_schema_version": METRIC_SCHEMA_VERSION,
+                "candidate_hash": baseline_config_hash(candidate.params),
+                "baseline_hash": baseline_config_hash(candidate.baseline),
+                "dataset_fingerprint": candidate.training_dataset.get("fingerprint")}
+    records = [("holdout", candidate.holdout_result)]
+    if candidate.evidence.get("require_forward_validation", True):
+        records.append(("forward", candidate.forward_result))
+    for name, record in records:
+        split = record.get("split") if isinstance(record, Mapping) else None
+        for key, value in expected.items():
+            if not value or not isinstance(split, Mapping) or split.get(key) != value:
+                failures.append(name + "." + key)
+    if candidate.target.get("baseline_config_hash") != expected["baseline_hash"]:
+        failures.append("target.baseline_config_hash")
+    return failures
+
+
 def published_policy(candidate: PolicyCandidate, *,
                      issued_at: float | None = None) -> dict[str, Any]:
     """The read-only offer ChatDynamics may consume.
@@ -543,6 +567,7 @@ def published_policy(candidate: PolicyCandidate, *,
     return {
         "policy_contract_version": POLICY_CONTRACT_VERSION,
         "policy_id": candidate.version,
+        "candidate_hash": baseline_config_hash(candidate.params),
         "issued_at": issued_at if issued_at is not None else time.time(),
         "state": normalize_status(candidate.status),
         "eligible_modes": (["shadow", "active"] if candidate.published else ["shadow"]),
@@ -557,9 +582,20 @@ def published_policy(candidate: PolicyCandidate, *,
             # `expected_dataset_fingerprint` in docs/contract.md.
             "dataset_fingerprint": dict(candidate.training_dataset).get("fingerprint", ""),
             "learning_version": LEARNING_VERSION,
+            "metric_schema_version": candidate.evidence.get("metric_schema_version"),
+        },
+        "applicability": {
+            "decision_stage": "rule",
+            "behavior_contract": compatibility.get("behavior_contract", "unverified"),
+            "observed_decision_modes": list(compatibility.get("decision_modes") or []),
+            "persona_behavior_validated": False,
+            "persona_behavior_version": None,
+            "participation_preferences_hash": None,
         },
         "target": {
             "chat_dynamics_version": target.get("chat_dynamics_version"),
+            "baseline_source": target.get("baseline_source", "unknown"),
+            "baseline_verified": target.get("baseline_verified", False),
             "baseline_config_hash": target.get("baseline_config_hash")
             or baseline_config_hash(base),
             # Compatibility is *validated*, not inferred from SemVer. Today the
@@ -595,7 +631,7 @@ def published_payload(policies: Sequence[PolicyCandidate], *,
     Only promoted records are offered. Earlier validated policies are exposed
     separately by candidate_payload for shadow consumers.
     """
-    promoted = sorted((row for row in policies if row.published),
+    promoted = sorted((row for row in policies if row.published and not row.evidence.get("stale")),
                       key=lambda row: row.status_changed_at or row.created_at, reverse=True)
     return {
         "policy_contract_version": POLICY_CONTRACT_VERSION,
@@ -609,7 +645,7 @@ def candidate_payload(policies: Sequence[PolicyCandidate], *,
                       issued_at: float | None = None) -> dict[str, Any]:
     """Validated offers for observation, without requiring early promotion."""
     eligible = sorted(
-        (row for row in policies if normalize_status(row.status) in
+        (row for row in policies if not row.evidence.get("stale") and normalize_status(row.status) in
          {STATUS_VALIDATED, STATUS_SHADOW, STATUS_PROMOTED}),
         key=lambda row: row.status_changed_at or row.created_at, reverse=True)
     return {
@@ -795,7 +831,7 @@ __all__ = [
     "STATUS_ALIASES", "STATUS_LABEL", "STATUS_PROPOSED", "STATUS_PROMOTED", "STATUS_REJECTED",
     "STATUS_ROLLED_BACK", "STATUS_SHADOW", "STATUS_SUPERSEDED", "STATUS_VALIDATED", "STATUSES",
     "TARGETED_EXPLICIT_CODES", "TARGET_ERROR_BY_DIRECTION", "ambient_score", "available_actions",
-    "baseline_config_hash",
+    "baseline_config_hash", "validate_candidate_evidence",
     "bounded_target",
     "can_transition", "candidate_from", "candidate_payload", "clamp_cumulative", "clamp_param", "decide", "drift_from",
     "next_version", "normalize_policy", "normalize_status", "policy_deltas", "policy_summary",

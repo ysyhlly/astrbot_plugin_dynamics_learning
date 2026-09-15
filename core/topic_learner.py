@@ -181,6 +181,14 @@ def replay_pairs(rows: Sequence[TopicPairRow], threshold: float, *,
     return list(grouped.values())
 
 
+def recorded_pairs(rows: Sequence[TopicPairRow]) -> list[list[tuple[str, str]]]:
+    """Observed assignments, without counterfactual threshold relaxation."""
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    for row in rows:
+        grouped.setdefault(row.session_hash, []).append((row.predicted, row.expected))
+    return list(grouped.values())
+
+
 def _display_confusion(samples: Sequence[LearningSample]) -> list[dict[str, Any]]:
     rows = label_confusion((sample.predicted, sample.expected) for sample in samples)
     for row in rows:
@@ -208,7 +216,7 @@ def learn(samples: Sequence[LearningSample], *, config: LearningConfig | None = 
 
     rows = pair_rows(subset)
     report.confusion = _display_confusion(subset)
-    report.pair_metrics = topic_pair_metrics(replay_pairs(rows, 0.0))
+    report.pair_metrics = topic_pair_metrics(recorded_pairs(rows))
     report.candidate_metrics = summarise_candidates(candidate_observations(subset))
     report.notes.append(PAIR_NOTE)
     report.notes.extend(_candidate_notes(report))
@@ -302,10 +310,10 @@ def _sweep(rows: Sequence[TopicPairRow], config: LearningConfig) -> dict[str, An
     if best is None:
         return {"threshold": None, "metric": "pair_accuracy", "value": None, "curve": []}
     best.pop("_key", None)
-    baseline = topic_pair_metrics(replay_pairs(rows, 0.0))
+    baseline = topic_pair_metrics(recorded_pairs(rows))
     return {"threshold": best["threshold"], "metric": "pair_accuracy", "value": best["pair_accuracy"],
             "evaluated": len(curve), "curve": curve[:48],
-            "baseline": {"threshold": 0.0, "pair_accuracy": baseline["pair_accuracy"],
+            "baseline": {"threshold": None, "source": "recorded", "pair_accuracy": baseline["pair_accuracy"],
                          "wrong_merge": baseline["wrong_merge"],
                          "fragmentation": baseline["fragmentation"]},
             "default_threshold": base}
@@ -401,5 +409,5 @@ def threshold_curve_rows(report: TopicLearning) -> list[dict[str, Any]]:
 
 __all__ = [
     "TopicLearning", "TopicPairRow", "UNASSIGNED_DISPLAY", "candidate_observations", "learn",
-    "pair_rows", "replay_can_move", "replay_label", "replay_pairs", "threshold_curve_rows",
+    "pair_rows", "recorded_pairs", "replay_can_move", "replay_label", "replay_pairs", "threshold_curve_rows",
 ]

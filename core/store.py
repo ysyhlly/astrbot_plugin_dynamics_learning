@@ -9,16 +9,19 @@ global cap is exceeded.
 from __future__ import annotations
 
 import time
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 from .config import LearningConfig
-from .policy import PolicyCandidate, can_transition, transition_error
+from .policy import PolicyCandidate, can_transition, transition_error, published_payload, candidate_payload, validate_candidate_evidence
 from .samples import LearningSample, session_hash
 
 SAMPLE_INDEX_KEY = "learning_index_v1"
 SAMPLE_KEY_PREFIX = "learning_samples_v1_"
 POLICY_KEY = "learning_policies_v1"
+POLICY_PENDING_KEY = "learning_policy_pending_v1"
 # The publish contract, materialised as one key so the consumer can read a
 # single agreed artefact instead of re-deriving the shape from the policy
 # records. Two implementations of the same contract is two chances to disagree,
@@ -145,21 +148,44 @@ class LearningStore:
         now: float | None = None,
     ) -> StoreStats:
         """Replace every sample belonging to one session, then enforce the cap."""
+        return await self.replace_sessions({session_key: samples}, config=config, now=now)
+
+    async def replace_sessions(
+        self,
+        sessions: Mapping[str, Sequence[LearningSample]],
+        *,
+        config: LearningConfig | None = None,
+        now: float | None = None,
+    ) -> StoreStats:
+        """Replace a batch using one index read and one final pruning pass."""
         config = config or LearningConfig()
-        digest = session_hash(session_key)
-        rows = [sample.as_dict(include_trace=config.store_raw_trace) for sample in samples]
-        if rows:
-            await self.backend.put_kv_data(SAMPLE_KEY_PREFIX + digest, rows)
-        else:
-            await self.backend.delete_kv_data(SAMPLE_KEY_PREFIX + digest)
         index = await self._load_index()
-        if rows:
-            index["sessions"][digest] = {"session_key": session_key[:256], "count": len(rows),
-                                         "updated_at": now if now is not None else time.time()}
-        else:
-            index["sessions"].pop(digest, None)
-        stats = await self._prune(index, config, now=now)
-        return stats
+        timestamp = now if now is not None else time.time()
+        for session_key, samples in sessions.items():
+            digest = session_hash(session_key)
+            key = SAMPLE_KEY_PREFIX + digest
+            rows = [sample.as_dict(include_trace=config.store_raw_trace) for sample in samples]
+            previous = await self.backend.get_kv_data(key, None)
+            if isinstance(previous, list) and len(previous) == len(rows):
+                # Re-reading an unchanged annotation is not a new sample revision.
+                def comparable(records):
+                    return [{k: v for k, v in row.items() if k != "ingested_at"}
+                            if isinstance(row, dict) else row for row in records]
+                if comparable(previous) == comparable(rows):
+                    rows = previous
+            if rows:
+                if previous != rows:
+                    await self.backend.put_kv_data(key, rows)
+                old_entry = index["sessions"].get(digest)
+                index["sessions"][digest] = {
+                    "session_key": session_key[:256], "count": len(rows),
+                    "updated_at": (old_entry["updated_at"] if previous == rows and old_entry else timestamp),
+                }
+            else:
+                if previous is not None:
+                    await self.backend.delete_kv_data(key)
+                index["sessions"].pop(digest, None)
+        return await self._prune(index, config, now=now)
 
     async def _prune(self, index: dict[str, Any], config: LearningConfig,
                      *, now: float | None = None) -> StoreStats:
@@ -194,7 +220,25 @@ class LearningStore:
 
     # ---- policies ------------------------------------------------------
 
+    async def _recover_policies(self) -> None:
+        pending = await self.backend.get_kv_data(POLICY_PENDING_KEY, None)
+        if not isinstance(pending, Mapping) or not isinstance(pending.get("policies"), list):
+            return
+        policies = [candidate for row in pending["policies"]
+                    if (candidate := PolicyCandidate.from_dict(row)) is not None]
+        revision = pending.get("revision", "")
+        await self.backend.put_kv_data(PUBLISHED_KEY, {**published_payload(policies), "revision": revision})
+        await self.backend.put_kv_data(CANDIDATE_KEY, {**candidate_payload(policies), "revision": revision})
+        await self.backend.put_kv_data(POLICY_KEY, dict(pending))
+        await self.backend.delete_kv_data(POLICY_PENDING_KEY)
+
+    async def policy_revision(self) -> str:
+        policies = await self.load_policies()
+        return hashlib.sha256(json.dumps([p.as_dict() for p in policies], sort_keys=True,
+                                         ensure_ascii=False).encode("utf-8")).hexdigest()
+
     async def load_policies(self) -> list[PolicyCandidate]:
+        await self._recover_policies()
         raw = await self.backend.get_kv_data(POLICY_KEY, {})
         rows = raw.get("policies") if isinstance(raw, Mapping) else None
         rows = rows if isinstance(rows, list) else []
@@ -206,10 +250,15 @@ class LearningStore:
         return result
 
     async def save_policies(self, policies: Sequence[PolicyCandidate]) -> None:
-        await self.backend.put_kv_data(POLICY_KEY, {
+        rows = [candidate.as_dict() for candidate in list(policies)[-500:]]
+        revision = hashlib.sha256(json.dumps(rows, sort_keys=True,
+                                            ensure_ascii=False).encode("utf-8")).hexdigest()
+        # A durable intent lets the next read finish a partially written offer.
+        await self.backend.put_kv_data(POLICY_PENDING_KEY, {
             "store_schema_version": STORE_SCHEMA_VERSION,
-            "policies": [candidate.as_dict() for candidate in list(policies)[-500:]],
+            "policies": rows, "revision": revision,
         })
+        await self._recover_policies()
 
     async def append_policy(self, candidate: PolicyCandidate) -> list[PolicyCandidate]:
         policies = await self.load_policies()
@@ -219,7 +268,8 @@ class LearningStore:
 
     async def update_policy_status(self, version: str, status: str, *,
                                    now: float | None = None,
-                                   reason: str = "") -> PolicyCandidate | None:
+                                   reason: str = "",
+                                   expected_revision: str | None = None) -> PolicyCandidate | None:
         """Move one policy through the state machine, or refuse and say why.
 
         The store is where the transition is checked, because it is the only
@@ -228,13 +278,25 @@ class LearningStore:
         is refused here with the two states named, rather than stored and
         discovered later by whoever reads the published file.
         """
+        if expected_revision is not None and expected_revision != await self.policy_revision():
+            raise ValueError("policy revision conflict; refresh before retrying")
         policies = await self.load_policies()
         updated: PolicyCandidate | None = None
         result: list[PolicyCandidate] = []
         for row in policies:
             if row.version == version:
+                if row.evidence.get("stale") and status in {"validated", "shadow", "promoted"}:
+                    raise ValueError("策略证据已过期，请基于当前数据重新分析")
                 if not can_transition(row.status, status):
                     raise ValueError(transition_error(row.status, status))
+                if status in {"validated", "shadow", "promoted"}:
+                    final = row.evidence.get("final_validation")
+                    if (validate_candidate_evidence(row)
+                            or not isinstance(final, Mapping)
+                            or final.get("verdict") != "accepted"
+                            or row.evidence.get("evaluation_enabled") is False
+                            or row.evidence.get("dataset_gate_ok") is not True):
+                        raise ValueError("策略缺少一致且通过的最终验证证据，请重新分析")
                 updated = row.with_status(status, now=now, reason=reason)
                 result.append(updated)
             else:
@@ -249,6 +311,7 @@ class LearningStore:
         await self.backend.put_kv_data(CANDIDATE_KEY, dict(payload))
 
     async def load_candidate(self) -> dict[str, Any]:
+        await self._recover_policies()
         raw = await self.backend.get_kv_data(CANDIDATE_KEY, {})
         return dict(raw) if isinstance(raw, dict) else {}
 
@@ -259,6 +322,7 @@ class LearningStore:
         await self.backend.put_kv_data(PUBLISHED_KEY, dict(payload))
 
     async def load_published(self) -> dict[str, Any]:
+        await self._recover_policies()
         raw = await self.backend.get_kv_data(PUBLISHED_KEY, {})
         return dict(raw) if isinstance(raw, Mapping) else {}
 

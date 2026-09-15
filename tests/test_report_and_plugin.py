@@ -63,7 +63,10 @@ def test_analysis_runs_the_iterative_tuner_and_reports_its_verdict():
         assert run["rules"]["step_delta_ratio"] == 0.05
         assert run["rules"]["max_steps"] == 3
         assert "不会自动修改" in run["note"]
-    assert result.promoted_runs, "the biased batch should reach a promote tier"
+    # This fixture is old: descriptive tuning gains cannot override the data gate.
+    assert not result.promoted_runs
+    assert all(row.candidate is None or row.candidate.status != "validated"
+               for row in result.tuning)
 
 
 def test_tuning_can_be_switched_off():
@@ -78,23 +81,23 @@ def test_a_proposal_that_contradicts_the_iteration_is_downgraded():
     When they do, the holdout wins and the in-sample number stops being
     actionable — otherwise the console would offer two contradictory changes.
     """
-    result = analyze(_samples())
-    by_param = {row.param: row for row in result.recommendations if row.param}
-    drift = {}
-    for run in result.tuning:
-        for row in (run.as_dict()["drift"] or []):
-            drift[row["param"]] = row["delta"]
-    conflicts = 0
-    for param, recommendation in by_param.items():
-        moved = drift.get(param)
-        if moved is None or recommendation.before is None or recommendation.after is None:
-            continue
-        if (recommendation.after - recommendation.before) * moved < 0:
-            conflicts += 1
-            assert recommendation.actionable is False
-            assert recommendation.evidence["downgrade_reason"] == \
-                "样本内建议方向与留出集迭代结论相反"
-    assert conflicts, "the fixture is chosen so the two directions disagree"
+    from astrbot_plugin_dynamics_learning.core.autotune import TuneRun
+    from astrbot_plugin_dynamics_learning.core.policy import candidate_from
+    from astrbot_plugin_dynamics_learning.core.recommendation import Recommendation
+    from astrbot_plugin_dynamics_learning.core.report import _annotate
+
+    base = dict(BASE_POLICY)
+    param = "strong_addressivity_threshold"
+    candidate = candidate_from({param: base[param] - 0.01}, baseline=base).with_fields(
+        status="validated")
+    run = TuneRun(task="recipient", baseline=base, decision="promote",
+                  final_policy=dict(candidate.params), candidate=candidate)
+    proposal = Recommendation(kind=KIND_CONFIG_PARAM, title="test", detail="test",
+                              param=param, before=base[param], after=base[param] + 0.01,
+                              confidence="moderate")
+    result = _annotate(proposal, "accepted", run)
+    assert not result.actionable
+    assert result.evidence["downgrade_reason"] == "样本内建议方向与留出集迭代结论相反"
 
 
 def test_every_parameter_proposal_carries_its_tuning_verdict():
@@ -176,20 +179,15 @@ async def test_plugin_ingests_an_export_then_reports(plugin):
 
     policies = await plugin.policies_payload()
     assert policies["total"] >= 1
-    # The iterative runs own the policy records; the single-shot candidate is a
-    # fallback, so the same adjustment is never recorded twice.
-    assert all(row["source"] == "iterative_tuning" for row in policies["rows"])
+    # Final validation reserves unseen data, so small corpora can use the
+    # single-shot fallback and cannot be manually promoted past a failed gate.
+    assert all(row["source"] in {"iterative_tuning", "offline_evaluation"}
+               for row in policies["rows"])
     version = policies["rows"][0]["version"]
-    # Promotion is a separate arrow from validation, and the store refuses to
-    # skip it: a policy that has not been through "validated" cannot be offered
-    # to the host.
-    await plugin.update_policy(version, "validate")
-    updated = await plugin.update_policy(version, "accept")
-    assert updated["status"] == "promoted"
-    published = await plugin.published_payload()
-    assert [row["policy_id"] for row in published["policies"]] == [version]
-    assert published["policies"][0]["shadow_observed"] is False
-    assert "未发生任何变化" in updated["note"]
+    assert policies["rows"][0]["evidence"]["final_validation"]["verdict"] != "accepted"
+    with pytest.raises(ValueError, match="验证|validation|门槛"):
+        await plugin.update_policy(version, "validate")
+    assert (await plugin.published_payload())["policies"] == []
     with pytest.raises(ValueError):
         await plugin.update_policy("policy_v999", "accept")
 
@@ -266,6 +264,8 @@ async def test_the_publish_contract_is_materialised_for_the_consumer(plugin):
     assert stored["policy_contract_version"] == 1
     assert isinstance(stored["policies"], list)
 
+    from .factories import evidenced_policy
+    await plugin.store.save_policies([evidenced_policy()])
     policies = await plugin.store.load_policies()
     if policies:
         version = policies[0].version
@@ -277,7 +277,7 @@ async def test_the_publish_contract_is_materialised_for_the_consumer(plugin):
         assert set(stored["policies"][0]) >= {"source", "target", "params", "state"}
         assert set(stored["policies"][0]["source"]) == {
             "trace_schema_version", "trace_schema_versions", "dataset_fingerprint",
-            "learning_version"}
+            "learning_version", "metric_schema_version"}
 
     await plugin.reset_storage()
     assert await plugin.store.load_published() == {}
@@ -298,6 +298,8 @@ async def test_plugin_never_writes_outside_its_own_learning_keys(plugin):
     await plugin.ingest(source="export", payload=export_payload(
         annotated_sessions(sessions=4, per_session=6, start=time.time() - 3600)))
     await plugin.run_analysis()
+    from .factories import evidenced_policy
+    await plugin.store.save_policies([evidenced_policy()])
     version = (await plugin.policies_payload())["rows"][0]["version"]
     await plugin.update_policy(version, "validate")
     await plugin.update_policy(version, "accept")
@@ -414,10 +416,10 @@ def test_base_policy_is_exposed_for_the_evaluator():
 
 @pytest.mark.asyncio
 async def test_shadow_candidate_is_available_before_promotion_and_withdrawn(plugin):
-    from astrbot_plugin_dynamics_learning.core.policy import candidate_from
+    from .factories import evidenced_policy
     from astrbot_plugin_dynamics_learning.core.store import CANDIDATE_KEY
 
-    row = candidate_from({"strong_addressivity_threshold": 0.67})
+    row = evidenced_policy()
     await plugin.store.append_policy(row)
     await plugin.update_policy(row.version, "validate")
     candidate = await plugin.store.load_candidate()

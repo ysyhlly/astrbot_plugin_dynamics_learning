@@ -30,9 +30,9 @@ def rows_for(plan, *, session=SESSION, start=1_000_000.0, step=1.0):
         records.append((session, shadow_record(
             f"m{index}",
             expected_reply=expected,
-            shadow=shadow_block(baseline_reply=baseline, shadow_reply=shadow,
+            shadow=dict(shadow_block(baseline_reply=baseline, shadow_reply=shadow,
                                 score=0.68 if not baseline else 0.72,
-                                recorded_at=start + index * step),
+                                recorded_at=start + index * step), experiment_id="run-1", candidate_hash="candidate-1", host_version="1.7.0", baseline_hash="baseline-1"),
             annotated_at=start + index * step + 3600,
         )))
     return build_dataset(records)
@@ -270,3 +270,27 @@ def test_the_rules_read_off_the_plugin_config():
     assert (tuned.min_shadow_samples, tuned.min_active_hours) == (10, 1)
     # A partial object (a script, a test double) gets the documented defaults.
     assert rules_from_config(object()).min_shadow_samples == DEFAULT_MIN_SHADOW_SAMPLES
+
+
+def test_legacy_rows_are_overview_only():
+    record = shadow_record("old", expected_reply=True, shadow=shadow_block())
+    report = evaluate_shadow(build_dataset([(SESSION, record)]), rules=loose())
+    assert report["rows"] == 1
+    assert report["legacy_rows"] == 1
+    assert not report["gate"]["ok"]
+    assert report["experiments"] == []
+
+
+@pytest.mark.parametrize("field", ["experiment_id", "candidate_hash", "host_version", "baseline_hash"])
+def test_experiment_identities_cannot_pool_gate_support(field):
+    records = []
+    for index in range(2):
+        identity = dict(experiment_id="run", candidate_hash="candidate", host_version="host", baseline_hash="baseline")
+        identity[field] += str(index)
+        block = dict(shadow_block(), **identity)
+        records.append((SESSION, shadow_record(str(index), expected_reply=True, shadow=block)))
+    report = evaluate_shadow(build_dataset(records), rules=loose(min_shadow_samples=2))
+    assert report["labelled"] == 2
+    assert len(report["experiments"]) == 2
+    assert not report["gate"]["ok"]
+    assert all("shadow_samples" in group["gate"]["blocked_by"] for group in report["experiments"])

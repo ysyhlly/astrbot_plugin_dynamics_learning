@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
+from dataclasses import replace
 import re
 import time
 from typing import Any, Optional
@@ -28,15 +30,15 @@ from .core.config import LearningConfig, parse_learning_config
 from .core.ingest import IngestResult, collect_from_host, parse_export, parse_preferences
 from .core.policy import (
     ACTION_STATUS, ACTIONS, BASE_POLICY, CONSOLE_ACTIONS, available_actions, candidate_payload,
-    normalize_status, published_payload,
+    normalize_status, published_payload, PARAM_SPECS, validate_candidate_evidence,
 )
 from .core.quality import dataset_gate, quality_report
-from .core.reply_review import (
+from .core.reply_review import (  # noqa: F401 - review mixin compatibility exports
     REPLY_REVIEW_SCHEMA_VERSION, build_digest as build_reply_digest,
     build_prompt as build_reply_prompt, digest_fingerprint as reply_digest_fingerprint,
     parse_reply_review, select_messages,
 )
-from .core.review import (
+from .core.review import (  # noqa: F401 - review mixin compatibility exports
     REVIEW_SCHEMA_VERSION, build_digest, build_prompt, digest_fingerprint, parse_review,
 )
 from .core.report import analyze, policy_rows
@@ -45,6 +47,9 @@ from .core.shadow_coverage import evaluate_shadow_coverage
 from .core import scope_profile
 from .core.samples import LearningSample, build_dataset, session_hash
 from .core.store import LearningStore
+from .core.query_cache import QueryCache
+from .core.review_runtime import ReviewRuntimeMixin
+from .core.evaluator import dataset_fingerprint
 from .core.window import session_digest, window_payload
 from .core.web_api import LearningWebAPI, PLUGIN_NAME
 
@@ -75,7 +80,7 @@ def _completion_text(response: Any) -> str:
     "v1.4.0",
     "",
 )
-class DynamicsLearningPlugin(Star):
+class DynamicsLearningPlugin(ReviewRuntimeMixin, Star):
     """Shadow-learning companion: learn, analyse, recommend. Never auto-apply."""
 
     def __init__(self, context: Context, config: Any = None):
@@ -88,6 +93,8 @@ class DynamicsLearningPlugin(Star):
         self._last_diagnostics: dict[str, Any] = {}
         self._last_contract: dict[str, Any] = {}
         self._lock = asyncio.Lock()
+        self._query_cache = QueryCache()
+        self._init_review_runtime()
         self._analysis_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._shutting_down = False
@@ -111,7 +118,16 @@ class DynamicsLearningPlugin(Star):
         contract = state.get("last_contract_stats")
         self._last_contract = contract if isinstance(contract, dict) else {}
         self._samples = await self.store.load_samples(config=self.runtime_config())
-        await self._save_policy_offers()
+        fingerprint = await asyncio.to_thread(dataset_fingerprint, self._samples)
+        policies = await self.store.load_policies()
+        for index, candidate in enumerate(policies):
+            if (candidate.training_dataset.get("fingerprint") != fingerprint
+                    or (candidate.status in {"validated", "shadow", "promoted"}
+                        and (validate_candidate_evidence(candidate)
+                             or candidate.evidence.get("final_validation", {}).get("verdict") != "accepted"))):
+                policies[index] = replace(candidate, evidence={**candidate.evidence,
+                    "stale": True, "stale_reason": "dataset_or_validation_changed"})
+        await self.store.save_policies(policies)
         self._stop.clear()
         if self.runtime_config().auto_analyze:
             self._analysis_task = asyncio.create_task(self._auto_analysis_loop())
@@ -124,6 +140,8 @@ class DynamicsLearningPlugin(Star):
 
     async def terminate(self) -> None:
         self._shutting_down = True
+        await self.invalidate_reviews()
+        await self._query_cache.close()
         self._stop.set()
         task = self._analysis_task
         self._analysis_task = None
@@ -164,6 +182,7 @@ class DynamicsLearningPlugin(Star):
 
     async def load_samples(self, *, refresh: bool = False) -> list[LearningSample]:
         if self._samples is None or refresh:
+            self._query_cache.invalidate()
             self._samples = await self.store.load_samples(config=self.runtime_config())
         return self._samples
 
@@ -185,20 +204,56 @@ class DynamicsLearningPlugin(Star):
                     result = IngestResult(diagnostics={
                         "source": "shared_preferences", "available": False,
                         "error": type(exc).__name__, "records": 0})
+            if result.diagnostics.get("available") is False:
+                return {"source": source, "ok": False, "annotations": 0,
+                        "imported_samples": 0, "sessions": 0,
+                        "stored_samples": len(await self.load_samples()),
+                        "diagnostics": dict(result.diagnostics),
+                        "contract": dict(self._last_contract)}
             # The runtime snapshot decides nothing about identity; it records
             # which host facts (umo / group_id / bot_id) were available, so the
             # contract health report can tell a confirmed session scope from a
             # fallback.
-            samples = build_dataset(result.annotations, session_meta=result.sessions,
-                                    config=config)
-            by_session: dict[str, list[LearningSample]] = {}
+            samples = await asyncio.to_thread(build_dataset, result.annotations,
+                                              session_meta=result.sessions, config=config)
+            samples = [row for row in samples if row.session_key in
+                       (result.confirmed_sessions | result.partial_sessions)]
+            before_fingerprint = await asyncio.to_thread(dataset_fingerprint, await self.load_samples())
+            by_session: dict[str, list[LearningSample]] = {
+                key: [] for key in result.confirmed_sessions}
+            partial = result.partial_sessions - result.confirmed_sessions
+            revised_messages = {(session, str(record.get("msg_id") or ""))
+                                for session, record in result.annotations if session in partial}
+            # Bare annotation records are an incremental import, never a full snapshot.
+            for session in partial:
+                by_session.setdefault(session, [])
+            for old in await self.load_samples():
+                if (old.session_key in partial
+                        and (old.session_key, old.msg_id) not in revised_messages):
+                    by_session.setdefault(old.session_key, []).append(old)
             for sample in samples:
-                by_session.setdefault(sample.session_key, []).append(sample)
+                if sample.session_key in result.confirmed_sessions:
+                    by_session[sample.session_key].append(sample)
+                elif sample.session_key in partial:
+                    by_session[sample.session_key].append(sample)
             if by_session:
-                for session_key, rows in by_session.items():
-                    await self.store.replace_session(session_key, rows, config=config)
-                self._samples = None
+                try:
+                    await self.store.replace_sessions(by_session, config=config)
+                finally:
+                    self._samples = None
+                    self._query_cache.invalidate()
             await self.load_samples(refresh=True)
+            fingerprint = await asyncio.to_thread(dataset_fingerprint, self._samples or [])
+            if fingerprint != before_fingerprint:
+                await self.invalidate_reviews()
+                await self.store.clear_review()
+                if self._last_report is not None:
+                    self._last_report = {**self._last_report, "stale": True,
+                                         "stale_reason": "dataset_changed"}
+                policies = await self.store.load_policies()
+                policies = [replace(row, evidence={**row.evidence, "stale": True,
+                            "stale_reason": "dataset_changed"}) for row in policies]
+                await self.store.save_policies(policies)
             self._last_diagnostics = dict(result.diagnostics)
             # The contract plane is a snapshot: it describes the raw records as
             # they were at this moment, and nothing downstream can reconstruct it
@@ -206,7 +261,9 @@ class DynamicsLearningPlugin(Star):
             self._last_contract = result.contract.as_dict()
             await self.store.patch_state(last_diagnostics=self._last_diagnostics,
                                          last_contract_stats=self._last_contract,
-                                         last_ingest_at=time.time())
+                                         last_ingest_at=time.time(),
+                                         dataset_fingerprint=fingerprint,
+                                         last_report=self._last_report)
             stored = len(self._samples or [])
         available = result.diagnostics.get("available")
         return {
@@ -225,24 +282,57 @@ class DynamicsLearningPlugin(Star):
 
     # ---- analysis ------------------------------------------------------
 
+    async def _analysis_baseline(self) -> tuple[dict[str, float], str, str | None]:
+        """Read the loaded host's effective policy inputs, never its config file."""
+        version = str(self._last_diagnostics.get("host_version") or "") or None
+        getter = getattr(self.context, "get_all_stars", None)
+        try:
+            stars = await self._maybe_await(getter()) if callable(getter) else []
+            for metadata in stars:
+                identity = f"{getattr(metadata, 'author', '')}/{getattr(metadata, 'name', '')}"
+                if identity != self.runtime_config().source_plugin_id:
+                    continue
+                host = getattr(metadata, "star_cls", None)
+                if host is None or not getattr(metadata, "activated", True):
+                    continue
+                reader = getattr(host, "_learning_policy_effective_config", None)
+                if not callable(reader):
+                    continue
+                values = await self._maybe_await(reader())
+                if not isinstance(values, dict):
+                    continue
+                if not all(isinstance(values.get(key), (float, int))
+                           and not isinstance(values[key], bool)
+                           and math.isfinite(values[key])
+                           and spec["min"] <= values[key] <= spec["max"]
+                           for key, spec in PARAM_SPECS.items()):
+                    continue
+                return ({key: float(values[key]) for key in PARAM_SPECS}, "host_effective",
+                        str(getattr(metadata, "version", "") or "") or version)
+        except Exception as exc:
+            logger.warning("[DynamicsLearning] baseline read failed type=%s", type(exc).__name__)
+        return dict(BASE_POLICY), "default_reference", version
+
     async def run_analysis(self, *, with_evaluation: bool = True,
                            with_tuning: bool = True) -> dict[str, Any]:
         async with self._lock:
             samples = await self.load_samples(refresh=True)
             policies = await self.store.load_policies()
+            baseline, baseline_source, host_version = await self._analysis_baseline()
             result = await asyncio.to_thread(
                 analyze,
                 samples,
                 config=self.runtime_config(),
                 existing_versions=[row.version for row in policies],
-                baseline_policy=BASE_POLICY,
+                baseline_policy=baseline,
+                baseline_source=baseline_source,
                 with_evaluation=with_evaluation,
                 with_tuning=with_tuning,
                 # The host's self-reported version, when it reports one. It
                 # travels into the policy record's `target` block and from there
                 # into /published: a consumer that cannot see which version a
                 # policy was validated against has no basis for `active`.
-                host_version=str(self._last_diagnostics.get("host_version") or "") or None,
+                host_version=host_version,
             )
             if self._shutting_down:
                 return self.report_payload_sync()
@@ -262,6 +352,8 @@ class DynamicsLearningPlugin(Star):
             # to click it — which is exactly what the gate exists to prevent.
             if result.dataset_gate.get("ok", True):
                 for candidate in recorded:
+                    if candidate.status == "validated" and validate_candidate_evidence(candidate):
+                        raise ValueError("最终候选与验证证据身份不一致，拒绝保存")
                     await self.store.append_policy(candidate)
             await self._save_policy_offers()
         return self.report_payload_sync()
@@ -366,7 +458,8 @@ class DynamicsLearningPlugin(Star):
         samples = await self.load_samples()
         state = await self.store.load_state()
         contract = self._last_contract or state.get("last_contract_stats")
-        payload = quality_report(
+        payload = await self._query_cache.compute(
+            ("quality", config, repr(contract), state.get("last_ingest_at")), quality_report,
             samples,
             contract=contract if isinstance(contract, dict) else None,
             reader_version=int(self._last_diagnostics.get("reader_version") or 0) or None,
@@ -376,274 +469,12 @@ class DynamicsLearningPlugin(Star):
         # The gate travels with quality, not with the report: it is a statement
         # about the corpus, and a reader has to be able to see it before running
         # an analysis that would produce nothing.
-        payload["dataset_gate"] = dataset_gate(
+        payload["dataset_gate"] = await self._query_cache.compute(
+            ("dataset_gate", config, repr(contract)), dataset_gate,
             samples, config=config,
             contract=contract if isinstance(contract, dict) else None)
         return payload
 
-    async def contract_review_payload(self, *, refresh: bool = False) -> dict[str, Any]:
-        """The contract panel, reread by a model.
-
-        The deterministic matrix is the input, not the answer: what a reader
-        opens is the model's reading of it, with every number checked back
-        against the digest it was given. Every failure — the feature is off, the
-        host has no provider, the call times out, the reply is prose — returns
-        the same shape with an empty review and the reason, because the page has
-        a complete fallback table and a blank panel would be a worse answer than
-        an uninterpreted one.
-        """
-        quality = await self.quality_payload()
-        digest = build_digest(quality)
-        fingerprint = digest_fingerprint(digest)
-        config = self.runtime_config()
-        payload: dict[str, Any] = {
-            "review_schema_version": REVIEW_SCHEMA_VERSION,
-            "fingerprint": fingerprint,
-            "state": "unavailable",
-            "reason": "",
-            "provider_id": "",
-            "generated_at": None,
-            "review": None,
-        }
-        if not config.review_enabled:
-            payload["state"] = "disabled"
-            payload["reason"] = ("模型解读已关闭（learning_review_enabled=false）；"
-                                 "下面是本插件自己的判定与计数。")
-            return payload
-
-        cached = await self.store.load_review()
-        if (not refresh and cached.get("fingerprint") == fingerprint
-                and isinstance(cached.get("review"), dict)):
-            payload.update(state="cached", generated_at=cached.get("generated_at"),
-                           provider_id=str(cached.get("provider_id") or ""),
-                           review=dict(cached["review"]))
-            return payload
-
-        # A provider that is down must not be called once per page refresh.
-        if not refresh and self._review_failed_at:
-            waited = time.time() - self._review_failed_at
-            if waited < REVIEW_RETRY_SECONDS:
-                payload["state"] = "failed"
-                payload["reason"] = self._review_failure_reason
-                return payload
-
-        provider_id, model = await self._review_provider(config.review_provider_id)
-        if not provider_id:
-            payload["state"] = "unavailable"
-            payload["reason"] = "宿主没有可用的对话模型 Provider，无法生成模型解读。"
-            return payload
-        payload["provider_id"] = provider_id
-        payload["model"] = model
-
-        try:
-            reply = await asyncio.wait_for(
-                self._ask_review(digest, provider_id),
-                timeout=float(config.review_timeout_seconds))
-        except asyncio.CancelledError:
-            raise
-        except asyncio.TimeoutError:
-            return self._review_failed(
-                payload, f"模型在 {config.review_timeout_seconds} 秒内没有返回，已回落到本插件判定。")
-        except Exception as exc:
-            return self._review_failed(
-                payload, f"调用模型失败（{type(exc).__name__}），已回落到本插件判定。")
-
-        review = parse_review(reply, digest)
-        if review is None:
-            return self._review_failed(payload, "模型返回的不是可解析的 JSON 对象，已回落到本插件判定。")
-
-        self._review_failed_at = 0.0
-        self._review_failure_reason = ""
-        generated_at = time.time()
-        review["provider_id"] = provider_id
-        review["model"] = model
-        await self.store.save_review({
-            "review_schema_version": REVIEW_SCHEMA_VERSION,
-            "fingerprint": fingerprint,
-            "generated_at": generated_at,
-            "provider_id": provider_id,
-            "model": model,
-            "review": review,
-        })
-        payload.update(state="fresh", generated_at=generated_at, review=review)
-        return payload
-
-    def _review_failed(self, payload: dict[str, Any], reason: str) -> dict[str, Any]:
-        self._review_failed_at = time.time()
-        self._review_failure_reason = reason
-        payload["state"] = "failed"
-        payload["reason"] = reason
-        return payload
-
-    async def _review_provider(self, explicit: str = "") -> tuple[str, str]:
-        """The provider to ask, and its model name when the host knows it.
-
-        An explicit id wins: a review is a fixed analytical task, and letting the
-        panel follow whichever model a conversation happens to use means two
-        readers of the same page can get different tables with no way to tell
-        why. With nothing configured, the host's current chat provider is used,
-        because a plugin that cannot be configured still has to say something.
-        """
-        if explicit:
-            return explicit, ""
-        context = getattr(self, "context", None)
-        getter = getattr(context, "get_using_provider", None)
-        if not callable(getter):
-            return "", ""
-        try:
-            provider = getter(None)
-        except TypeError:
-            provider = getter()
-        except Exception:
-            return "", ""
-        if inspect.isawaitable(provider):
-            provider = await provider
-        if provider is None:
-            return "", ""
-        meta = getattr(provider, "meta", None)
-        try:
-            info = meta() if callable(meta) else None
-        except Exception:
-            info = None
-        return str(getattr(info, "id", "") or ""), str(getattr(info, "model", "") or "")
-
-    async def _ask_review(self, digest: dict[str, Any], provider_id: str) -> str:
-        context = getattr(self, "context", None)
-        generate = getattr(context, "llm_generate", None)
-        if not callable(generate):
-            raise RuntimeError("AstrBot context does not expose llm_generate")
-        system_prompt, prompt = build_prompt(digest)
-        response = generate(chat_provider_id=provider_id, prompt=prompt, system_prompt=system_prompt)
-        if inspect.isawaitable(response):
-            response = await response
-        return _completion_text(response)
-
-    async def reply_review_payload(self, *, refresh: bool = False,
-                                   sp_module: Any = None) -> dict[str, Any]:
-        """Per-message post-mortem of the reply decision, written by a model.
-
-        This is the one path in the plugin that reads message text. It is read
-        from the host shared preferences for this call only, sent to the
-        configured model, and never written back: not into the sample store,
-        not into a cache. The result is held in memory for the life of the
-        process, so a restart forgets it — which is also why the cache below
-        is a plain dict and not a KV key.
-
-        The model is not shown the human label or what the host decided. That
-        is the whole point: a judge that has been shown the answer agrees with
-        it, and the useful rows here are the ones where the three disagree.
-        """
-        config = self.runtime_config()
-        payload: dict[str, Any] = {
-            "reply_review_schema_version": REPLY_REVIEW_SCHEMA_VERSION,
-            "state": "unavailable",
-            "reason": "",
-            "provider_id": "",
-            "model": "",
-            "generated_at": None,
-            "stats": {},
-            "review": None,
-            "text_policy": ("正文只在本体与模型之间过一次：本插件不保存正文，复盘结果也不落盘；"
-                            "关掉开关后连读都不读。"),
-        }
-        if not config.reply_review_enabled:
-            payload["state"] = "disabled"
-            payload["reason"] = ("逐条复盘默认关闭：它会把群消息正文发给你配置的模型。"
-                                 "确认接受这一点后，打开 learning_reply_review_enabled。")
-            return payload
-
-        try:
-            result = await collect_from_host(config.source_plugin_id, sp_module=sp_module)
-        except Exception as exc:
-            payload["reason"] = f"读取本体标注失败（{type(exc).__name__}）。"
-            return payload
-        if result.diagnostics.get("available") is False:
-            # collect_from_host reports an unreachable host instead of raising:
-            # "the host is not there" and "the host has no annotations" are
-            # different findings with different fixes.
-            payload["reason"] = ("读不到本体的共享首选项（本体未安装、未加载，或 AstrBot 版本不支持）。")
-            return payload
-        messages, stats = select_messages(result.annotations,
-                                          limit=config.reply_review_max_messages)
-        payload["stats"] = stats
-        if not messages:
-            payload["state"] = "empty"
-            payload["reason"] = ("本体还没有可复盘的标注记录：先在 ChatDynamics 的场景回放里标注"
-                                 "「该不该回」（expected_reply）。")
-            return payload
-        if not stats["with_text"]:
-            payload["state"] = "no_text"
-            payload["reason"] = (
-                f"选中的 {stats['selected']} 条都没有正文。本插件从不保存正文，本体也只在打开"
-                "「控制台显示消息正文」时才把它写进标注记录；打开它并重新标注后即可复盘。")
-            return payload
-
-        digest = build_reply_digest(messages)
-        fingerprint = reply_digest_fingerprint(digest)
-        cached = self._reply_review_cache
-        if not refresh and cached.get("fingerprint") == fingerprint:
-            payload.update(state="cached", generated_at=cached.get("generated_at"),
-                           provider_id=cached.get("provider_id", ""),
-                           model=cached.get("model", ""), review=cached.get("review"))
-            return payload
-        if not refresh and self._reply_review_failed_at:
-            if time.time() - self._reply_review_failed_at < REVIEW_RETRY_SECONDS:
-                payload["state"] = "failed"
-                payload["reason"] = self._reply_review_failure_reason
-                return payload
-
-        provider_id, model = await self._review_provider(config.reply_review_provider_id)
-        if not provider_id:
-            payload["reason"] = "宿主没有可用的对话模型 Provider，无法复盘。"
-            return payload
-        payload["provider_id"] = provider_id
-        payload["model"] = model
-        try:
-            reply = await asyncio.wait_for(
-                self._ask_reply_review(digest, provider_id),
-                timeout=float(config.reply_review_timeout_seconds))
-        except asyncio.CancelledError:
-            raise
-        except asyncio.TimeoutError:
-            return self._reply_review_failed(
-                payload, f"模型在 {config.reply_review_timeout_seconds} 秒内没有返回。")
-        except Exception as exc:
-            return self._reply_review_failed(
-                payload, f"调用模型失败（{type(exc).__name__}）。")
-
-        review = parse_reply_review(reply, messages, stats=stats)
-        if review is None:
-            return self._reply_review_failed(payload, "模型返回的不是可解析的 JSON 对象。")
-
-        self._reply_review_failed_at = 0.0
-        self._reply_review_failure_reason = ""
-        generated_at = time.time()
-        review["provider_id"] = provider_id
-        review["model"] = model
-        review["generated_at"] = generated_at
-        self._reply_review_cache = {"fingerprint": fingerprint, "generated_at": generated_at,
-                                    "provider_id": provider_id, "model": model,
-                                    "review": review}
-        payload.update(state="fresh", generated_at=generated_at, review=review)
-        return payload
-
-    def _reply_review_failed(self, payload: dict[str, Any], reason: str) -> dict[str, Any]:
-        self._reply_review_failed_at = time.time()
-        self._reply_review_failure_reason = reason
-        payload["state"] = "failed"
-        payload["reason"] = reason
-        return payload
-
-    async def _ask_reply_review(self, digest: dict[str, Any], provider_id: str) -> str:
-        context = getattr(self, "context", None)
-        generate = getattr(context, "llm_generate", None)
-        if not callable(generate):
-            raise RuntimeError("AstrBot context does not expose llm_generate")
-        system_prompt, prompt = build_reply_prompt(digest)
-        response = generate(chat_provider_id=provider_id, prompt=prompt, system_prompt=system_prompt)
-        if inspect.isawaitable(response):
-            response = await response
-        return _completion_text(response)
     async def annotation_window_payload(self, *, include_messages: bool = False,
                                         sp_module: Any = None) -> dict[str, Any]:
         """Which messages can still be labelled, and for how much longer.
@@ -686,7 +517,8 @@ class DynamicsLearningPlugin(Star):
         could not tell which batch it described.
         """
         config = self.runtime_config()
-        return attribution_report(
+        return await self._query_cache.compute(
+            ("attribution", config, examples), attribution_report,
             await self.load_samples(),
             min_messages=config.min_samples_for_evaluation,
             min_samples=config.min_samples_for_evaluation,
@@ -702,7 +534,8 @@ class DynamicsLearningPlugin(Star):
         cannot tell which batch it describes.
         """
         config = self.runtime_config()
-        result = evaluate_shadow(await self.load_samples(),
+        result = await self._query_cache.compute(("shadow", config), evaluate_shadow,
+                                 await self.load_samples(),
                                  rules=rules_from_config(config),
                                  min_samples=config.gate_min_samples)
         result["operational"] = await self.operational_shadow_payload()
@@ -721,13 +554,15 @@ class DynamicsLearningPlugin(Star):
             status = "ok" if payload is not None else "missing"
         except Exception as exc:
             logger.warning("[DynamicsLearning] telemetry read failed type=%s", type(exc).__name__)
-        result = evaluate_shadow_coverage(payload)
+        result = await asyncio.to_thread(evaluate_shadow_coverage, payload)
         result["source_status"] = status
         return result
 
     async def scopes_payload(self) -> dict[str, Any]:
         """Every reviewed scope, one row each, already ranked for the list view."""
-        return scope_profile.scopes_payload(await self.load_samples())
+        samples = await self.load_samples()
+        return await self._query_cache.compute(("scopes", self.runtime_config()),
+                                               scope_profile.scopes_payload, samples)
 
     async def scope_payload(self, identifier: str) -> dict[str, Any]:
         """One scope's review profile against the leave-one-out baseline.
@@ -737,7 +572,9 @@ class DynamicsLearningPlugin(Star):
         disagree with the report it is sitting next to.
         """
         digest = resolve_session_digest(identifier)
-        payload = scope_profile.scope_payload(await self.load_samples(), digest)
+        samples = await self.load_samples()
+        payload = await self._query_cache.compute(("scope", self.runtime_config(), digest),
+                                                  scope_profile.scope_payload, samples, digest)
         if payload is None:
             raise ValueError(f"数据集里没有作用域 {digest[:12]} 的样本")
         return payload
@@ -746,6 +583,10 @@ class DynamicsLearningPlugin(Star):
         return self.report_payload_sync()
 
     async def policies_payload(self) -> dict[str, Any]:
+        async with self._lock:
+            return await self._policies_payload_locked()
+
+    async def _policies_payload_locked(self) -> dict[str, Any]:
         policies = await self.store.load_policies()
         counts: dict[str, int] = {}
         for row in policies:
@@ -753,12 +594,17 @@ class DynamicsLearningPlugin(Star):
             counts[key] = counts.get(key, 0) + 1
         published = published_payload(policies)
         rows = policy_rows(policies)
+        revision = await self.store.policy_revision()
         # Which buttons a row may offer is a property of its *current* status,
         # and the store is the only thing that knows it. Deriving it here means
         # the page never renders an arrow the state machine would refuse — the
         # alternative is a 400 the reader has to read as a UI bug.
         for policy_row in rows:
+            policy_row["revision"] = revision
             policy_row["available_actions"] = available_actions(policy_row.get("status") or "")
+            if policy_row.get("evidence", {}).get("stale"):
+                policy_row["available_actions"] = [action for action in policy_row["available_actions"]
+                                                   if action in {"ignore", "rollback", "supersede"}]
         return {"total": len(policies), "rows": rows,
                 "actions": [{"action": action, "label": label}
                             for action, label in CONSOLE_ACTIONS],
@@ -770,7 +616,13 @@ class DynamicsLearningPlugin(Star):
                 "note": "策略记录只是建议与结论，不会改动 ChatDynamics 配置；"
                         "只有 promoted 的记录会出现在 /published。"}
 
-    async def update_policy(self, version: str, action: str) -> dict[str, Any]:
+    async def update_policy(self, version: str, action: str, *,
+                            expected_revision: str | None = None) -> dict[str, Any]:
+        async with self._lock:
+            return await self._update_policy_locked(version, action, expected_revision=expected_revision)
+
+    async def _update_policy_locked(self, version: str, action: str, *,
+                                    expected_revision: str | None = None) -> dict[str, Any]:
         """Move one policy record through the state machine.
 
         This writes a record inside this plugin and nothing else. The published
@@ -781,7 +633,8 @@ class DynamicsLearningPlugin(Star):
         if status is None:
             raise ValueError(f"未知操作 {action}；支持：{'/'.join(ACTIONS)}")
         updated = await self.store.update_policy_status(
-            version, status, reason=f"控制台操作 {action}")
+            version, status, reason=f"控制台操作 {action}",
+            expected_revision=expected_revision)
         if updated is None:
             raise ValueError(f"找不到策略版本 {version}")
         # The publish contract is materialised on every state change, so the
@@ -794,12 +647,13 @@ class DynamicsLearningPlugin(Star):
 
     async def _save_policy_offers(self) -> None:
         policies = await self.store.load_policies()
-        await self.store.save_published(published_payload(policies))
-        await self.store.save_candidate(candidate_payload(policies))
+        await self.store.save_policies(policies)
 
     async def candidate_payload(self) -> dict[str, Any]:
         """Read-only validated/shadow/promoted offers for shadow consumers."""
-        return candidate_payload(await self.store.load_policies())
+        async with self._lock:
+            return {**candidate_payload(await self.store.load_policies()),
+                    "revision": await self.store.policy_revision()}
 
     async def published_payload(self) -> dict[str, Any]:
         """The read-only offer for ChatDynamics: promoted policies only.
@@ -808,13 +662,18 @@ class DynamicsLearningPlugin(Star):
         the callers that change those records, never read back here, so a stale
         key can never be served as if it were current.
         """
-        return published_payload(await self.store.load_policies())
+        async with self._lock:
+            return {**published_payload(await self.store.load_policies()),
+                    "revision": await self.store.policy_revision()}
 
     async def export_payload(self) -> dict[str, Any]:
-        samples = await self.load_samples()
-        policies = await self.store.load_policies()
+        async with self._lock:
+            samples = await self.load_samples()
+            policies = await self.store.load_policies()
         return {
             "schema": "dynamics_learning_export_v1",
+            "purpose": "diagnostic",
+            "restorable": False,
             "exported_at": time.time(),
             "samples": [row.as_dict(include_trace=False) for row in samples],
             "published": published_payload(policies)["policies"],
@@ -826,6 +685,8 @@ class DynamicsLearningPlugin(Star):
 
     async def reset_storage(self) -> dict[str, Any]:
         async with self._lock:
+            await self.invalidate_reviews()
+            self._query_cache.invalidate()
             removed = await self.store.clear_samples()
             await self.store.save_policies([])
             await self.store.clear_published()

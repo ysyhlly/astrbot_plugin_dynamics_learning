@@ -199,6 +199,7 @@ function renderTuning(report) {
       <h3>${esc(TASK_LABEL[run.task] || run.task)} ·
         <span class="tag ${cls}">${esc(run.decision_label)}</span>
         ${run.high_confidence ? '<span class="tag ok">高置信度</span>' : ""}</h3>
+      <p class="hint">${esc(baselineDescription(run.candidate))}</p>
       <p class="rationale">${esc(run.stop_reason)}
         · 采纳 ${esc(run.adopted_steps)} 步 · 主指标 ${esc(run.primary_metric)}</p>
       <details><summary>查看调参规则与逐步记录</summary><div class="meta">
@@ -216,6 +217,17 @@ function renderTuning(report) {
   }).join("");
 }
 
+function baselineDescription(candidate) {
+  const target = (candidate || {}).target || {};
+  if (target.baseline_source === "host_effective" && target.baseline_verified === true) {
+    return "基线来自分析时读取的宿主有效配置；之后的在线配置变化需重新分析。";
+  }
+  if (target.baseline_source === "default_reference") {
+    return "基线为默认参考配置；未验证当前宿主有效配置，结果不代表在线配置的收益。";
+  }
+  return "基线来源未验证；请重新分析以确认参考配置与宿主的对应关系。";
+}
+
 function renderEvaluation(report) {
   const host = $("eval");
   const evaluation = report && report.evaluation;
@@ -227,7 +239,7 @@ function renderEvaluation(report) {
   const hasPromotion = Boolean(gate.verdict);
   const conclusion = hasPromotion ? gate : evaluation;
   const verdict = VERDICT_LABEL[conclusion.verdict] || { text: conclusion.verdict, cls: "" };
-  const head = `<div class="rec ${conclusion.verdict === "accepted" ? "actionable" : "diagnostic"}">
+  const head = `${report.stale ? '<p class="empty">数据已变化，此报告已过期，请重新运行分析。</p>' : ""}<p class="hint">${esc(baselineDescription(evaluation.candidate))}</p><div class="rec ${conclusion.verdict === "accepted" ? "actionable" : "diagnostic"}">
     <h3>${hasPromotion ? "综合采纳结论" : "会话留出评测"}：<span class="tag ${verdict.cls}">${esc(verdict.text || "未知")}</span></h3>
     <p class="rationale">${(conclusion.reasons || []).map(esc).join("<br />")}</p>
     <div class="meta">
@@ -257,7 +269,7 @@ function renderEvaluation(report) {
 
   const candidate = evaluation.candidate;
   const deltas = candidate && candidate.deltas && candidate.deltas.length
-    ? `<table><thead><tr><th>参数</th><th class="num">当前</th><th class="num">候选</th><th class="num">变化</th></tr></thead>
+    ? `<table><thead><tr><th>参数</th><th class="num">参考基线</th><th class="num">候选</th><th class="num">变化</th></tr></thead>
        <tbody>${candidate.deltas.map((row) => `<tr><td>${esc(row.label || row.param)}</td>
          <td class="num">${num(row.before)}</td><td class="num">${num(row.after)}</td>
          <td class="num">${row.delta == null ? "—" : (row.delta >= 0 ? "+" : "") + num(row.delta)}</td></tr>`).join("")}</tbody></table>`

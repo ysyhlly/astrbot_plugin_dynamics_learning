@@ -19,6 +19,7 @@ const POLICY_STATUS_CLASS = {
 function policyEvidence(row) {
   const holdout = row.holdout_result || {};
   const parts = [];
+  if ((row.evidence || {}).stale) parts.push("数据已变化，验证证据已过期，请重新分析");
   if (holdout.primary_metric) {
     const delta = holdout.cumulative_delta;
     parts.push("留出集 " + esc(holdout.primary_metric) + " "
@@ -64,7 +65,7 @@ function renderPolicies(data) {
           <p class="rationale">${policyEvidence(row)}</p>
           <h4>状态历史</h4>${history ? `<ol>${history}</ol>` : '<p class="empty">尚无状态变更记录。</p>'}
         </details>
-        <div class="actions">${actions.map((item) => `<button class="btn small" data-policy="${esc(row.version)}" data-action="${item.action}">${item.label}</button>`).join("") || '<span class="sub">当前没有可用操作</span>'}</div>
+        <div class="actions">${actions.map((item) => `<button class="btn small" data-policy="${esc(row.version)}" data-action="${item.action}"${row.revision == null ? "" : ` data-revision="${esc(row.revision)}"`}>${item.label}</button>`).join("") || '<span class="sub">当前没有可用操作</span>'}</div>
       </article>`;
     }).join("")}`;
 }

@@ -228,7 +228,7 @@ def test_the_gate_blocks_a_corpus_that_is_too_small():
     gate = dataset_gate(samples, config=LearningConfig(), now=time.time())
 
     assert gate["ok"] is False
-    assert set(gate["blocked_by"]) == {"samples", "sessions"}
+    assert set(gate["blocked_by"]) == {"samples", "sessions", "label_age"}
     assert any(row["status"] == GATE_BLOCK for row in gate["checks"])
 
 
@@ -315,12 +315,14 @@ def test_the_published_file_separates_the_three_versions():
 
     assert published["policy_contract_version"] == POLICY_CONTRACT_VERSION
     assert published["source"] == {
+        "metric_schema_version": None,
         "trace_schema_version": 3,
         "trace_schema_versions": {"2": 20, "3": 100},
         "dataset_fingerprint": "abc123",
         "learning_version": LEARNING_VERSION,
     }
     assert published["target"] == {
+        "baseline_source": "unknown", "baseline_verified": False,
         "chat_dynamics_version": "1.6.2",
         "baseline_config_hash": "deadbeef",
         "validated_host_versions": ["1.6.2"],

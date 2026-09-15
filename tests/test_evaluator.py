@@ -80,7 +80,7 @@ def test_the_learned_scorer_is_reported_but_never_gated():
 
 def test_an_unlearnable_batch_is_rejected_with_a_reason():
     samples = _recipient(annotated_sessions(sessions=16, per_session=18, biased=False))
-    report = evaluate_dataset(samples)
+    report = evaluate_dataset(samples, tasks=("recipient",))
     assert report.verdict in {VERDICT_REJECTED, VERDICT_INSUFFICIENT}
     assert report.reasons
     if report.verdict == VERDICT_REJECTED:
@@ -139,7 +139,7 @@ def test_the_candidate_is_bounded_even_when_the_sweep_wants_a_big_move():
 
 def test_a_batch_that_only_barely_moves_is_rejected_with_the_shortfall():
     samples = _recipient(strict_cut_sessions(sessions=24, per_session=20))
-    report = evaluate_dataset(samples)
+    report = evaluate_dataset(samples, tasks=("recipient",))
     assert report.verdict == VERDICT_REJECTED
     assert any("门槛" in reason or "回退" in reason for reason in report.reasons)
 

@@ -75,6 +75,8 @@ REASON_TOO_LARGE = "too_large"
 
 @dataclass
 class IngestResult:
+    confirmed_sessions: set[str] = field(default_factory=set)
+    partial_sessions: set[str] = field(default_factory=set)
     annotations: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
@@ -208,6 +210,8 @@ def parse_preferences(rows: Any) -> IngestResult:
         if session is None:
             unknown_sessions += 1
         session_key = session["session_key"] if session is not None else ""
+        if session_key and len(value) <= MAX_RECORDS_PER_SESSION and all(clean_record(row)[0] is not None for row in value):
+            result.confirmed_sessions.add(session_key)
         for row in value[:MAX_RECORDS_PER_SESSION]:
             # Counted before anything can drop it, so the accounting identity
             # covers every row the host actually stored.
@@ -260,6 +264,13 @@ def parse_export(payload: Any) -> IngestResult:
     """
     result = IngestResult()
     stats = RawContractStats(source="export")
+    if isinstance(payload, Mapping) and payload.get("schema") == "dynamics_learning_export_v1":
+        result.diagnostics = {"source": "export", "available": False, "error": "analysis export is not a restorable annotation backup", "records": 0}
+        return result
+    if isinstance(payload, Mapping) and "schema" in payload:
+        result.diagnostics = {"source": "export", "available": False,
+                              "error": "unsupported export schema", "records": 0}
+        return result
     rows: Sequence[Any]
     if isinstance(payload, Mapping):
         candidate = payload.get("sessions")
@@ -268,7 +279,7 @@ def parse_export(payload: Any) -> IngestResult:
         rows = payload
     else:
         result.contract = stats
-        result.diagnostics = {"source": "export", "records": 0, "malformed": 1,
+        result.diagnostics = {"source": "export", "available": False, "records": 0, "malformed": 1,
                               "balanced": stats.balanced,
                               "error": "unsupported export shape"}
         return result
@@ -283,6 +294,9 @@ def parse_export(payload: Any) -> IngestResult:
         session_key = row.get("session_key") or row.get("umo")
         records = row.get("records")
         if isinstance(session_key, str) and session_key and isinstance(records, list):
+            if len(records) <= MAX_RECORDS_PER_SESSION and all(clean_record(record)[0] is not None for record in records):
+                result.confirmed_sessions.add(session_key)
+            result.sessions.setdefault(session_key, {"session_key": session_key})
             stats.annotation_keys += 1
             stats.truncated += max(0, len(records) - MAX_RECORDS_PER_SESSION)
             for record in records[:MAX_RECORDS_PER_SESSION]:
@@ -306,12 +320,12 @@ def parse_export(payload: Any) -> IngestResult:
             if reason == REASON_TOO_LARGE:
                 stats.oversized += 1
             continue
+        result.partial_sessions.add(session_key)
         stats.observe_record(row)
         result.annotations.append((session_key, clean))
         used.append(session_key)
         stats.annotations_kept += 1
 
-    result.sessions = {}
     for session_key, _ in result.annotations:
         result.sessions.setdefault(session_key, {"session_key": session_key})
     stats.observe_sessions(result.sessions, used)
@@ -326,6 +340,8 @@ def parse_export(payload: Any) -> IngestResult:
         "malformed": stats.malformed,
         "balanced": stats.balanced,
     }
+    if not result.annotations and not result.confirmed_sessions:
+        result.diagnostics.update(available=False, error="export contains no usable records or confirmed sessions")
     return result
 
 
@@ -367,6 +383,8 @@ async def collect_from_host(source_plugin_id: str, *, sp_module: Any = None) -> 
 def merge_results(results: Iterable[IngestResult]) -> IngestResult:
     merged = IngestResult()
     for result in results:
+        merged.confirmed_sessions.update(result.confirmed_sessions)
+        merged.partial_sessions.update(result.partial_sessions)
         merged.annotations.extend(result.annotations)
         merged.sessions.update(result.sessions)
         merged.contract.merge(result.contract)

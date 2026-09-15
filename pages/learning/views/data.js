@@ -144,16 +144,23 @@ function humanCell(value) {
 function hostCell(row) {
   const level = row.host_level ? `<span class="tag">${esc(row.host_level)}</span>` : `<span class="sub">未记录</span>`;
   const outcome = row.outcome || {};
+  const stages = row.decision_stages || {};
+  const persona = stages.persona || {};
+  const gate = stages.gate || {};
+  const personaLabel = { ignore: "沉默", acknowledge: "简短回应", clarify: "澄清", reply: "回复", close: "收尾" };
+  const stageDetails = (persona.action ? `<div class="sub">角色决定：${esc(personaLabel[persona.action] || persona.action)}</div>` : "")
+    + (gate.allowed === false ? `<div class="sub">发送约束：未通过 ${esc(gate.reason_code || "")}</div>`
+      : gate.evaluated === true && gate.allowed === true ? `<div class="sub">发送约束：通过${gate.length_hint === "brief" ? "（短回应）" : ""}</div>` : "");
   const actual = row.outcome_recorded
     ? `<span class="tag ${outcome.delivered ? "ok" : "bad"}">${esc(outcome.value_label || outcome.value || "—")}</span>`
       + (outcome.suppression_reason ? `<div class="sub">${esc(outcome.suppression_reason)}</div>` : "")
     : `<span class="sub">结果未记录</span>`;
-  return `${level}<div class="sub">实际：${actual}</div>`;
+  return `${level}${stageDetails}<div class="sub">实际：${actual}</div>`;
 }
 
 function modelCell(row) {
   if (!row.decided) {
-    return `<span class="tag">未判断</span><div class="sub">${esc(row.model_reason || "模型没有给出布尔判断")}</div>`;
+    return `<span class="tag">未判断</span><div class="sub">${esc(row.model_reason || "正文、上下文或有效置信度不足")}</div>`;
   }
   // The reason is the only part of a judgement a reader can argue with, so it
   // sits next to the call rather than behind a tooltip.
@@ -175,7 +182,7 @@ function renderReplyReview(data) {
   const counts = review.counts || {};
   const rows = (review.rows || []).map((row) => `<tr>
       <td>${row.has_text ? esc(row.text) : `<span class="sub">（没有正文）</span>`}
-        <div class="sub">${esc(row.msg_id)}${row.mentions_bot ? " · 提到了机器人" : ""}</div></td>
+        <div class="sub">${esc(row.session)} · ${esc(row.msg_id)}${row.mentions_bot ? " · 提到了机器人" : ""}</div></td>
       <td>${humanCell(row.human_expected_reply)}</td>
       <td>${hostCell(row)}</td>
       <td>${modelCell(row)}</td>
@@ -186,8 +193,9 @@ function renderReplyReview(data) {
   host.innerHTML = `<div class="grid">
       ${statCard("模型判断", counts.decided ?? 0, `未判断 ${counts.undecided ?? 0} 条`)}
       ${statCard("与人工一致", `${counts.human_agree ?? 0}/${counts.with_human ?? 0}`, `不一致 ${counts.human_disagree ?? 0} 条`)}
-      ${statCard("模型认为漏回", counts.missed ?? 0, `认为多回 ${counts.over_replied ?? 0} 条`)}
+      ${statCard("未发送但模型倾向回应", counts.reply_preference ?? 0, `已发送但模型倾向不回 ${counts.over_replied ?? 0} 条`)}
     </div>
+    <p class="hint">模型意见不等于规则错误。门禁、角色选择、生成和发送需分别核查；未记录发送结果时仅对照规则准入。复盘结果不作为训练标签。</p>
     <p class="rationale">${esc(review.summary || "")}</p>
     <div class="table-host"><table><thead><tr>
       <th>消息</th><th>人工标注</th><th>本体 / 实际</th><th>模型判断</th><th>对照</th>

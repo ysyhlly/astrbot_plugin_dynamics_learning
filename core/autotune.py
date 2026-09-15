@@ -40,7 +40,7 @@ from typing import Any, Mapping, Sequence
 
 from .config import LearningConfig
 from .evaluator import (
-    GUARD_METRICS, PRIMARY_METRIC, evaluate_dataset, score_task, split_by_session,
+    GUARD_METRICS, PRIMARY_METRIC, evaluate_dataset, score_task, split_by_session, dataset_fingerprint, contract_compatibility, target_facts,
 )
 from .metrics import ErrorRate
 from .policy import (
@@ -475,7 +475,7 @@ def _finalise(run: TuneRun, samples: Sequence[LearningSample], config: LearningC
     """Attach a policy record when the run produced anything worth recording."""
     if run.final_policy is None:
         return run
-    if abs(sum(run.final_policy.values()) - sum(baseline.values())) < 1e-9:
+    if not drift_from(baseline, run.final_policy):
         return run
     # `validated`, never `promoted`: a tuning run proves a holdout improvement.
     # The shadow stage — publishing the policy beside live behaviour and watching
@@ -499,6 +499,9 @@ def _finalise(run: TuneRun, samples: Sequence[LearningSample], config: LearningC
         existing_versions=existing_versions, now=now,
     )
     run.candidate = candidate.with_fields(
+        training_dataset={"samples": len(samples), "fingerprint": dataset_fingerprint(samples)},
+        compatibility=contract_compatibility(samples),
+        target=target_facts(None, baseline),
         target_error=(last.target_error if last is not None else "") or "",
         collateral_regressions=tuple(
             name for name, row in ((last.collateral or {}).items() if last else ())

@@ -70,3 +70,13 @@ def test_retention_count_limit_and_empty_payload():
     empty = evaluate_shadow_coverage(snapshot([]), now=1000)
     assert empty["available"] is True
     assert empty["disagreement_rate"] is None
+
+
+def test_coverage_partitions_runs_and_baselines_and_rejects_invalid_identity():
+    rows = [observation("a", experiment_id="one", candidate_hash="c", baseline_hash="b"),
+            observation("b", experiment_id="two", candidate_hash="c", baseline_hash="b"),
+            observation("c", experiment_id="two", candidate_hash="c", baseline_hash="changed"),
+            observation("bad", experiment_id=[])]
+    report = evaluate_shadow_coverage(snapshot(rows), now=1000)
+    assert len(report["buckets"]) == 3
+    assert report["invalid"] == 1

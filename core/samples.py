@@ -56,7 +56,7 @@ from .trace import (
 # off the data instead of guessed from which fields happen to be present.
 # 3 splits `reply` into admission and outcome, and stores the schema 3 facts
 # (candidate evidence level, final outcome) unconditionally.
-SAMPLE_SCHEMA_VERSION = 3
+SAMPLE_SCHEMA_VERSION = 4
 
 TASK_RECIPIENT = "recipient"
 TASK_TOPIC = "topic"
@@ -91,6 +91,7 @@ MAX_TOPIC_CANDIDATES = candidates_module.MAX_CANDIDATES
 FACT_KEYS = (
     "outcome", "shadow", "topic_candidates", "topic_candidates_recorded", "candidate_evidence",
     "selected_topic", "source_schema", "contribution_total_recorded", "evidence_summary",
+    "decision_scope", "reply_supervision", "decision_stages",
 )
 
 
@@ -208,6 +209,11 @@ class LearningSample:
     scope_source: str = SCOPE_SOURCE_SESSION
     # Diagnostic provenance only; never an aggregation key. See `core/scope.py`.
     group_hint_hash: str = ""
+    # Independent clocks and label provenance; zero means unrecorded.
+    event_at: float = 0.0
+    ingested_at: float = 0.0
+    label_source: str = "unknown"
+    label_revision: str = ""
 
     def __post_init__(self) -> None:
         # The migration invariant: a sample constructed without an explicit
@@ -313,6 +319,24 @@ class LearningSample:
         return _legacy_contribution_total_recorded(self.trace)
 
     @property
+    def rule_reply_supervision_eligible(self) -> bool:
+        """Final behaviour is not a label for the rule threshold.
+
+        Old rows remain readable; recorded persona/gate/failure evidence still
+        excludes them even when written before the explicit boundary marker.
+        """
+        marker = self.trace.get("reply_supervision")
+        if isinstance(marker, Mapping):
+            return marker.get("eligible") is True
+        if self.features.get("ctx_mode_persona", 0.0) > 0:
+            return False
+        if self.trace.get("mode", "legacy") != "legacy":
+            return False
+        outcome = self.outcome
+        return not (outcome.recorded and not outcome.is_delivered
+                    and outcome.stage != STAGE_ADMISSION)
+
+    @property
     def selected_topic(self) -> str:
         value = self.trace.get("selected_topic") if isinstance(self.trace, Mapping) else None
         return value if isinstance(value, str) else self.predicted
@@ -332,6 +356,10 @@ class LearningSample:
             "source": self.source,
             "error_type": self.error_type,
             "annotated_at": self.annotated_at,
+            "event_at": self.event_at,
+            "ingested_at": self.ingested_at,
+            "label_source": self.label_source,
+            "label_revision": self.label_revision,
             "features": {key: float(value) for key, value in self.features.items()},
             "scope_hash": self.scope_hash or self.session_hash,
             "scope_source": self.scope_source,
@@ -385,6 +413,10 @@ class LearningSample:
             source=str(raw.get("source") or SOURCE_MANUAL_REPLAY)[:64],
             error_type=str(raw.get("error_type") or "unknown")[:64],
             annotated_at=_finite(raw.get("annotated_at")),
+            event_at=_finite(raw.get("event_at")),
+            ingested_at=_finite(raw.get("ingested_at")),
+            label_source=str(raw.get("label_source") or "unknown")[:64],
+            label_revision=str(raw.get("label_revision") or "")[:128],
             features=clean_features,
             trace=dict(trace) if isinstance(trace, Mapping) else {},
             scope_hash=scope_hash,
@@ -472,12 +504,43 @@ def samples_from_annotation(
         return []
     resolved = scope if scope is not None else resolve_scope(session_key)
     trace = trace_from_sample_record(record)
-    annotated_at = _finite(record.get("annotated_at"), now if now is not None else time.time())
+    annotated_at = _finite(record.get("annotated_at"))
+    ingested_at = now if now is not None else time.time()
+    label_source = str(record.get("label_source") or record.get("accepted_from") or "unknown")[:64]
     digest = session_hash(session_key)
     features = build_features(trace)
     score_recorded = _contribution_total_recorded(record)
     trace_payload = trace.to_contract() if config.store_raw_trace else {}
     summary = feature_summary(trace)
+    raw_trace = record.get("decision_trace")
+    raw_trace = raw_trace if isinstance(raw_trace, Mapping) else {}
+    review_context = raw_trace.get("review_context")
+    review_context = review_context if isinstance(review_context, Mapping) else {}
+    mode = review_context.get("decision_mode") or raw_trace.get("mode")
+    decision_scope = {"decision_mode": mode if isinstance(mode, str) else "unknown"}
+    # Retain declared identifiers only. No persona prompt or inferred identity.
+    raw_scope = raw_trace.get("decision_scope")
+    if isinstance(raw_scope, Mapping):
+        for key in ("persona_behavior_version", "participation_preferences_hash"):
+            value = raw_scope.get(key)
+            if isinstance(value, str) and value:
+                decision_scope[key] = value[:128]
+    for key in ("persona_fingerprint", "presence_knob", "interaction_state"):
+        value = review_context.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            decision_scope[key] = value[:128] if isinstance(value, str) else value
+    stages = raw_trace.get("decision_stages")
+    # Small stage evidence only; never retain arbitrary prompts or text.
+    decision_stages = {}
+    if isinstance(stages, Mapping):
+        for stage, keys in {"rule": ("level", "score"),
+                            "persona": ("action", "state", "length", "reason_code"),
+                            "gate": ("evaluated", "allowed", "reason_code", "length_hint")}.items():
+            block = stages.get(stage)
+            if isinstance(block, Mapping):
+                decision_stages[stage] = {key: value[:128] if isinstance(value, str) else value
+                                         for key in keys if isinstance(
+                                             value := block.get(key), (str, bool, int, float))}
     short_id = msg_id[:256]
     produced: list[LearningSample] = []
 
@@ -485,6 +548,9 @@ def samples_from_annotation(
              error_type: str, extra: Mapping[str, Any] | None = None) -> LearningSample:
         payload: dict[str, Any] = dict(trace_payload)
         payload["evidence_summary"] = summary
+        payload["decision_scope"] = decision_scope
+        if decision_stages:
+            payload["decision_stages"] = decision_stages
         # The next four are facts about the host's record, not part of the trace
         # snapshot, so every sample of a message carries them: the attribution
         # chain reads a message through whichever of its samples exist, and a
@@ -515,6 +581,10 @@ def samples_from_annotation(
             source=SOURCE_MANUAL_REPLAY,
             error_type=error_type,
             annotated_at=annotated_at,
+            event_at=_finite(record.get("event_at")),
+            ingested_at=ingested_at,
+            label_source=label_source,
+            label_revision=str(record.get("label_revision") or "")[:128],
             features=dict(features),
             trace=payload,
             scope_hash=resolved.scope_hash,
@@ -566,16 +636,32 @@ def samples_from_annotation(
     # no admission sample instead; the count travels on the contract plane
     # (`admission_undecided`) so the corpus never shrinks silently.
     expected_reply = record.get("expected_reply")
-    if isinstance(expected_reply, bool) and trace.admission_recorded:
+    expected_rule_reply = record.get("expected_rule_reply")
+    rule_label_explicit = isinstance(expected_rule_reply, bool)
+    rule_expected = expected_rule_reply if rule_label_explicit else expected_reply
+    downstream = (trace.outcome.recorded and not trace.outcome.is_delivered
+                  and trace.outcome.stage != STAGE_ADMISSION)
+    eligible = rule_label_explicit or (mode == "legacy" and not downstream)
+    supervision = {
+        "eligible": eligible,
+        "label_stage": "rule" if rule_label_explicit else "legacy_reply",
+        "reason": ("explicit_rule_label" if rule_label_explicit else
+                   "non_rule_outcome" if downstream else
+                   "legacy_admission_contract" if mode == "legacy" else
+                   "persona_or_unknown_decision_mode"),
+    }
+    if isinstance(rule_expected, bool) and trace.admission_recorded:
         predicted_reply = REPLY if (trace.participation_level == "strong"
                                     or (trace.is_explicit and trace.bot_targeted)) else SILENT
-        expected_reply_label = REPLY if expected_reply else SILENT
+        expected_reply_label = REPLY if rule_expected else SILENT
         produced.append(make(
             TASK_REPLY_ADMISSION, predicted_reply, expected_reply_label,
             float(trace.participation_score or 0.0),
             _error_label(None, predicted_reply, expected_reply_label,
                          missed="missed_reply", false_positive="premature_reply",
-                         wrong="wrong_reply"),
+                         wrong="wrong_reply") if eligible or predicted_reply == expected_reply_label
+            else buckets.UNATTRIBUTABLE,
+            {"reply_supervision": supervision},
         ))
 
     # --- reply outcome ---------------------------------------------------

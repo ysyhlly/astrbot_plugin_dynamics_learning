@@ -283,10 +283,14 @@ class LearningWebAPI:
             return _json_err("需要 version")
         if not isinstance(action, str) or action not in _ALLOWED_ACTIONS:
             return _json_err("action 只支持 " + "/".join(_ALLOWED_ACTIONS))
+        revision = body.get("expected_revision")
+        if revision is not None and not isinstance(revision, str):
+            return _json_err("expected_revision 必须是字符串")
         try:
-            return _json_ok(await self.plugin.update_policy(version.strip(), action))
+            return _json_ok(await self.plugin.update_policy(
+                version.strip(), action, expected_revision=revision))
         except ValueError as exc:
-            return _json_err(str(exc), 404)
+            return _json_err(str(exc), 409 if "revision conflict" in str(exc) else 400)
         except Exception as exc:
             logger.error("[DynamicsLearning] policy failed type=%s", type(exc).__name__)
             return _json_err("更新策略记录失败", 500)

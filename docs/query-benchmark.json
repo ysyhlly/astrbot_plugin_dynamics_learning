@@ -1,0 +1,449 @@
+{
+  "generated_at_utc": "2026-09-15T15:51:02Z",
+  "environment": {
+    "python": "3.10.8 (tags/v3.10.8:aaaf517, Oct 11 2022, 16:50:30) [MSC v.1933 64 bit (AMD64)]",
+    "platform": "Windows-10-10.0.26200-SP0",
+    "processor": ""
+  },
+  "source_sha256": {
+    "main.py": "ce226b5e771dd57d994d74a66a3204d31d4b445bf618787af8cb145e1acbd0ce",
+    "core/query_cache.py": "cc80ffabc384353493d6d926d4dc8c931e26f71abb5c2a1561c815695ef5bf76",
+    "core/quality.py": "0dbed287999cdbeeb78b3dbf8614aca7e63ee00c04adfc628ca9448ac6280020",
+    "core/attribution.py": "21ba58b862ddfc68dcfde1f0007a0568863addf584680deae303379e8181e7bb",
+    "core/scope_profile.py": "13567e8537fc0f5ec7781124569039713503289c927c004fb10c8286d3102d7e",
+    "core/shadow.py": "dc6d47b778fd57118fa4a925f7914c97366550295bd77a4bcd0e9f7ad990004c"
+  },
+  "method": {
+    "sdk": "explicit test double",
+    "storage": "in-memory SDK KV with put/delete counters",
+    "sample_plane": "preloaded plugin._samples; excludes ingest, disk load and HTTP/JSON serialization",
+    "synthetic_shadow": "complete synthetic identity and comparisons; not real host evidence",
+    "sizes": "1000, default limit 5000, stress 10000 (preloaded beyond default ingestion cap)",
+    "cold": "invalidate QueryCache before each endpoint; one run",
+    "warm": "three immediate calls to same endpoint; defaults and 30-second cache TTL",
+    "event_loop": "5ms asyncio heartbeat lateness; includes timer/GIL/scheduler noise; short calls have only one observation",
+    "scope": "actual quality/attribution/scopes/shadow plugin methods; no old-version comparison",
+    "operational_shadow": "unavailable SDK host telemetry deliberately exercises degraded path"
+  },
+  "idle_heartbeat_baseline": {
+    "elapsed_ms": 84.53,
+    "event_loop_max_lateness_ms": 11.336,
+    "heartbeat_observations": 8
+  },
+  "results": [
+    {
+      "samples": 1000,
+      "sessions": 31,
+      "tasks": {
+        "recipient": 334,
+        "reply_admission": 333,
+        "topic": 333
+      },
+      "configured_default_max_samples": 5000,
+      "queries": {
+        "quality": {
+          "cold": {
+            "elapsed_ms": 62.207,
+            "event_loop_max_lateness_ms": 29.216,
+            "heartbeat_observations": 6,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 0.352,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.276,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.39,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 0.352,
+          "payload_json_bytes": 7460
+        },
+        "attribution": {
+          "cold": {
+            "elapsed_ms": 18.112,
+            "event_loop_max_lateness_ms": 11.337,
+            "heartbeat_observations": 4,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 0.313,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.281,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.295,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 0.295,
+          "payload_json_bytes": 8453
+        },
+        "scopes": {
+          "cold": {
+            "elapsed_ms": 24.281,
+            "event_loop_max_lateness_ms": 8.365,
+            "heartbeat_observations": 4,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 0.428,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.423,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.426,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 0.426,
+          "payload_json_bytes": 12106
+        },
+        "shadow": {
+          "cold": {
+            "elapsed_ms": 129.941,
+            "event_loop_max_lateness_ms": 27.431,
+            "heartbeat_observations": 8,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 1.81,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 2,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 1.844,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 2,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 1.912,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 2,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 1.844,
+          "payload_json_bytes": 21482,
+          "operational_source_status": "unavailable",
+          "labelled_shadow_rows": 334
+        }
+      },
+      "storage_writes_total": {
+        "put": 0,
+        "delete": 0
+      }
+    },
+    {
+      "samples": 5000,
+      "sessions": 32,
+      "tasks": {
+        "recipient": 1667,
+        "reply_admission": 1667,
+        "topic": 1666
+      },
+      "configured_default_max_samples": 5000,
+      "queries": {
+        "quality": {
+          "cold": {
+            "elapsed_ms": 196.129,
+            "event_loop_max_lateness_ms": 34.3,
+            "heartbeat_observations": 11,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 0.523,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.45,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.571,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 0.523,
+          "payload_json_bytes": 7491
+        },
+        "attribution": {
+          "cold": {
+            "elapsed_ms": 98.436,
+            "event_loop_max_lateness_ms": 33.212,
+            "heartbeat_observations": 6,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 0.365,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.281,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.266,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 0.281,
+          "payload_json_bytes": 8472
+        },
+        "scopes": {
+          "cold": {
+            "elapsed_ms": 88.503,
+            "event_loop_max_lateness_ms": 27.28,
+            "heartbeat_observations": 6,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 0.41,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.474,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.395,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 0.41,
+          "payload_json_bytes": 12553
+        },
+        "shadow": {
+          "cold": {
+            "elapsed_ms": 172.721,
+            "event_loop_max_lateness_ms": 42.809,
+            "heartbeat_observations": 9,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 1.076,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 2,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 1.147,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 2,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 1.096,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 2,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 1.096,
+          "payload_json_bytes": 30504,
+          "operational_source_status": "unavailable",
+          "labelled_shadow_rows": 1667
+        }
+      },
+      "storage_writes_total": {
+        "put": 0,
+        "delete": 0
+      }
+    },
+    {
+      "samples": 10000,
+      "sessions": 32,
+      "tasks": {
+        "recipient": 3334,
+        "reply_admission": 3333,
+        "topic": 3333
+      },
+      "configured_default_max_samples": 5000,
+      "queries": {
+        "quality": {
+          "cold": {
+            "elapsed_ms": 563.282,
+            "event_loop_max_lateness_ms": 88.132,
+            "heartbeat_observations": 21,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 0.465,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.328,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.445,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 0.445,
+          "payload_json_bytes": 7503
+        },
+        "attribution": {
+          "cold": {
+            "elapsed_ms": 211.199,
+            "event_loop_max_lateness_ms": 55.901,
+            "heartbeat_observations": 8,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 0.569,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.482,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.507,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 0.507,
+          "payload_json_bytes": 8472
+        },
+        "scopes": {
+          "cold": {
+            "elapsed_ms": 248.687,
+            "event_loop_max_lateness_ms": 27.022,
+            "heartbeat_observations": 11,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 0.665,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.649,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 0.632,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 1,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 0.649,
+          "payload_json_bytes": 12534
+        },
+        "shadow": {
+          "cold": {
+            "elapsed_ms": 298.306,
+            "event_loop_max_lateness_ms": 40.987,
+            "heartbeat_observations": 13,
+            "storage_writes": 0
+          },
+          "warm_runs": [
+            {
+              "elapsed_ms": 1.09,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 2,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 1.568,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 2,
+              "storage_writes": 0
+            },
+            {
+              "elapsed_ms": 1.025,
+              "event_loop_max_lateness_ms": 0.0,
+              "heartbeat_observations": 2,
+              "storage_writes": 0
+            }
+          ],
+          "warm_median_ms": 1.09,
+          "payload_json_bytes": 30538,
+          "operational_source_status": "unavailable",
+          "labelled_shadow_rows": 3334
+        }
+      },
+      "storage_writes_total": {
+        "put": 0,
+        "delete": 0
+      }
+    }
+  ]
+}

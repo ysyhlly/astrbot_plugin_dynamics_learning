@@ -304,7 +304,7 @@ def test_the_whole_loop_from_a_host_trace_to_a_resolved_policy():
     from astrbot_plugin_dynamics_learning.core.samples import build_dataset
 
     # 1. ChatDynamics 生成真实 trace
-    rows = _host_built_sessions()
+    rows = _host_built_sessions(start=1000.0)
     samples = build_dataset(rows)
     assert samples
     assert {sample.trace["trace_schema_version"] for sample in samples} == {3}

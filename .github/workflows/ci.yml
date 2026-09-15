@@ -38,3 +38,26 @@ jobs:
       - run: node tests/frontend_regression.cjs
       - run: python scripts/check_release.py
       - run: python scripts/build_release.py
+
+  released-host-contract:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: astrbot_plugin_dynamics_learning
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: astrbot_plugin_dynamics_learning
+      - uses: actions/checkout@v4
+        with:
+          repository: ysyhlly/astrbot_plugin_chat_dynamics
+          ref: 8b31139dbb3341ff789eee7f6ed232abb5e2b876 # v1.8.0
+          path: astrbot_plugin_chat_dynamics
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Verify unmodified released host is importable
+        run: PYTHONPATH=.. python -c "import astrbot_plugin_chat_dynamics.core.routing_trace; import astrbot_plugin_chat_dynamics.core.learning_policy"
+      - name: Cross-repository contracts against released host (no patch)
+        run: python -m pytest -q tests/test_cross_repo_contract.py tests/test_candidate_cross_repo.py

@@ -24,15 +24,17 @@ accuracy claim.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Sequence
 
 from .bootstrap import METRICS, Unit, bootstrap_delta, human_interval
 from .config import LearningConfig
 from .features import FEATURE_NAMES, vector
+from .evaluation_plan import evaluation_plan
 from .logistic import LogisticModel, fit, sweep_threshold
 from .metrics import (
-    ErrorRate, binary_counts, binary_error_rates, binary_report, compare_error_rates,
+    METRIC_SCHEMA_VERSION, ErrorRate, binary_counts, binary_error_rates, binary_report, compare_error_rates,
     rounded, topic_pair_metrics,
 )
 from .policy import (
@@ -146,11 +148,16 @@ def split_by_time(samples: Sequence[LearningSample], *, ratio: float) -> Split:
     """
     ordered = sorted(samples, key=lambda item: (item.timestamp, item.session_hash,
                                                 item.msg_id, item.task))
+    # Undated rows cannot establish a temporal ordering. Keep them available
+    # for training, but never manufacture a forward holdout from hash order.
+    if not any(item.timestamp > 0 for item in ordered):
+        return Split(train=tuple(ordered), holdout=())
     if len(ordered) < 2:
         return Split(train=tuple(ordered), holdout=())
     clamped = max(0.05, min(0.9, float(ratio)))
     cut = int(round(len(ordered) * (1.0 - clamped)))
     cut = max(1, min(len(ordered) - 1, cut))
+    cut = max(cut, sum(item.timestamp <= 0 for item in ordered))
     return Split(train=tuple(ordered[:cut]), holdout=tuple(ordered[cut:]))
 
 
@@ -220,6 +227,8 @@ def _decision(sample: LearningSample, policy: Mapping[str, float],
 
 def _unreplayable(sample: LearningSample) -> bool:
     """Exclude missing scores/context; explicit decisions need neither."""
+    if sample.task == TASK_REPLY_ADMISSION and not sample.rule_reply_supervision_eligible:
+        return True
     if sample.features.get("ctx_explicit", 0.0) >= 0.5:
         return False
     return (not sample.contribution_total_recorded
@@ -383,6 +392,9 @@ class TaskEvaluation:
 
 @dataclass
 class EvaluationReport:
+    metric_schema_version: int = METRIC_SCHEMA_VERSION
+    plan: dict[str, Any] = field(default_factory=dict)
+    baseline_reproduction: dict[str, Any] = field(default_factory=dict)
     verdict: str = VERDICT_INSUFFICIENT
     reasons: list[str] = field(default_factory=list)
     split: dict[str, Any] = field(default_factory=dict)
@@ -399,6 +411,8 @@ class EvaluationReport:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "metric_schema_version": self.metric_schema_version, "evaluation_plan": dict(self.plan),
+            "baseline_reproduction": dict(self.baseline_reproduction),
             "verdict": self.verdict, "reasons": list(self.reasons), "split": dict(self.split),
             "tasks": {name: row.as_dict() for name, row in self.tasks.items()},
             "candidate": self.candidate.as_dict() if self.candidate else None,
@@ -766,7 +780,8 @@ def evaluate_dataset(
 
     counts = {task: sum(1 for sample in samples if sample.task == task) for task in PRIMARY_METRIC}
     report.dataset = {"samples": len(samples), "tasks": counts,
-                      "sessions": len({sample.session_hash for sample in samples})}
+                      "sessions": len({sample.session_hash for sample in samples}),
+                      "fingerprint": dataset_fingerprint(samples)}
     if not samples:
         report.reasons.append("没有学习样本；先在控制台执行一次导入。")
         return report
@@ -805,12 +820,20 @@ def evaluate_dataset(
     moved = {name: value for name, value in changes.items()
              if abs(value - baseline.get(name, value)) > 1e-9}
     report.target_error = target_error_for(moved, baseline)
+    final_params = normalize_policy({**baseline, **moved})
+    report.plan = evaluation_plan(final_params, baseline).as_dict()
+    # Builders may propose independently; all reported evidence must score the
+    # same merged parameters, including tasks forbidden from proposing changes.
+    for task, evaluation in report.tasks.items():
+        _fill(evaluation, task, [row for row in split.holdout if row.task == task],
+              baseline, final_params, target_error=report.target_error, config=config)
     if moved:
         candidate = candidate_from(moved, baseline=baseline,
                                    source="offline_evaluation",
                                    rationale="离线回放在留出集上选出的参数",
-                                   evidence={name: row.as_dict()
-                                             for name, row in report.tasks.items()},
+                                   evidence={"metric_schema_version": METRIC_SCHEMA_VERSION,
+                                             **{name: row.as_dict()
+                                                for name, row in report.tasks.items()}},
                                    existing_versions=existing_versions, now=now)
         report.candidate = candidate.with_fields(
             status=STATUS_PROPOSED,
@@ -829,6 +852,77 @@ def evaluate_dataset(
     return report
 
 
+def dataset_fingerprint(samples: Sequence[LearningSample]) -> str:
+    """Order-independent digest of complete persisted learning inputs."""
+    rows = []
+    for row in samples:
+        payload = row.as_dict(include_trace=True)
+        payload.pop("ingested_at", None)
+        rows.append(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                               separators=(",", ":"), allow_nan=False))
+    return hashlib.sha256(json.dumps(sorted(rows), ensure_ascii=False,
+                                    separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def validate_frozen(candidate: PolicyCandidate, samples: Sequence[LearningSample], *,
+                    split: Split, kind: str, config: LearningConfig,
+                    now: float | None = None) -> EvaluationReport:
+    """Score fixed parameters without fitting or selecting on the final holdout."""
+    baseline = normalize_policy(candidate.baseline)
+    params = normalize_policy(candidate.params)
+    report = EvaluationReport(baseline_params=baseline, candidate=candidate)
+    identity = {"metric_schema_version": METRIC_SCHEMA_VERSION, "candidate_hash": baseline_config_hash(params),
+                "baseline_hash": baseline_config_hash(baseline),
+                "dataset_fingerprint": dataset_fingerprint(samples)}
+    report.dataset = {"samples": len(samples),
+                      "sessions": len({s.session_hash for s in samples}),
+                      "fingerprint": identity["dataset_fingerprint"]}
+    report.split = {**split.as_dict(), "kind": kind, **identity,
+                    "train_fingerprint": dataset_fingerprint(split.train),
+                    "holdout_fingerprint": dataset_fingerprint(split.holdout)}
+    report.target_error = target_error_for(params, baseline)
+    report.plan = evaluation_plan(params, baseline).as_dict()
+    report.baseline_reproduction = baseline_reproduction(split.holdout, baseline)
+    for task in (TASK_RECIPIENT, TASK_TOPIC, TASK_REPLY_ADMISSION):
+        if not any(row.task == task for row in samples):
+            continue
+        rows = [row for row in split.holdout if row.task == task]
+        evaluation = TaskEvaluation(task=task, train=sum(row.task == task for row in split.train),
+                                    holdout=len(rows), primary_metric=PRIMARY_METRIC[task])
+        _fill(evaluation, task, rows, baseline, params,
+              target_error=report.target_error, config=config)
+        report.tasks[task] = evaluation
+    _verdict(report, config, now=now)
+    return report
+
+
+def baseline_reproduction(samples: Sequence[LearningSample],
+                          baseline: Mapping[str, float]) -> dict[str, Any]:
+    """Diagnostic agreement with recorded decisions, not with human labels.
+
+    A difference can reflect a changed live baseline as well as a replay gap;
+    it is evidence for investigation, not automatic proof of incompatibility.
+    """
+    counts = {}
+    for task in (TASK_RECIPIENT, TASK_REPLY_ADMISSION):
+        rows = [row for row in samples if row.task == task]
+        checked = mismatched = excluded = 0
+        for row in rows:
+            if _unreplayable(row):
+                excluded += 1
+                continue
+            decision = _decision(row, baseline, None)
+            predicted = decision.recipient_label if task == TASK_RECIPIENT else decision.reply_label
+            checked += 1
+            mismatched += predicted != row.predicted
+        counts[task] = {"checked": checked, "mismatched": mismatched, "excluded": excluded}
+    return {"tasks": counts, "diagnostic_only": True,
+            "capability": "Recorded-trace recipient and admission labels only; no host execution, "
+                          "topic retrieval, generation or delivery replay.",
+            "interpretation": "Mismatches may reflect baseline configuration drift or replay gaps; "
+                              "they do not establish host incompatibility on their own."}
+
+
 def dataset_record(dataset: Mapping[str, Any]) -> dict[str, Any]:
     """A fingerprint of the corpus a policy was fitted on.
 
@@ -843,14 +937,18 @@ def dataset_record(dataset: Mapping[str, Any]) -> dict[str, Any]:
         "sessions": int(dataset.get("sessions") or 0),
         "tasks": tasks,
     }
-    digest = hashlib.sha256(repr(sorted(payload.items())).encode("utf-8")).hexdigest()[:16]
+    digest = str(dataset.get("fingerprint") or "")
     return {**payload, "fingerprint": digest}
 
 
 def holdout_record(report: EvaluationReport) -> dict[str, Any]:
     """The per-task holdout numbers, in the shape a policy record keeps."""
     return {
+        "metric_schema_version": report.metric_schema_version,
+        "evaluation_plan": dict(report.plan),
+        "baseline_reproduction": dict(report.baseline_reproduction),
         "split": dict(report.split),
+        "verdict": report.verdict,
         "tasks": {
             task: {
                 "holdout": row.holdout,
@@ -896,12 +994,21 @@ def contract_compatibility(samples: Sequence[LearningSample]) -> dict[str, Any]:
         if sample.outcome.recorded:
             outcomes += 1
     return {
+        "metric_schema_version": METRIC_SCHEMA_VERSION,
         "trace_schema_version": highest or None,
         "trace_schema_versions": dict(sorted(schemas.items())),
         "sample_schema_version": SAMPLE_SCHEMA_VERSION,
         "candidate_evidence": dict(sorted(evidence.items())),
         "outcome_recorded": outcomes,
         "parameter_specs": list(PARAM_NAMES),
+        "decision_modes": sorted({str(sample.trace.get("decision_scope", {}).get(
+            "decision_mode", "unknown")) for sample in samples
+            if isinstance(sample.trace.get("decision_scope", {}), Mapping)}),
+        "reply_rule_excluded": sum(sample.task == TASK_REPLY_ADMISSION
+                                   and not sample.rule_reply_supervision_eligible
+                                   for sample in samples),
+        "behavior_contract": "rule_thresholds_only_v1",
+        "persona_behavior_validated": False,
     }
 
 
@@ -1039,6 +1146,18 @@ def promotion_check(session: EvaluationReport | None,
     if session is None:
         check.reasons.append("没有会话留出集评测结果，无法下结论。")
         return check
+    if session.metric_schema_version != METRIC_SCHEMA_VERSION or (
+            forward is not None and forward.metric_schema_version != METRIC_SCHEMA_VERSION):
+        check.verdict = VERDICT_REJECTED
+        check.reasons.append("指标版本不一致，需要重新验证。")
+        return check
+    if forward is not None:
+        for key in ("candidate_hash", "baseline_hash", "dataset_fingerprint"):
+            left, right = session.split.get(key), forward.split.get(key)
+            if (left or right) and left != right:
+                check.verdict = VERDICT_REJECTED
+                check.reasons.append("验证身份不一致：" + key)
+                return check
     if config.require_forward_validation:
         if forward is None or forward.verdict == VERDICT_INSUFFICIENT:
             check.reasons.append("没有可用的前向验证：只有会话留出集通过的候选不下结论。")
@@ -1084,6 +1203,8 @@ def guard_failures(report: EvaluationReport, *, max_regression: float) -> list[s
     """Names of the guard metrics that regressed beyond the allowance."""
     failures: list[str] = []
     for row in report.tasks.values():
+        if report.plan and row.task not in report.plan["affected_tasks"]:
+            continue
         for name in GUARD_METRICS.get(row.task, ()):
             delta = row.deltas.get(name)
             value = delta.get("delta") if isinstance(delta, Mapping) else None
@@ -1093,7 +1214,13 @@ def guard_failures(report: EvaluationReport, *, max_regression: float) -> list[s
 
 
 def primary_task(report: EvaluationReport) -> TaskEvaluation | None:
-    return (report.tasks.get(TASK_RECIPIENT) or report.tasks.get(TASK_TOPIC)
+    if report.plan:
+        # Freeze objective order from parameter changes before seeing holdout
+        # scores; choosing the largest measured delta would select on test data.
+        return next((report.tasks[name] for name in report.plan["target_tasks"]
+                     if name in report.tasks), None)
+    return (report.tasks.get(str(report.split.get("primary_task", "")))
+            or report.tasks.get(TASK_RECIPIENT) or report.tasks.get(TASK_TOPIC)
             or (next(iter(report.tasks.values())) if report.tasks else None))
 
 
@@ -1106,7 +1233,15 @@ def _verdict(report: EvaluationReport, config: LearningConfig,
     records. A verdict that embedded a wall-clock timestamp would make the
     reproducibility test — and any fingerprint built on it — meaningless.
     """
-    evaluated = list(report.tasks.values())
+    if report.plan:
+        missing = set(report.plan["affected_tasks"]) - set(report.tasks)
+        if missing or report.plan["unsupported_params"] or not report.plan["target_tasks"]:
+            report.verdict = VERDICT_INSUFFICIENT
+            report.reasons.append("候选无法完整验证：缺失受影响任务 " + ", ".join(sorted(missing))
+                                  + "；未覆盖参数 " + ", ".join(report.plan["unsupported_params"]))
+            return
+    evaluated = [row for row in report.tasks.values()
+                 if not report.plan or row.task in report.plan["affected_tasks"]]
     underpowered = [row for row in evaluated if max(0, row.holdout - row.unreplayable)
                     < config.min_samples_for_evaluation]
     if underpowered:
@@ -1147,6 +1282,7 @@ def _verdict(report: EvaluationReport, config: LearningConfig,
             # written through a replacement rather than mutated in place.
             evidence = dict(report.candidate.evidence)
             evidence["verdict"] = VERDICT_ACCEPTED
+            evidence["metric_schema_version"] = METRIC_SCHEMA_VERSION
             # `validated`, not `promoted`: the evaluator can prove an offline
             # improvement and nothing else. Promotion is a separate step that
             # requires the shadow observation this plugin cannot perform.
@@ -1175,7 +1311,7 @@ __all__ = [
     "REPORTED_METRICS", "SPLIT_NOTE", "TIME_SPLIT_NOTE", "PromotionCheck", "Split",
     "TASK_ERROR_KINDS", "TaskEvaluation", "TaskScore", "VERDICT_ACCEPTED", "VERDICT_INSUFFICIENT",
     "VERDICT_REJECTED", "EvaluationReport", "contract_compatibility", "dataset_record",
-    "evaluate_dataset", "evaluation_fingerprint", "forward_evaluation", "group_diagnostics",
+    "dataset_fingerprint", "validate_frozen", "evaluate_dataset", "evaluation_fingerprint", "forward_evaluation", "group_diagnostics",
     "guard_failures", "holdout_record", "outcome_layer", "primary_task", "promotion_check",
     "score_outcome", "score_task", "split_by_session", "split_by_time", "target_facts",
 ]

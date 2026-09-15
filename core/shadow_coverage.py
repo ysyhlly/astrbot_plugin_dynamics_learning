@@ -74,6 +74,10 @@ def evaluate_shadow_coverage(payload: Any, *, now: float | None = None) -> dict[
         ):
             result["invalid"] += 1
             continue
+        if any(key in row and (not isinstance(row[key], str) or len(row[key]) > 256)
+               for key in ("experiment_id", "candidate_hash", "baseline_hash")):
+            result["invalid"] += 1
+            continue
         if (
             row.get("reason") not in ("structural", "early_return", "ambient")
             or not all(type(row.get(k)) is bool for k in ("baseline_reply", "shadow_reply", "changed"))
@@ -108,7 +112,7 @@ def evaluate_shadow_coverage(payload: Any, *, now: float | None = None) -> dict[
         groups: dict[Any, list[Mapping[str, Any]]] = {}
         for row in rows:
             key = (
-                (row["policy_id"], row["host_version"])
+                tuple(row.get(name, "") for name in ("policy_id", "host_version", "experiment_id", "candidate_hash", "baseline_hash"))
                 if field == "bucket"
                 else datetime.fromtimestamp(row["recorded_at"], timezone.utc).strftime("%Y-%m-%dT%H:00Z")
                 if field == "hour"
@@ -116,7 +120,7 @@ def evaluate_shadow_coverage(payload: Any, *, now: float | None = None) -> dict[
             )
             groups.setdefault(key, []).append(row)
         result[output] = [
-            ({"policy_id": key[0], "host_version": key[1]} if field == "bucket" else {"key": key}) | _counts(group)
+            (dict(zip(("policy_id", "host_version", "experiment_id", "candidate_hash", "baseline_hash"), key)) if field == "bucket" else {"key": key}) | _counts(group)
             for key, group in sorted(groups.items())
         ]
     return result
