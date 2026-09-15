@@ -1,207 +1,60 @@
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="light dark" />
-    <title>Dynamics Learning</title>
-    <!-- AstrBot rewrites this URL with the page asset token. Loading it here,
-         rather than relying on the copy injected before </body>, is what makes
-         window.AstrBotPluginPage exist before app.js runs. -->
-    <script src="/api/plugin/page/bridge-sdk.js"></script>
-    <link rel="stylesheet" href="./style.css" />
-  </head>
-  <body>
-    <noscript>
-      <p class="notice error">
-        这个页面完全由 JavaScript 渲染：脚本被拦截或加载失败时，下面只会是一片空卡片。
-        请允许本页运行脚本，然后从 AstrBot 面板的插件页入口重新打开。
-      </p>
-    </noscript>
-    <a class="skip-link" href="#main">跳到主内容</a>
-    <div class="wrap">
-      <header class="bar">
-        <div class="brand">
-          <h1>Dynamics Learning</h1>
-          <p class="sub">ChatDynamics 的行为学习层 · 只读 · 只建议</p>
-        </div>
-        <div class="bar-actions">
-          <span id="linkLamp" class="lamp" aria-hidden="true"></span>
-          <span id="linkLabel" class="lamp-label">未连接</span>
-          <button id="btnRefresh" type="button" class="btn">刷新</button>
-          <button id="btnIngest" type="button" class="btn">导入标注</button>
-          <button id="btnAnalyze" type="button" class="btn primary">运行分析</button>
-          <button id="btnExport" type="button" class="btn">导出 JSON</button>
-        </div>
-      </header>
-
-      <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
-
-      <nav class="tabs" role="tablist" aria-label="视图">
-        <button type="button" class="tab active" id="tab-overview" role="tab"
-                data-view-btn="overview" aria-selected="true" aria-controls="panel-overview">总览</button>
-        <button type="button" class="tab" id="tab-scopes" role="tab"
-                data-view-btn="scopes" aria-selected="false" aria-controls="panel-scopes">会话画像</button>
-      </nav>
-
-      <main id="main">
-        <div id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" tabindex="-1">
-        <section class="card" data-view="overview" aria-labelledby="hQuality">
-          <h2 id="hQuality">数据契约状态</h2>
-          <p class="hint">
-            每一行是学习层真正要用的一项能力，以及这批数据能不能支撑它。
-            这张表由本插件确定性计算；下面「数据门槛」决定这批数据能不能出策略，它不会被折叠。
-            覆盖率低不代表系统差，代表记录里没有可以判断的证据；
-            「不支持」是结论，不是错误。
-            这张表由模型解读：它读的是本插件算出的计数与判定，只能引用摘要里出现过的数字，
-            越界的数字会单独标出；模型不可用时自动回落到本插件自己的判定。
-          </p>
-          <div id="review" class="stack"></div>
-          <!-- The pre-learning gate is deliberately *outside* the <details>
-               below. It answers "will this batch produce a policy at all", and
-               it used to be folded away the moment the model review succeeded:
-               the one conclusion on the page that must not be collapsible was
-               the one that disappeared. -->
-          <div id="datasetGate" class="stack"></div>
-          <!-- The deterministic table lives here and is never moved into the
-               review card: moving a node into a parent that is later replaced
-               with innerHTML destroys it, and every later render of it then
-               fails on a null element. -->
-          <details id="qualityRaw" open>
-            <summary>原始判定与计数（本插件计算，未经过模型）</summary>
-          <div id="quality" class="stack"></div>
-          </details>
-        </section>
-
-        <section class="card" data-view="overview" aria-labelledby="hAnnotationWindow">
-          <h2 id="hAnnotationWindow">待标注窗口</h2>
-          <p class="hint">
-            能人工标注的只有本体消息图里还留着的消息（默认 500 条 / 60 分钟），
-            但标注记录本身是永久的，正文也随标注一起留在本体的共享首选项里。
-            这里告诉你还能标哪些、最旧的一条还剩多久，以及可以把当前窗口整段导出留档。
-          </p>
-          <div class="bar-actions">
-            <button id="btnAnnotationWindow" type="button" class="btn">刷新窗口</button>
-            <button id="btnExportWindow" type="button" class="btn">导出这段窗口</button>
-          </div>
-          <div id="annotationWindow" class="stack"><p class="empty">读取本体窗口…</p></div>
-        </section>
-
-        <section class="card" data-view="overview" aria-labelledby="hOverview">
-          <h2 id="hOverview">学习概览</h2>
-          <div id="overview" class="grid"></div>
-        </section>
-
-        <section class="card" data-view="overview" aria-labelledby="hShadow">
-          <h2 id="hShadow">Shadow A/B</h2>
-          <h3>Operational Shadow Coverage：真实比较覆盖</h3>
-          <div id="shadowOperational" class="stack"></div>
-          <h3>已标注样本：配对评估与分歧子集</h3>
-          <p class="hint">
-            本体把 <code>learning_policy_mode</code> 设为 <code>shadow</code> 且策略移动阈值时，会同时算出
-            「原本会怎么判」和「策略会怎么判」。这张表只关心两者<strong>不一致</strong>的那部分 ——
-            当 95% 的判定完全相同时，总体准确率会把策略的差异稀释掉。
-            「净收益」= shadow 在分歧里多赢的条数减去多输的条数；它不为止损，
-            就没有进入 <code>active</code> 的理由。
-          </p>
-          <div id="shadow" class="stack"></div>
-        </section>
-
-        <section class="card" data-view="overview" aria-labelledby="hReplyReview">
-          <h2 id="hReplyReview">回复复盘</h2>
-          <p class="hint">
-            让模型逐条回答同一个问题：<strong>这条消息，机器人当时应该回复吗？</strong>
-            模型看不到人工标注，也看不到本体当时判成了什么 —— 它只看正文。判断回来之后，
-            与人工标注、本体判定和实际结果并排放，所以三列不一致的那几行才是这张表的意义。
-            正文只在本体与模型之间过一次：本插件不保存正文，复盘结果也不落盘，默认关闭。
-            需要同时打开本插件的 <code>learning_reply_review_enabled</code>，以及 ChatDynamics 的
-            「控制台显示消息正文」（否则标注记录里根本没有正文）。
-          </p>
-          <div class="bar-actions">
-            <button id="btnReplyReview" type="button" class="btn">开始复盘</button>
-          </div>
-          <div id="replyReview" class="stack">
-            <p class="empty">点「开始复盘」才会调用模型 —— 这一步会把选中的消息正文发给模型。</p>
-          </div>
-        </section>
-
-        <section class="card" data-view="overview" aria-labelledby="hAttribution">
-          <h2 id="hAttribution">错误归因链</h2>
-          <p class="hint">
-            每条被标注的消息归入<strong>唯一一格</strong>，从「谁在跟谁说」到「最后有没有发出去」。
-            这张表是<strong>复查顺序</strong>而不是因果结论：一条消息可能同时错在多环，
-            只记入最先的一格，其余列在「同时出错」。
-            「门禁压制 / 生成失败 / 发送失败」不是路由错误——把它们读成「漏回复」，
-            会去动一个没有错的阈值。
-          </p>
-          <div id="attribution" class="stack"></div>
-        </section>
-
-        <section class="card" data-view="overview" aria-labelledby="hWindow">
-          <h2 id="hWindow">最近 7 天标注表现</h2>
-          <p class="hint">仅统计人工标注样本，不代表真实准确率。</p>
-          <div id="window" class="grid"></div>
-        </section>
-
-        <section class="card" data-view="overview" aria-labelledby="hErrors">
-          <h2 id="hErrors">错误分布与话题候选归因</h2>
-          <div id="errors" class="table-host"></div>
-          <!-- 话题候选归因 used to render inside 学习概览 while this heading
-               promised it. A heading and its content in two different cards is
-               a table of contents that lies. -->
-          <div id="candidates" class="stack"></div>
-        </section>
-
-        <section class="card" data-view="overview" aria-labelledby="hRec">
-          <h2 id="hRec">系统建议</h2>
-          <p class="hint">
-            参数建议都指向 ChatDynamics 的真实配置键，并已按单次变化上限截断。
-            把建议变成一条策略记录要先过离线评测，所以这里的按钮只负责跳到「策略版本」——
-            那里才有可采纳的版本号。标记「采纳」只写入本插件的策略记录，不会改动 ChatDynamics 配置。
-          </p>
-          <div id="recs" class="stack"></div>
-        </section>
-
-        <section class="card" data-view="overview" aria-labelledby="hTuning">
-          <h2 id="hTuning">迭代调参（小步累计）</h2>
-          <p class="hint">
-            单步上限 ±5%，累计上限 ±15%，最多连续 3 步。每一步都在留出集上回放，
-            并按它针对的错误类型评判：累计收益 ≥1% 或目标错误相对下降 ≥10% 才采纳，
-            ≥2% 记为高置信度。任何一步核心指标回退超过 1% 会整轮回滚。
-          </p>
-          <div id="tuning" class="stack"></div>
-        </section>
-
-        <section class="card" data-view="overview" aria-labelledby="hEval">
-          <h2 id="hEval">离线评测（baseline vs candidate）</h2>
-          <p class="hint">
-            按会话切分留出集。回放的是记录轨迹上的决策函数，不是 ChatDynamics 路由器的完整重跑。
-            回复准入与最终发送是两个任务：前者回放路由准入判定，后者只报告已记录的事实
-            （门禁、生成、平台发送都不在记录轨迹里，无法回放）。
-          </p>
-          <div id="eval" class="stack"></div>
-        </section>
-
-        <section class="card" id="policiesCard" data-view="overview" aria-labelledby="hPolicies">
-          <h2 id="hPolicies">策略版本</h2>
-          <p class="hint">
-            这一列按钮按每条记录的<strong>当前状态</strong>给出：状态机不允许的迁移不会渲染，
-            省得点了才报错。只有「采纳」会让记录出现在 /published，
-            而是否采用仍由 ChatDynamics 决定 —— 这里不会改动本体的任何配置。
-          </p>
-          <div id="policies" class="stack"></div>
-        </section>
-
-        <section class="card" data-view="overview" aria-labelledby="hSamples">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Dynamics Learning · 学习工作台</title>
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+<noscript><p class="notice error">请允许本页运行 JavaScript，然后从 AstrBot 插件页重新打开。</p></noscript>
+<a class="skip-link" href="#main">跳到主内容</a>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">D<span>·</span></span><div><strong>Dynamics</strong><span class="brand-sub">LEARNING WORKSPACE</span></div></div>
+    <p class="nav-label">学习与验证</p>
+    <nav class="main-nav" aria-label="主要栏目" role="tablist" aria-orientation="vertical">
+<button class="nav-item active" id="tab-workspace" type="button" role="tab" data-view-btn="workspace" aria-selected="true" aria-controls="panel-workspace" tabindex="0"><span class="nav-index" aria-hidden="true">01</span>工作台</button>
+<button class="nav-item" id="tab-data" type="button" role="tab" data-view-btn="data" aria-selected="false" aria-controls="panel-data" tabindex="-1"><span class="nav-index" aria-hidden="true">02</span>数据与复盘</button>
+<button class="nav-item" id="tab-evaluation" type="button" role="tab" data-view-btn="evaluation" aria-selected="false" aria-controls="panel-evaluation" tabindex="-1"><span class="nav-index" aria-hidden="true">03</span>评测</button>
+<button class="nav-item" id="tab-shadow" type="button" role="tab" data-view-btn="shadow" aria-selected="false" aria-controls="panel-shadow" tabindex="-1"><span class="nav-index" aria-hidden="true">04</span>影子观察</button>
+<button class="nav-item" id="tab-policies" type="button" role="tab" data-view-btn="policies" aria-selected="false" aria-controls="panel-policies" tabindex="-1"><span class="nav-index" aria-hidden="true">05</span>策略</button>
+</nav>
+    <div class="sidebar-bottom"><span class="tag">ChatDynamics</span><p>从会话找到问题<br>用证据判断下一步</p><div class="connection"><span id="linkLamp" class="lamp" aria-hidden="true"></span><span id="linkLabel" class="lamp-label">未连接</span></div></div>
+  </aside>
+  <div class="content-shell">
+    <header class="page-header">
+      <div><div class="eyebrow">DYNAMICS LEARNING <span id="scopeBadge" class="tag">全局数据</span></div><h1 id="pageTitle" tabindex="-1">会话工作台</h1><p id="pageDescription" class="sub">选择会话，检查画像与样本证据。</p></div>
+      <div class="bar-actions"><button id="btnRefresh" type="button" class="btn">刷新</button><button id="nextAction" type="button" class="btn primary">导入标注</button></div>
+    </header>
+    <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
+    <main id="main" tabindex="-1">
+      <section id="panel-workspace" class="page workspace-page" data-page="workspace" role="tabpanel" aria-labelledby="tab-workspace" tabindex="-1">
+        <div class="workspace-summary"><div class="section-heading"><h2>当前学习状态</h2><span class="hint">全局概览</span></div><p id="workspaceStatus" class="hint" role="status">正在读取学习状态…</p><div id="overview" class="grid"></div></div>
+        <div class="workspace-grid">
+          <section class="scope-browser" aria-labelledby="hScopes">
+            <div class="section-heading"><h2 id="hScopes">会话 <span id="scopeCount" class="count">—</span></h2><button id="btnScopes" type="button" class="btn small">刷新列表</button></div>
+            <label class="search-label" for="scopeSearch">搜索会话标识</label><input id="scopeSearch" type="search" placeholder="输入会话标识…" autocomplete="off" />
+            <label class="filter-label" for="scopeFilter">显示<select id="scopeFilter"><option value="all">全部会话</option><option value="problems">有问题的会话</option><option value="insufficient">证据不足</option></select></label>
+            <div id="scopes" class="scope-list"><p class="empty">正在读取会话…</p></div>
+          </section>
+          <section id="workspaceDetail" class="workspace-detail" aria-labelledby="scopeTitle">
+            <div class="detail-heading"><button id="scopeBack" type="button" class="btn small scope-back">← 返回会话</button><div><span class="eyebrow">会话检查</span><h2 id="scopeTitle" tabindex="-1">选择一个会话</h2><p id="scopeSubtitle" class="hint">只统计人工检查过的样本，不代表全部流量的准确率。</p></div></div>
+            <div class="detail-tabs" role="tablist" aria-label="会话详情"><button id="tab-profile" type="button" class="tab active" data-detail-tab="profile" role="tab" aria-selected="true" aria-controls="detail-profile">会话画像</button><button id="tab-samples" type="button" class="tab" data-detail-tab="samples" role="tab" aria-selected="false" aria-controls="detail-samples" tabindex="-1">样本证据</button></div>
+            <div id="detail-profile" role="tabpanel" aria-labelledby="tab-profile"><div id="scopeDetail" class="stack"><div class="empty-state"><span class="empty-symbol" aria-hidden="true">↗</span><h3>从左侧开始检查</h3><p>选择会话，查看主要问题、证据充分度与样本。</p></div></div></div>
+            <div id="detail-samples" role="tabpanel" aria-labelledby="tab-samples" hidden>
+<section class="card" aria-labelledby="hSamples">
           <h2 id="hSamples">样本浏览</h2>
           <div class="row-controls">
             <label>任务
               <select id="taskFilter">
                 <option value="">全部</option>
-                <option value="recipient">recipient</option>
-                <option value="topic">topic</option>
-                <option value="reply_admission">reply_admission</option>
-                <option value="reply_outcome">reply_outcome</option>
+                <option value="recipient">对话对象</option>
+                <option value="topic">话题</option>
+                <option value="reply_admission">回复准入</option>
+                <option value="reply_outcome">最终发送</option>
               </select>
             </label>
             <button id="btnSamples" type="button" class="btn">加载样本</button>
@@ -212,37 +65,94 @@
             </div>
           </div>
           <div id="samples" class="table-host"></div>
-        </section>
+        </section></div></section></div></section>
+<section id="panel-data" class="page" data-page="data" role="tabpanel" aria-labelledby="tab-data" tabindex="-1" hidden>
+<div class="view-toolbar"><span class="hint">全局数据 · 标注、质量与复盘</span><div class="bar-actions"><button id="btnIngest" type="button" class="btn">导入标注</button><button id="btnExport" type="button" class="btn">导出 JSON</button></div></div><section class="card" aria-labelledby="hQuality">
+          <h2 id="hQuality">数据契约状态</h2>
+          <p class="hint">数据门槛由本插件计算，决定当前数据能否支持策略。展开查看能力覆盖与原始计数。</p>
 
-        </div>
-        <div id="panel-scopes" role="tabpanel" aria-labelledby="tab-scopes" tabindex="-1" hidden>
-        <section class="card" data-view="scopes" aria-labelledby="hScopes" hidden>
-          <h2 id="hScopes">会话画像</h2>
-          <p class="hint">
-            只统计<strong>被人工检查过</strong>的样本：它回答的是「在这个会话里，我看过的那些消息系统经常错在哪里」，
-            不是「这个会话有多少比例的消息会出错」。偏差对照的是 leave-one-out 基线
-            （除本会话以外的全部样本），避免自己稀释自己。
-          </p>
-          <div class="row-controls">
-            <button id="btnScopes" type="button" class="btn">加载会话列表</button>
+          <div id="datasetGate" class="stack"></div>
+          <details id="qualityRaw">
+            <summary>原始判定与计数（本插件计算，未经过模型）</summary>
+          <div id="quality" class="stack"></div>
+          </details>
+        </section>
+<section class="card" aria-labelledby="hAnnotationWindow">
+          <h2 id="hAnnotationWindow">待标注窗口</h2>
+          <p class="hint">查看本体当前仍可标注的消息窗口，及时补齐证据或导出留档。</p>
+          <div class="bar-actions">
+            <button id="btnAnnotationWindow" type="button" class="btn">刷新窗口</button>
+            <button id="btnExportWindow" type="button" class="btn">导出这段窗口</button>
           </div>
-          <div id="scopes" class="table-host"></div>
+          <div id="annotationWindow" class="stack"><p class="empty">读取本体窗口…</p></div>
         </section>
-
-        <section class="card" data-view="scopes" aria-labelledby="hScopeDetail" hidden>
-          <h2 id="hScopeDetail">会话详情</h2>
-          <p class="hint">作用域当前等于会话：本体契约没有提供跨会话的群身份。</p>
-          <div id="scopeDetail" class="stack">
-            <p class="empty">在上面的列表里点「查看」。</p>
+<section class="card" aria-labelledby="hReplyReview">
+          <h2 id="hReplyReview">回复复盘</h2>
+          <p class="hint">模型只根据正文独立判断，再与人工标注和实际结果比较。点击才会将选中正文发送给模型；结果不落盘。</p>
+          <div class="bar-actions">
+            <button id="btnReplyReview" type="button" class="btn">查看回复复盘</button>
+<button id="btnReplyRegenerate" type="button" class="btn">重新生成</button>
+          </div>
+          <div id="replyReview" class="stack">
+            <p class="empty">点击「查看回复复盘」后优先读取缓存，必要时将本体窗口内选取的消息正文交给模型。范围为全局，不受工作台会话选择影响。</p>
           </div>
         </section>
-        </div>
-      </main>
-
-      <footer class="foot">
-        <span id="footVersion">Dynamics Learning · Shadow Learning：只学习、只分析、只推荐。</span>
-      </footer>
-    </div>
-    <script src="./app.js"></script>
-  </body>
-</html>
+<section class="card" aria-labelledby="hReview"><div class="section-heading"><h2 id="hReview">数据复盘</h2><span class="tag">模型解释</span></div><p class="hint">解读确定性统计，优先使用已有缓存；点击后才请求模型。</p><div class="bar-actions"><button id="btnReview" type="button" class="btn">查看数据复盘</button><button id="btnReviewRegenerate" type="button" class="btn">重新生成</button></div><div id="review" class="stack"><p class="empty">尚未请求数据复盘。</p></div></section></section>
+<section id="panel-evaluation" class="page" data-page="evaluation" role="tabpanel" aria-labelledby="tab-evaluation" tabindex="-1" hidden>
+<div class="view-toolbar"><span class="hint">全局数据 · 离线证据</span><button id="btnAnalyze" type="button" class="btn">运行分析</button></div><section class="card" aria-labelledby="hEval">
+          <h2 id="hEval">离线评测（baseline vs candidate）</h2>
+          <p class="hint">按会话切分留出集，比较记录轨迹上的准入决策；最终发送仅报告已记录事实。</p>
+          <div id="eval" class="stack"></div>
+        </section>
+<section class="card" aria-labelledby="hAttribution">
+          <h2 id="hAttribution">错误归因链</h2>
+          <p class="hint">按优先顺序归类已标注样本，用于定位复查入口，不代表因果结论。</p>
+          <div id="attribution" class="stack"></div>
+        </section>
+<section class="card" aria-labelledby="hWindow">
+          <h2 id="hWindow">最近 7 天标注表现</h2>
+          <p class="hint">仅统计人工标注样本，不代表真实准确率。</p>
+          <div id="window" class="grid"></div>
+        </section>
+<section class="card" aria-labelledby="hErrors">
+          <h2 id="hErrors">错误分布与话题候选归因</h2>
+          <div id="errors" class="table-host"></div>
+          <div id="candidates" class="stack"></div>
+        </section>
+<section class="card" aria-labelledby="hTuning">
+          <h2 id="hTuning">迭代调参（小步累计）</h2>
+          <p class="hint">查看每一步的目标、收益与回退依据。所有调参结论以有效留出样本为准。</p>
+          <div id="tuning" class="stack"></div>
+        </section>
+</section>
+<section id="panel-shadow" class="page" data-page="shadow" role="tabpanel" aria-labelledby="tab-shadow" tabindex="-1" hidden>
+<section class="card" aria-labelledby="hShadow">
+          <h2 id="hShadow">Shadow A/B</h2>
+          <h3>Operational Shadow Coverage：真实比较覆盖</h3>
+          <div id="shadowOperational" class="stack"></div>
+          <h3>已标注样本：配对评估与分歧子集</h3>
+          <p class="hint">分别检查真实流量覆盖与人工标注分歧。净收益为分歧中多赢条数减去多输条数。</p>
+          <div id="shadow" class="stack"></div>
+        </section>
+</section>
+<section id="panel-policies" class="page" data-page="policies" role="tabpanel" aria-labelledby="tab-policies" tabindex="-1" hidden>
+<details class="card" aria-labelledby="hRec">
+          <summary id="hRec">系统建议与诊断</summary>
+          <p class="hint">建议对应真实配置键。采纳只记录本插件策略，是否采用由 ChatDynamics 决定。</p>
+          <div id="recs" class="stack"></div>
+        </details>
+<section class="card" id="policiesCard" aria-labelledby="hPolicies">
+          <h2 id="hPolicies">策略版本</h2>
+          <p class="hint">按当前状态提供可用操作。采纳会更新本插件发布记录，不会直接修改 ChatDynamics 配置。</p>
+          <div id="policies" class="stack"></div>
+        </section>
+</section>
+</main><footer class="foot"><span id="footVersion">Dynamics Learning · 只学习、只分析、只推荐</span></footer></div></div><script defer src="./state.js"></script>
+<script defer src="./api.js"></script>
+<script defer src="./components.js"></script>
+<script defer src="./views/evaluation.js"></script>
+<script defer src="./views/shadow.js"></script>
+<script defer src="./views/policies.js"></script>
+<script defer src="./views/data.js"></script>
+<script defer src="./views/workspace.js"></script>
+<script defer src="./app.js"></script></body></html>

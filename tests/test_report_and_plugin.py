@@ -345,19 +345,24 @@ async def test_plugin_registers_every_endpoint_once(plugin):
 def test_the_page_only_calls_endpoints_the_plugin_registers(plugin):
     r"""The page is not compiled, so a mistyped endpoint fails silently in a browser.
 
-    The map in app.js must name routes the plugin actually registers, and must not
+    The shipped scripts must name routes the plugin actually registers, and must not
     carry a declaration nothing calls. The reverse is deliberately not asserted:
     the plugin exposes endpoints (reset, for one) that the page has no button for.
     """
     import re
     from pathlib import Path
 
-    source = (Path(__file__).resolve().parents[1] / "pages" / "learning" / "app.js") \
-        .read_text(encoding="utf-8")
+    pages = Path(__file__).resolve().parents[1] / "pages" / "learning"
+    markup = (pages / "index.html").read_text(encoding="utf-8")
+    scripts = re.findall(r'<script\b[^>]*\bsrc="(\./[^\"]+)"', markup)
+    assert scripts, "no local scripts are loaded"
+    source = "\n".join((pages / script).read_text(encoding="utf-8") for script in scripts)
     block = re.search(r"const ENDPOINTS = \{(.*?)\};", source, flags=re.S)
-    assert block is not None, "app.js no longer declares an ENDPOINTS map"
+    assert block is not None, "the page no longer declares an ENDPOINTS map"
     declared = dict(re.findall(r"(\w+):\s*\"([^\"]+)\"", block.group(1)))
     used = set(re.findall(r"ENDPOINTS\.(\w+)", source))
+    # Resource-backed views call ENDPOINTS[key] through the shared loader.
+    used.update(re.findall(r"^  (\w+): \{ hosts:", source, flags=re.M))
 
     plugin.web.register()
     registered = {route.rsplit("/", 1)[-1] for route, _h, _m, _d in plugin.context.routes}
@@ -374,11 +379,12 @@ def test_the_page_script_only_touches_elements_the_page_has():
 
     pages = Path(__file__).resolve().parents[1] / "pages" / "learning"
     markup = (pages / "index.html").read_text(encoding="utf-8")
-    script = (pages / "app.js").read_text(encoding="utf-8")
+    scripts = re.findall(r'<script\b[^>]*\bsrc="(\./[^\"]+)"', markup)
+    script = "\n".join((pages / name).read_text(encoding="utf-8") for name in scripts)
     ids = set(re.findall(r'id="([^"]+)"', markup))
-    referenced = set(re.findall(r'\$("([^"]+)")', script))
-    views = set(re.findall(r'data-view="([^"]+)"', markup))
-    buttons = set(re.findall(r'data-view-btn="([^"]+)"', script))
+    referenced = set(re.findall(r'\$\("([^"]+)"\)', script))
+    views = set(re.findall(r'data-page="([^"]+)"', markup))
+    buttons = set(re.findall(r'data-view-btn="([^"]+)"', markup))
 
     assert referenced <= ids, sorted(referenced - ids)
     assert buttons <= views, sorted(buttons - views)
