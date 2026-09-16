@@ -77,7 +77,7 @@ def _completion_text(response: Any) -> str:
     PLUGIN_NAME,
     "ysyhlly",
     "群间 · Dynamics Learning",
-    "v1.4.0",
+    "v1.4.1",
     "",
 )
 class DynamicsLearningPlugin(ReviewRuntimeMixin, Star):
@@ -378,7 +378,7 @@ class DynamicsLearningPlugin(ReviewRuntimeMixin, Star):
         policies = await self.store.load_policies()
         return {
             "plugin": PLUGIN_NAME,
-            "version": "v1.4.0",
+            "version": "v1.4.1",
             "config": config.as_dict(),
             "dataset": {
                 "samples": len(samples),

@@ -56,7 +56,8 @@ def build() -> Path:
     output.mkdir(exist_ok=True)
     archive = output / f"{NAME}-{version}.zip"
     paths = [ROOT / name for name in ("__init__.py", "main.py", "metadata.yaml",
-             "_conf_schema.json", "requirements.txt", "README.md", "CHANGELOG.md")]
+             "_conf_schema.json", "requirements.txt", "README.md", "CHANGELOG.md",
+             "logo.png")]
     paths.extend((ROOT / "core").glob("*.py"))
     for folder in ("pages", "docs"):
         paths.extend(path for path in (ROOT / folder).rglob("*") if path.is_file()

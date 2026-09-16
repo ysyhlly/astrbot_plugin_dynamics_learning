@@ -1,6 +1,12 @@
+<div align="center">
+
+<img src="logo.png" alt="群间 · Dynamics Learning" width="520" />
+
 # 群间 · Dynamics Learning
 
-当前版本：**v1.4.0**。本版将插件页重写为会话优先的五栏目工作台，详见 [Changelog](CHANGELOG.md)。
+</div>
+
+当前版本：**v1.4.1**。本版修复策略证据一致性，并更新插件封面，详见 [Changelog](CHANGELOG.md)。
 
 Shadow 活跃时段依赖宿主保留 `recorded_at`。本次发布附带
 [宿主配套补丁](docs/chat-dynamics-shadow-recorded-at.patch)，用于仍缺失该字段的宿主版本；
