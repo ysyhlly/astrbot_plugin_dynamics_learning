@@ -1,0 +1,121 @@
+import asyncio
+import time
+
+import pytest
+
+from astrbot_plugin_dynamics_learning.core.contract import candidate
+from astrbot_plugin_dynamics_learning.core.engine import Engine
+from astrbot_plugin_dynamics_learning.core.store import Store, Conflict
+from test_social import SCOPE, CHARACTER, evidence, legacy, character_key
+
+
+@pytest.fixture
+def store(tmp_path):
+    store=Store(tmp_path/'auto.sqlite3')
+    yield store
+    store.close()
+
+
+def add_event(store, mid):
+    event={**evidence(mid), 'received_at':time.time(), 'timestamp':time.time()}
+    store.ingest(event)
+    return event
+
+
+def raw(event, delta=2):
+    return dict(category='affection',key='bot_affection',member='alice',value={'experience_delta':delta,'tone':.1},
+                reason='真实互动',evidence_ids=[event['id']],days=30)
+
+
+def test_auto_positive_negative_no_review_model_and_rollback(store):
+    async def run():
+        legacy(store)
+        store.bind_legacy_social(SCOPE,'fingerprint',character_key(CHARACTER))
+        before=store.entries()[0]['value']['affection_exp']
+        delta=2
+        calls=[]
+        async def model(role,prompt,data):
+            calls.append(role)
+            assert role=='analysis_provider', 'automatic affection must not call review model'
+            return {'proposals':[raw(data['events'][-1],delta)]}
+        engine=Engine(store,{'sessions':[SCOPE],'affection_review':'auto'},model)
+        add_event(store,'first')
+        await engine.refresh()
+        await engine.analyze(SCOPE,'fingerprint')
+        first=store.entries()[0]['value']['affection_exp']
+        assert float(first)>float(before)
+        assert store.proposals()[0]['state']=='applied' and store.proposals()[0]['reviews']==[]
+        delta=-2
+        add_event(store,'second')
+        await engine.analyze(SCOPE,'fingerprint')
+        second=store.proposals()[0]
+        assert float(store.entries()[0]['value']['affection_exp'])==pytest.approx(float(before))
+        assert second['applied_by']=='system:auto-affection'
+        assert calls==['analysis_provider','analysis_provider']
+        await engine.action(second['id'],'rollback','human:admin',second['updated'])
+        assert store.entries()[0]['value']['affection_exp']==first
+        await engine.apply_pending_affection()
+        assert store.entries()[0]['value']['affection_exp']==first
+        await engine.analyze(SCOPE,'fingerprint')
+        assert store.entries()[0]['value']['affection_exp']==first
+        assert store.get(second['id'])['state']=='rolled_back'
+    asyncio.run(run())
+
+
+def test_pending_migration_checks_revision_and_preserves_rejected_history(store):
+    async def run():
+        first=add_event(store,'first')
+        second=add_event(store,'second')
+        third=add_event(store,'third')
+        p=store.propose(candidate(raw(first),[first],None),'llm_then_human','old')
+        stale=store.propose(candidate(raw(second,3),[second],None),'human','old')
+        rejected=store.propose(candidate(raw(third,4),[third],None),'human','old')
+        store.review(rejected['id'],{'verdict':'reject','reason':'人工已拒绝','risks':[]},'human:admin',rejected['updated'])
+        engine=Engine(store,{'sessions':[SCOPE],'affection_review':'auto'},None)
+        await engine.refresh()
+        assert await engine.apply_pending_affection()=={'applied':1,'stale':1}
+        assert store.get(p['id'])['previous_mode']=='llm_then_human'
+        assert store.get(p['id'])['reviews']==[]
+        assert store.get(stale['id'])['state']=='rejected'
+        assert store.get(rejected['id'])['reviews'][0]['actor']=='human:admin'
+        value=store.entries()[0]['value']
+        assert await engine.apply_pending_affection()=={'applied':0,'stale':0}
+        assert store.entries()[0]['value']==value
+    asyncio.run(run())
+
+
+def test_auto_cannot_be_used_to_bypass_other_categories(store):
+    event=add_event(store,'one')
+    data=candidate({**raw(event),'category':'style','value':'该成员喜欢简短表达'},[event],None)
+    with pytest.raises(ValueError,match='only supported'):
+        store.propose(data,'auto','test')
+    p=store.propose(data,'llm_then_human','test')
+    with pytest.raises(Conflict,match='only supported'):
+        store.apply(p['id'],'system:auto-affection',p['updated'],automatic_affection=True)
+    engine=Engine(store,{'style_review':'auto'},None)
+    with pytest.raises(ValueError,match='invalid review mode'):
+        engine.mode('style')
+
+
+@pytest.mark.parametrize('setting',[{'affection_enabled':False},{'sessions':[]},{'affection_review':'llm_then_human'}])
+def test_disabled_or_reviewed_modes_do_not_apply_pending(store,setting):
+    async def run():
+        e=add_event(store,'one')
+        p=store.propose(candidate(raw(e),[e],None),'llm_then_human','old')
+        engine=Engine(store,{'sessions':[SCOPE],'affection_review':'auto',**setting},None)
+        await engine.refresh()
+        assert await engine.apply_pending_affection()=={'applied':0,'stale':0}
+        assert store.get(p['id'])['state']=='pending' and not store.entries()
+    asyncio.run(run())
+
+
+def test_changed_persona_is_not_automatically_applied(store):
+    async def run():
+        e=add_event(store,'one')
+        p=store.propose(candidate(raw(e),[e],None),'auto','test')
+        engine=Engine(store,{'sessions':[SCOPE],'affection_review':'auto'},None)
+        await engine.refresh()
+        engine.current_personas[SCOPE]='new-role'
+        assert await engine.apply_pending_affection()=={'applied':0,'stale':1}
+        assert store.get(p['id'])['state']=='rejected' and not store.entries()
+    asyncio.run(run())

@@ -1,0 +1,1 @@
+"""Attributed embedded components."""

@@ -1,1 +1,1 @@
-"""AstrBot Dynamics Learning plugin package."""
+"""群间学习 — independent learning and review for Chat Dynamics."""

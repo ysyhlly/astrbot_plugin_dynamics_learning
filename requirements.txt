@@ -1,3 +1,1 @@
-# Dynamics Learning has no runtime dependency of its own: the learners are
-# dependency-free by design so a fitted policy is reproducible on any host.
-# Nothing is pinned here on purpose; see core/logistic.py for the rationale.
+# No dependencies beyond AstrBot and the Python standard library.
