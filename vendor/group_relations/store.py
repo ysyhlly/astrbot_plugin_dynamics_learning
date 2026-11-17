@@ -49,6 +49,33 @@ class _ClosingConnection(sqlite3.Connection):
             self.close()
 
 
+class _SharedConnection:
+    def __init__(self, store: Any) -> None:
+        self._store = store
+
+    def __enter__(self) -> sqlite3.Connection:
+        self._store.lock.acquire()
+        try:
+            if not self._store.db.in_transaction:
+                self._store.db.execute("BEGIN")
+            return self._store.db
+        except BaseException:
+            self._store.lock.release()
+            raise
+
+    def __exit__(self, *args: Any) -> bool:
+        try:
+            if args[0] is None:
+                if self._store.db.in_transaction:
+                    self._store.db.commit()
+            else:
+                if self._store.db.in_transaction:
+                    self._store.db.rollback()
+        finally:
+            self._store.lock.release()
+        return False
+
+
 class RelationStore:
     def __init__(
         self,
@@ -61,8 +88,10 @@ class RelationStore:
         relation_growth_scale: float = 120.0,
         pair_daily_budget: float = 80.0,
         activity_daily_cap: int = 80,
+        shared_store: Any = None,
     ) -> None:
         self.db_path = db_path
+        self._shared_store = shared_store
         # 铁关系证据门槛：可选注入，缺省回退到 DEFAULT_SCORING（与评分规则同源）。
         self.min_hits_tie = int(
             min_hits_tie
@@ -86,7 +115,9 @@ class RelationStore:
         self.activity_daily_cap = max(1, activity_daily_cap)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> sqlite3.Connection | _SharedConnection:
+        if self._shared_store is not None:
+            return _SharedConnection(self._shared_store)
         conn = sqlite3.connect(
             str(self.db_path), timeout=10, factory=_ClosingConnection
         )
@@ -97,11 +128,11 @@ class RelationStore:
 
     def _init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        wal_prefix = "" if self._shared_store is not None else "PRAGMA journal_mode=WAL;\n                PRAGMA synchronous=NORMAL;\n"
         with self._connect() as conn:
             conn.executescript(
-                """
-                PRAGMA journal_mode=WAL;
-                PRAGMA synchronous=NORMAL;
+                f"""
+                {wal_prefix}
                 CREATE TABLE IF NOT EXISTS users (
                     group_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,

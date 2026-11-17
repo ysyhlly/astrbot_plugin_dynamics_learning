@@ -24,18 +24,23 @@ class Store:
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        current_version = self.db.execute("PRAGMA user_version").fetchone()[0]
         self.db.executescript("""
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
         PRAGMA busy_timeout=5000;
-        PRAGMA user_version=9;
         CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, scope TEXT, persona TEXT, created REAL, body TEXT);
         CREATE INDEX IF NOT EXISTS events_scope ON events(scope, persona, created);
+        CREATE INDEX IF NOT EXISTS events_scope_kind_created ON events(scope, json_extract(body,'$.kind'), created);
+        CREATE INDEX IF NOT EXISTS events_turn ON events(scope, persona, json_extract(body,'$.turn_id'));
         CREATE TABLE IF NOT EXISTS proposals(id TEXT PRIMARY KEY, scope TEXT, persona TEXT, state TEXT,
           created REAL, updated REAL, body TEXT);
         CREATE TABLE IF NOT EXISTS entries(id TEXT PRIMARY KEY, body TEXT);
+        CREATE INDEX IF NOT EXISTS entries_scope_persona ON entries(json_extract(body,'$.scope'), json_extract(body,'$.persona'), json_extract(body,'$.category'), json_extract(body,'$.active'));
+        CREATE INDEX IF NOT EXISTS entries_proposal_id ON entries(json_extract(body,'$.proposal_id'));
         CREATE INDEX IF NOT EXISTS proposals_entry ON proposals(json_extract(body,'$.entry_id'),created);
         CREATE INDEX IF NOT EXISTS proposals_queue ON proposals(state,scope,created,id);
+        CREATE INDEX IF NOT EXISTS proposals_cat_key ON proposals(scope,persona,json_extract(body,'$.category'),created);
         CREATE TABLE IF NOT EXISTS review_claims(proposal TEXT PRIMARY KEY,scope TEXT,job TEXT);
         CREATE INDEX IF NOT EXISTS review_claims_scope ON review_claims(scope);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, proposal TEXT, action TEXT, actor TEXT, created REAL, body TEXT);
@@ -48,6 +53,8 @@ class Store:
         CREATE TABLE IF NOT EXISTS affection_source_claims(scope TEXT,persona TEXT,member TEXT,message_id TEXT,proposal TEXT,
           PRIMARY KEY(scope,persona,member,message_id));
         """)
+        if current_version < 9:
+            self.db.execute("PRAGMA user_version=9")
         from .profiles import Profiles
 
         self.profiles = Profiles(self)
@@ -116,15 +123,25 @@ class Store:
                     changed["proposals"] += 1
         return changed
 
+    def _ingest_one(self, event):
+        self.db.execute(
+            "INSERT OR IGNORE INTO events VALUES(?,?,?,?,?)",
+            (event["id"], event["scope"], event["persona"], event["received_at"], encode(event)),
+        )
+        self.profiles.bind(event)
+        self.native.register_scope(event)
+        self.scheduling.ingest(event)
+
     def ingest(self, event):
         with self.transaction():
-            self.db.execute(
-                "INSERT OR IGNORE INTO events VALUES(?,?,?,?,?)",
-                (event["id"], event["scope"], event["persona"], event["received_at"], encode(event)),
-            )
-            self.profiles.bind(event)
-            self.native.register_scope(event)
-            self.scheduling.ingest(event)
+            self._ingest_one(event)
+
+    def ingest_batch(self, events):
+        if not events:
+            return
+        with self.transaction():
+            for event in events:
+                self._ingest_one(event)
 
     def events(self, scope, persona, limit=80):
         with self.lock:
@@ -294,7 +311,7 @@ class Store:
                     and before
                     and before["active"]
                     and before["proposal_id"] == old["id"]
-                    and before["expires"] > time.time()
+                    and (before.get("category") == "affection" or before["expires"] > time.time())
                 )
                 if (
                     old["entry_id"] == key
@@ -360,6 +377,19 @@ class Store:
                 json.loads(r[0])
                 for r in self.db.execute("""SELECT body FROM proposals WHERE state IN ('pending','reviewed')
                 AND json_extract(body,'$.category') IN ('style','typing_habit','preference','expression_example') ORDER BY created DESC,rowid DESC""")
+            ]
+
+    def pending_catchup_proposals(self, limit=200):
+        with self.lock:
+            return [
+                json.loads(r[0])
+                for r in self.db.execute(
+                    """SELECT p.body FROM proposals p
+                    WHERE (p.state='pending' OR (p.state='reviewed' AND json_extract(p.body,'$.mode')='llm'))
+                    AND NOT EXISTS (SELECT 1 FROM review_claims WHERE proposal=p.id)
+                    ORDER BY p.created ASC, p.rowid ASC LIMIT ?""",
+                    (int(limit),),
+                )
             ]
 
     def adopt_profile_llm_mode(self, proposal_id, expected_updated):
@@ -463,6 +493,12 @@ class Store:
                 raise Conflict("a later change exists; rollback that change first")
             restored = dict(p["before"] or current)
             restored.update(revision=current["revision"] + 1, active=bool(p["before"] and p["before"].get("active")))
+            if p["category"] == "affection" and (p["before"] is None or not restored["active"]):
+                from .affection import state as affection_state
+
+                prev_val = restored.get("value")
+                char_key = prev_val.get("character_key") if isinstance(prev_val, dict) else None
+                restored["value"] = affection_state({"character_key": char_key} if char_key else None)
             if not policy_allowed(restored):
                 restored["active"] = False
             self.db.execute("UPDATE entries SET body=? WHERE id=?", (encode(restored), p["entry_id"]))

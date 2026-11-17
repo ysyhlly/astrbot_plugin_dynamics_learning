@@ -20,9 +20,13 @@ ARCHIVE_TABLES = {'expression_patterns':'expression','style_learning_reviews':'s
 
 def plan(source, sessions):
     mapping={}
+    skipped_private=[]
     for scope in sessions:
         gid=group_id(scope)
-        if not gid or gid in mapping:
+        if not gid:
+            skipped_private.append(scope)
+            continue
+        if gid in mapping:
             raise ValueError('legacy group scope is ambiguous')
         mapping[gid]=scope
     scopes={}
@@ -34,12 +38,12 @@ def plan(source, sessions):
         if 'narrative_observations' in tables:
             for row in db.execute('SELECT scope_key,envelope FROM narrative_observations GROUP BY scope_key'):
                 scope=json.loads(row['envelope']).get('scope',{})
-                if scope.get('umo') in sessions and character_key(scope)==row['scope_key']:
+                if scope.get('umo') in sessions and group_id(scope.get('umo')) and character_key(scope)==row['scope_key']:
                     mapping[row['scope_key']]=scope['umo']
                     scopes[row['scope_key']]=scope
         marks=','.join('?' for _ in mapping)
         for table,category in ARCHIVE_TABLES.items():
-            if table not in tables:
+            if table not in tables or not marks:
                 continue
             field='chat_id' if table=='jargon' else 'group_id'
             for row in db.execute('SELECT * FROM '+table+' WHERE '+field+' IN ('+marks+')',tuple(mapping)):
@@ -59,8 +63,8 @@ def plan(source, sessions):
                     if term and len(term)<=64 and meaning:
                         records.append(dict(scope=scope,source_key=source_scope,category='jargon',member='',key=term,
                             value=meaning[:1000],provenance={'plugin':'astrbot_plugin_self_learning','table':table,'row_id':row['id'],'source_scope':source_scope,'cutover':True}))
-    fingerprint=digest({'archive':archive,'records':records,'counts':counts,'scopes':scopes})
-    return dict(fingerprint=fingerprint,archive=archive,records=records,scopes=scopes,counts=counts)
+    fingerprint=digest({'archive':archive,'records':records,'counts':counts,'scopes':scopes,'skipped_private':sorted(skipped_private)})
+    return dict(fingerprint=fingerprint,archive=archive,records=records,scopes=scopes,counts=counts,skipped_private=sorted(skipped_private))
 
 
 def migrate(source, destination, sessions, expected):
@@ -124,6 +128,7 @@ def migrate(source, destination, sessions, expected):
         report={'fingerprint':expected,'source_counts':data['counts'],'history_records':len(data['archive']),
                 'history_by_category':{c:sum(r['category']==c for r in data['archive']) for c in sorted(set(ARCHIVE_TABLES.values()))},
                 'legacy_social_records':len(data['records']),'untouched_legacy_refreshed':updated,'native_updates_preserved':preserved,
+                'skipped_private':data.get('skipped_private',[]),'skipped_private_count':len(data.get('skipped_private',[])),
                 'imported_at':time.time(),'unknown_expression_auto_applied':0}
         with store.lock,store.db:
             store.db.execute('INSERT INTO replacement_imports VALUES(?,?,?)',(expected,time.time(),encode(report)))

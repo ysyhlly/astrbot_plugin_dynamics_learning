@@ -22,12 +22,18 @@ class Console:
         CREATE INDEX IF NOT EXISTS reply_usage_refs_source ON reply_usage_refs(source_id,receipt);
         CREATE TABLE IF NOT EXISTS review_batches(id TEXT PRIMARY KEY,scope TEXT,status TEXT,created REAL,body TEXT);
         CREATE INDEX IF NOT EXISTS review_batches_scope ON review_batches(scope,created);
+        CREATE TABLE IF NOT EXISTS analysis_meta(key TEXT PRIMARY KEY,value TEXT);
         """)
         with store.transaction():
-            for field in ("profiles", "learning"):
+            if not store.db.execute("SELECT 1 FROM analysis_meta WHERE key='reply_usage_refs_backfilled_v1'").fetchone():
+                for field in ("profiles", "learning"):
+                    store.db.execute(
+                        "INSERT OR IGNORE INTO reply_usage_refs SELECT u.id,json_extract(r.value,'$.source_id') FROM reply_usage u,json_each(u.body,?) r WHERE json_extract(r.value,'$.source_id') IS NOT NULL",
+                        ("$.{}".format(field),),
+                    )
                 store.db.execute(
-                    "INSERT OR IGNORE INTO reply_usage_refs SELECT u.id,json_extract(r.value,'$.source_id') FROM reply_usage u,json_each(u.body,?) r WHERE json_extract(r.value,'$.source_id') IS NOT NULL",
-                    ("$.{}".format(field),),
+                    "INSERT OR REPLACE INTO analysis_meta VALUES('reply_usage_refs_backfilled_v1',?)",
+                    (str(time.time()),),
                 )
             store.db.execute(
                 "UPDATE console_tasks SET status='interrupted',finished=?,error='Restarted' WHERE status IN ('queued','running')",
@@ -232,15 +238,29 @@ class Console:
                 "SELECT id,created,body FROM reply_usage WHERE scope=? ORDER BY created DESC LIMIT 20 OFFSET ?",
                 (scope, (page - 1) * 20),
             ).fetchall()
+            records = [json.loads(row["body"]) for row in rows]
+            source_ids = list(
+                dict.fromkeys(
+                    profile.get("source_id", "")
+                    for record in records
+                    for profile in record.get("profiles", []) + record.get("learning", [])
+                    if profile.get("source_id")
+                )
+            )
+            labels = {}
+            for offset in range(0, len(source_ids), 400):
+                batch = source_ids[offset : offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                for pid, key in self.store.db.execute(
+                    f"SELECT json_extract(body,'$.proposal_id'),json_extract(body,'$.key') FROM entries WHERE json_extract(body,'$.proposal_id') IN ({placeholders})",
+                    batch,
+                ):
+                    if pid is not None and pid not in labels:
+                        labels[pid] = key or ""
             result = []
-            for row in rows:
-                record = json.loads(row["body"])
+            for row, record in zip(rows, records):
                 for profile in record["profiles"] + record.get("learning", []):
-                    entry = self.store.db.execute(
-                        "SELECT body FROM entries WHERE json_extract(body,'$.proposal_id')=? LIMIT 1",
-                        (profile.get("source_id", ""),),
-                    ).fetchone()
-                    profile["label"] = json.loads(entry[0]).get("key", "") if entry else "历史版本"
+                    profile["label"] = labels.get(profile.get("source_id", ""), "历史版本")
                 result.append({"id": row["id"], "created": row["created"], **record})
             return {"total": total, "page": page, "page_size": 20, "records": result}
 

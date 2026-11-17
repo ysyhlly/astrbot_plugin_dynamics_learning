@@ -124,17 +124,27 @@ class Profiles:
         self.store.db.execute('INSERT OR IGNORE INTO profile_messages VALUES(?,?,?,?,?,?)',
             (raw['scope'], target['persona'], raw['source_id'], raw['member'], raw['created'], encode(evidence)))
 
+    def _observe_one(self, raw):
+        old = self.store.db.execute('SELECT body FROM profile_raw WHERE scope=? AND source_id=?', (raw['scope'], raw['source_id'])).fetchone()
+        if old:
+            return  # Source receipt is immutable; repeated delivery does not increase statistics.
+        previous = self.store.db.execute('SELECT source_id FROM profile_raw WHERE scope=? ORDER BY created DESC,rowid DESC LIMIT 1', (raw['scope'],)).fetchone()
+        raw = {**raw, 'previous_id': previous[0] if previous else ''}
+        self.store.db.execute('INSERT INTO profile_raw VALUES(?,?,?,?)', (raw['scope'], raw['source_id'], raw['created'], encode(raw)))
+        target = self.store.db.execute('SELECT body FROM profile_targets WHERE scope=? AND source_id=?', (raw['scope'], raw['source_id'])).fetchone()
+        if target:
+            self._join(raw, json.loads(target[0]))
+
     def observe(self, raw):
         with self.store.transaction():
-            old = self.store.db.execute('SELECT body FROM profile_raw WHERE scope=? AND source_id=?', (raw['scope'], raw['source_id'])).fetchone()
-            if old:
-                return  # Source receipt is immutable; repeated delivery does not increase statistics.
-            previous = self.store.db.execute('SELECT source_id FROM profile_raw WHERE scope=? ORDER BY created DESC,rowid DESC LIMIT 1', (raw['scope'],)).fetchone()
-            raw = {**raw, 'previous_id': previous[0] if previous else ''}
-            self.store.db.execute('INSERT INTO profile_raw VALUES(?,?,?,?)', (raw['scope'], raw['source_id'], raw['created'], encode(raw)))
-            target = self.store.db.execute('SELECT body FROM profile_targets WHERE scope=? AND source_id=?', (raw['scope'], raw['source_id'])).fetchone()
-            if target:
-                self._join(raw, json.loads(target[0]))
+            self._observe_one(raw)
+
+    def observe_batch(self, items):
+        if not items:
+            return
+        with self.store.transaction():
+            for raw in items:
+                self._observe_one(raw)
 
     def bind(self, event):
         if event.get('kind') != 'observed' or ':GroupMessage:' not in event['scope']:
@@ -211,9 +221,22 @@ class Profiles:
         bundle = self.bundle(scope, persona)
         output = []
         with self.store.lock:
-            old = self.store.proposals(scope, 2000)
+            existing_examples = {
+                r[0]
+                for r in self.store.db.execute(
+                    "SELECT json_extract(body,'$.key') FROM proposals WHERE scope=? AND persona=? AND json_extract(body,'$.category')='expression_example'",
+                    (scope, persona),
+                )
+            }
+            habits_by_member = {}
+            for member_key, body in self.store.db.execute(
+                "SELECT json_extract(body,'$.member'),body FROM proposals WHERE scope=? AND persona=? AND json_extract(body,'$.category')='typing_habit' AND json_extract(body,'$.key')='observed_typing' ORDER BY created DESC,rowid DESC LIMIT 200",
+                (scope, persona),
+            ):
+                if member_key not in habits_by_member:
+                    habits_by_member[member_key] = json.loads(body)
         for pair in bundle['examples']:
-            if any(p['persona'] == persona and p['category'] == 'expression_example' and p['key'] == pair['key'] for p in old):
+            if pair['key'] in existing_examples:
                 continue
             output.append((dict(category='expression_example', key=pair['key'], member=pair['member'], value=pair['value'],
                 reason=f"{pair['quality']}；窗口内该场景与表达出现 {pair['count']} 次。仍需审查语境和角色兼容性。",
@@ -223,7 +246,7 @@ class Profiles:
         for member, stats in sorted(bundle['statistics'].items(), key=lambda r: r[1]['sample_count'], reverse=True):
             if stats['sample_count'] < 10:
                 continue
-            previous = next((p for p in old if p['persona'] == persona and p['member'] == member and p['category'] == 'typing_habit' and p['key'] == 'observed_typing'), None)
+            previous = habits_by_member.get(member)
             sources = [e for e in bundle['sources'] if e['member'] == member][-60:]
             if previous and (previous['state'] in {'pending', 'reviewed'} or
                 len({e['id'] for e in sources} - {e['id'] for e in previous['evidence']}) < 5):

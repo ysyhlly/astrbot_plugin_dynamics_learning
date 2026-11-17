@@ -21,11 +21,14 @@ def item(entry, source_scope):
 
 
 def member_items(engine, scope, persona, member, query='', budget=2600,trace=None):
-    rows=[e for e in engine.cache if (e['scope'],e['persona'],e['member'])==(scope,persona,member)
-          and e['category'] in MEMBER_PROFILES and e['active'] and e['expires']>time.time() and policy_allowed(e)]
+    source_rows = engine._entries_for(scope, persona) if hasattr(engine, '_entries_for') else engine.cache
+    now = time.time()
+    rows=[e for e in source_rows if (e['scope'],e['persona'],e['member'])==(scope,persona,member)
+          and e['category'] in MEMBER_PROFILES and e['active'] and e['expires']>now and policy_allowed(e)]
     order={'preference':0,'typing_habit':1,'style':2,'expression_example':3}
     rows.sort(key=lambda e:(order[e['category']],-relevance({'situation':encode(e['value'])},query),-e['revision']))
     result=[]
+    total_len = 2  # len('[]')
     examples=0
     for entry in rows:
         reason=''
@@ -37,13 +40,16 @@ def member_items(engine, scope, persona, member, query='', budget=2600,trace=Non
         if len(result)>=8:
             reason='成员资料数量预算'
         value=item(entry,scope)
-        if len(encode(result+[value]))>budget:
+        encoded_len = len(encode(value))
+        next_len = total_len + encoded_len + (1 if result else 0)
+        if next_len>budget:
             reason='成员资料长度预算'
         if reason:
             if trace is not None:
                 trace[entry['proposal_id']]=reason
             continue
         result.append(value)
+        total_len = next_len
         examples+=entry['category']=='expression_example'
     return result
 

@@ -4,7 +4,7 @@ from test_browser import server,snapshot,playwright  # noqa: F401
 
 
 @pytest.mark.parametrize('width',[1280,390])
-def test_presence_buttons_and_safe_navigation_fallback(server,width):
+def test_presence_buttons_and_safe_navigation_fallback(server,width):  # noqa: F811
     state=snapshot()
     data={'legacy_conflict':False,'plugins':[
         dict(id='astrbot_plugin_dynamics_learning',label='群间学习',state='ready',page='review',role='学习',current=True,can_open=True),

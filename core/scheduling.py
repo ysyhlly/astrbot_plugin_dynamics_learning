@@ -15,6 +15,7 @@ class Scheduling:
         CREATE TABLE IF NOT EXISTS analysis_inbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,event_id TEXT UNIQUE,
             scope TEXT,persona TEXT,turn_id TEXT,created REAL,processed INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS analysis_pending ON analysis_inbox(scope,persona,processed,seq);
+        CREATE INDEX IF NOT EXISTS analysis_unprocessed ON analysis_inbox(scope,persona,created,turn_id,seq) WHERE processed=0;
         CREATE INDEX IF NOT EXISTS analysis_turn ON analysis_inbox(scope,persona,turn_id,seq);
         CREATE TABLE IF NOT EXISTS analysis_meta(key TEXT PRIMARY KEY,value TEXT);
         CREATE TABLE IF NOT EXISTS analysis_runs(id TEXT PRIMARY KEY,scope TEXT,persona TEXT,created REAL,body TEXT);
@@ -46,26 +47,87 @@ class Scheduling:
 
     def batches(self, minimum=0):
         with self.store.lock:
-            return [dict(r) for r in self.store.db.execute('''SELECT scope,persona,
-                count(DISTINCT CASE WHEN processed=0 THEN turn_id END) AS count,
-                sum(CASE WHEN processed=0 THEN 1 ELSE 0 END) AS callbacks,
-                min(CASE WHEN processed=0 THEN created END) AS oldest,max(seq) AS cursor
-                FROM analysis_inbox GROUP BY scope,persona HAVING count>=? ORDER BY oldest IS NULL,oldest''',(minimum,))]
+            if minimum > 0:
+                return [
+                    dict(r)
+                    for r in self.store.db.execute(
+                        '''SELECT scope,persona,
+                        count(DISTINCT turn_id) AS count,
+                        count(*) AS callbacks,
+                        min(created) AS oldest,
+                        max(seq) AS cursor
+                        FROM analysis_inbox
+                        WHERE processed=0
+                        GROUP BY scope,persona
+                        HAVING count>=?
+                        ORDER BY oldest''',
+                        (minimum,),
+                    )
+                ]
+            pending = {
+                (r['scope'], r['persona']): dict(r)
+                for r in self.store.db.execute(
+                    '''SELECT scope,persona,
+                    count(DISTINCT turn_id) AS count,
+                    count(*) AS callbacks,
+                    min(created) AS oldest,
+                    max(seq) AS cursor
+                    FROM analysis_inbox
+                    WHERE processed=0
+                    GROUP BY scope,persona'''
+                )
+            }
+            all_pairs = self.store.db.execute(
+                'SELECT scope,persona,max(seq) AS cursor FROM analysis_inbox GROUP BY scope,persona'
+            ).fetchall()
+            rows = []
+            for r in all_pairs:
+                row = pending.get((r['scope'], r['persona']))
+                if row is not None:
+                    row['cursor'] = max(row['cursor'], r['cursor'])
+                    rows.append(row)
+                else:
+                    rows.append(
+                        {
+                            'scope': r['scope'],
+                            'persona': r['persona'],
+                            'count': 0,
+                            'callbacks': 0,
+                            'oldest': None,
+                            'cursor': r['cursor'],
+                        }
+                    )
+            rows.sort(key=lambda r: (r['oldest'] is None, r['oldest'] or 0))
+            return rows
 
     def batch(self, scope, persona, limit=80):
         with self.store.lock:
-            groups=self.store.db.execute('''SELECT turn_id,min(seq) AS first,max(seq) AS frontier,count(*) AS callbacks
+            groups = self.store.db.execute(
+                '''SELECT turn_id,min(seq) AS first,max(seq) AS frontier,count(*) AS callbacks
                 FROM analysis_inbox WHERE scope=? AND persona=? AND processed=0
-                GROUP BY turn_id ORDER BY first LIMIT ?''',(scope,persona,limit)).fetchall()
-            events=[]
-            frontiers=[]
+                GROUP BY turn_id ORDER BY first LIMIT ?''',
+                (scope, persona, limit),
+            ).fetchall()
+            if not groups:
+                return {'scope': scope, 'persona': persona, 'events': [], 'frontiers': []}
+            seqs = [group['frontier'] for group in groups]
+            placeholders = ','.join('?' for _ in seqs)
+            rows_by_seq = {
+                r[0]: r[1]
+                for r in self.store.db.execute(
+                    f'SELECT q.seq,e.body FROM analysis_inbox q JOIN events e ON q.event_id=e.id WHERE q.seq IN ({placeholders})',
+                    seqs,
+                )
+            }
+            events = []
+            frontiers = []
             for group in groups:
-                row=self.store.db.execute('SELECT e.body FROM events e JOIN analysis_inbox q ON q.event_id=e.id WHERE q.seq=?',(group['frontier'],)).fetchone()
-                if not row:
+                body = rows_by_seq.get(group['frontier'])
+                if not body:
                     raise ValueError('pending evidence unavailable')
-                events.append(json.loads(row[0]))
+                events.append(json.loads(body))
                 frontiers.append(dict(group))
-            return {'scope':scope,'persona':persona,'events':events,'frontiers':frontiers}
+            return {'scope': scope, 'persona': persona, 'events': events, 'frontiers': frontiers}
 
     def commit(self, batch, candidates, rejected):
         created=[]

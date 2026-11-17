@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from astrbot_plugin_dynamics_learning.core.contract import candidate
+from astrbot_plugin_dynamics_learning.core.contract import candidate, encode
 from astrbot_plugin_dynamics_learning.core.engine import Engine
 from astrbot_plugin_dynamics_learning.core.store import Store, Conflict
 from test_social import SCOPE, CHARACTER, evidence, legacy, character_key
@@ -118,4 +118,79 @@ def test_changed_persona_is_not_automatically_applied(store):
         engine.current_personas[SCOPE]='new-role'
         assert await engine.apply_pending_affection()=={'applied':0,'stale':1}
         assert store.get(p['id'])['state']=='rejected' and not store.entries()
+    asyncio.run(run())
+
+
+def test_first_entry_rollback_zeroes_value_and_allows_subsequent_apply(store):
+    async def run():
+        add_event(store,'first')
+        calls=[]
+        async def model(role,prompt,data):
+            calls.append(role)
+            return {'proposals':[raw(data['events'][-1],2)]}
+        store.bind_legacy_social(SCOPE,'fingerprint',character_key(CHARACTER))
+        engine=Engine(store,{'sessions':[SCOPE],'affection_review':'auto'},model)
+        await engine.refresh()
+        await engine.analyze(SCOPE,'fingerprint')
+        applied=store.proposals()[0]
+        assert applied['state']=='applied'
+        assert float(store.entries()[0]['value']['affection_exp'])==pytest.approx(2.0)
+        await engine.action(applied['id'],'rollback','human:admin',applied['updated'])
+        rolled=store.entries()[0]
+        assert not rolled['active']
+        assert float(rolled['value']['affection_exp'])==0.0
+        add_event(store,'second')
+        await engine.analyze(SCOPE,'fingerprint')
+        latest=store.proposals()[0]
+        assert latest['state']=='applied'
+        assert float(store.entries()[0]['value']['affection_exp'])==pytest.approx(2.0)
+        assert store.entries()[0]['active']
+    asyncio.run(run())
+
+
+def test_expired_affection_entry_stays_active_baseline_beyond_30_days(store):
+    async def run():
+        legacy(store)
+        store.bind_legacy_social(SCOPE,'fingerprint',character_key(CHARACTER))
+        add_event(store,'day1')
+        async def model(role,prompt,data):
+            return {'proposals':[raw(data['events'][-1],2)]}
+        engine=Engine(store,{'sessions':[SCOPE],'affection_review':'auto'},model)
+        await engine.refresh()
+        await engine.analyze(SCOPE,'fingerprint')
+        entry=store.entries()[0]
+        expired=dict(entry,expires=time.time()-3600)
+        store.db.execute('UPDATE entries SET body=? WHERE id=?',(encode(expired),entry['id']))
+        store.db.commit()
+        before=float(entry['value']['affection_exp'])
+        add_event(store,'after-30-days')
+        seen_current=[]
+        async def model2(role,prompt,data):
+            seen_current.extend(data['current'])
+            return {'proposals':[raw(data['events'][-1],2)]}
+        engine.call_model=model2
+        await engine.refresh()
+        result=await engine.analyze(SCOPE,'fingerprint')
+        assert any(e['id']==entry['id'] for e in seen_current)
+        assert result['proposals']==1
+        assert store.proposals()[0]['state']=='applied'
+        assert float(store.entries()[0]['value']['affection_exp'])==pytest.approx(before+2.0)
+    asyncio.run(run())
+
+
+def test_same_batch_multiple_affection_proposals_converge_without_stale_reject(store):
+    async def run():
+        legacy(store)
+        store.bind_legacy_social(SCOPE,'fingerprint',character_key(CHARACTER))
+        before=float(store.entries()[0]['value']['affection_exp'])
+        e1=add_event(store,'m1')
+        e2=add_event(store,'m2')
+        async def model(role,prompt,data):
+            return {'proposals':[raw(e1,2),raw(e2,3)]}
+        engine=Engine(store,{'sessions':[SCOPE],'affection_review':'auto'},model)
+        await engine.refresh()
+        result=await engine.analyze(SCOPE,'fingerprint')
+        assert result['proposals']==1
+        assert all(p['state']=='applied' for p in store.proposals())
+        assert float(store.entries()[0]['value']['affection_exp'])==pytest.approx(before+5.0)
     asyncio.run(run())

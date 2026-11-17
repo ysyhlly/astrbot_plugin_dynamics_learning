@@ -1,6 +1,10 @@
 """Independent decimal implementation of the existing uncapped experience curve."""
 from decimal import Decimal, localcontext
 
+with localcontext() as _ctx:
+    _ctx.prec = 64
+    _LN2 = Decimal(2).ln()
+
 
 def decimal(value):
     if isinstance(value, bool):
@@ -22,7 +26,7 @@ def state(value=None, *, delta=0, interval=20):
         raise ValueError("invalid affection growth interval")
     with localcontext() as ctx:
         ctx.prec = 64
-        c = Decimal(2).ln()
+        c = _LN2
         if value.get('affection_exp') is not None:
             experience = decimal(value['affection_exp'])
         else:

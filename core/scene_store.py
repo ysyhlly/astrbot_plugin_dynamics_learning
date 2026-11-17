@@ -12,6 +12,7 @@ from .contract import digest, encode
 class SceneStore:
     def __init__(self, store):
         self.store = store
+        self._summary_cache = None
         store.db.executescript('''
         CREATE TABLE IF NOT EXISTS scene_receipts(id TEXT PRIMARY KEY,scope TEXT,persona TEXT,turn_id TEXT,stage TEXT,created REAL,body TEXT);
         CREATE INDEX IF NOT EXISTS scene_receipts_turn ON scene_receipts(scope,persona,turn_id,stage);
@@ -142,7 +143,11 @@ class SceneStore:
 
     def summary(self):
         with self.store.lock:
-            cutoff = time.time() - 86400
+            now = time.time()
+            cache_key = (self.store.db.total_changes, int(now // 5))
+            if self._summary_cache and self._summary_cache[0] == cache_key:
+                return dict(self._summary_cache[1])
+            cutoff = now - 86400
             stages = {}
             for stage in ('selected', 'provider'):
                 stages[stage] = self.store.db.execute('SELECT count(*) FROM (SELECT DISTINCT scope,persona,turn_id FROM scene_receipts WHERE stage=? AND created>? AND json_array_length(body,\'$.refs\')>0)', (stage, cutoff)).fetchone()[0]
@@ -151,12 +156,14 @@ class SceneStore:
             attempts = [json.loads(r[0]) for r in self.store.db.execute("SELECT body FROM scene_receipts WHERE stage='disambiguation' AND created>?", (cutoff,))]
             prepared = self.store.db.execute("SELECT count(*) FROM (SELECT DISTINCT scope,persona,turn_id FROM scene_receipts WHERE stage IN ('selected','disambiguation') AND created>?)", (cutoff,)).fetchone()[0]
             waits = sorted(r['elapsed_ms'] for r in attempts)
-            learned = self.store.db.execute("SELECT count(*) FROM entries WHERE json_extract(body,'$.category')='scene_pattern' AND json_extract(body,'$.active')=1 AND json_extract(body,'$.expires')>?", (time.time(),)).fetchone()[0]
-            return {'learned': learned, **stages, 'delivered': linked, 'feedback': feedback,
-                    'attempts': len(attempts), 'timeouts': sum(r['status'] == 'timeout' for r in attempts),
-                    'prepared_turns': prepared, 'attempt_rate': round(len(attempts) / prepared, 4) if prepared else None,
-                    'wait_p95_ms': waits[max(0, (95 * len(waits) + 99) // 100 - 1)] if waits else 0,
-                    'extra_wait_ms': sum(r['elapsed_ms'] for r in attempts), 'window': 'last_24h_except_learned'}
+            learned = self.store.db.execute("SELECT count(*) FROM entries WHERE json_extract(body,'$.category')='scene_pattern' AND json_extract(body,'$.active')=1 AND json_extract(body,'$.expires')>?", (now,)).fetchone()[0]
+            result = {'learned': learned, **stages, 'delivered': linked, 'feedback': feedback,
+                      'attempts': len(attempts), 'timeouts': sum(r['status'] == 'timeout' for r in attempts),
+                      'prepared_turns': prepared, 'attempt_rate': round(len(attempts) / prepared, 4) if prepared else None,
+                      'wait_p95_ms': waits[max(0, (95 * len(waits) + 99) // 100 - 1)] if waits else 0,
+                      'extra_wait_ms': sum(r['elapsed_ms'] for r in attempts), 'window': 'last_24h_except_learned'}
+            self._summary_cache = (cache_key, result)
+            return dict(result)
 
     def prune(self, days):
         with self.store.transaction():

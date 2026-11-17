@@ -21,7 +21,8 @@ class ExpressionLearning:
         if not self.enabled(scope, persona):
             return result
         now = time.time()
-        rows = [e for e in self.engine.cache if e['scope'] == scope and e['persona'] == persona and e['category'] == 'expression_style'
+        pair_entries = self.engine._entries_for(scope, persona) if hasattr(self.engine, '_entries_for') else self.engine.cache
+        rows = [e for e in pair_entries if e['scope'] == scope and e['persona'] == persona and e['category'] == 'expression_style'
                 and e.get('expression_policy') == 1 and not e['member'] and e['active'] and e['expires'] > now]
         if not rows:
             return result
@@ -49,7 +50,7 @@ class ExpressionLearning:
                 return result
             penalized = any(e['category'] == 'expression_adjustment' and e['scope'] == scope and e['persona'] == persona
                 and e['active'] and e['expires'] > now and e['value']['target_id'] == row['proposal_id']
-                and e['value']['target_revision'] == row['revision'] for e in self.engine.cache)
+                and e['value']['target_revision'] == row['revision'] for e in pair_entries)
             traits = []
             for t in row['value']['traits']:
                 if t['kind'] in {'humor', 'teasing'} and mode != 'playful':

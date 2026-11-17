@@ -333,3 +333,130 @@ def test_pending_native_sources_are_not_pruned_before_analysis(store):
     store.checkpoint(SCOPE,PERSONA,time.time())
     store.prune(1)
     assert store.db.execute('SELECT count(*) FROM profile_messages').fetchone()[0]==0
+
+
+def test_consume_batch_drain_and_per_scope_context_revision(store):
+    from types import SimpleNamespace
+    from astrbot_plugin_dynamics_learning import main
+
+    async def run():
+        s1='qq:GroupMessage:1'
+        s2='qq:GroupMessage:2'
+        engine=Engine(store,{'sessions':[s1,s2],'batch_events':20},None)
+        plugin=main.DynamicsLearning(SimpleNamespace(),{'sessions':[s1,s2]})
+        plugin.engine=engine
+        plugin.ready=True
+        for i in range(6):
+            engine.ingest({k:v for k,v in callback(i,scope=s1 if i<4 else s2).items() if k not in {'id','received_at'}})
+        consumer=asyncio.create_task(engine.consume())
+        try:
+            await asyncio.wait_for(engine.queue.join(),3)
+        finally:
+            engine.closed=True
+            consumer.cancel()
+            await asyncio.gather(consumer,return_exceptions=True)
+        engine.closed=False
+        b1={r['scope']:r for r in store.batches(1)}
+        assert b1[s1]['count']==4 and b1[s2]['count']==2
+        fetched=store.scheduling.batch(s1,'persona-a')
+        assert len(fetched['events'])==4
+        store.scheduling.commit(fetched,[],0)
+        b0={r['scope']:r for r in store.batches(0)}
+        assert b0[s1]['count']==0 and b0[s1]['cursor']>0 and b0[s2]['count']==2
+        gen_s1_before=plugin.peek_context_revision({'umo':s1})['generation']
+        gen_s2_before=plugin.peek_context_revision({'umo':s2})['generation']
+        p=store.propose(candidate({**raw(),'category':'jargon','member':'','key':'黑话甲','evidence_ids':[fetched['events'][0]['id']]},[fetched['events'][0]],None),'human','t')
+        store.apply(p['id'],'human:admin',p['updated'])
+        await engine.refresh()
+        assert plugin.peek_context_revision({'umo':s1})['generation']>gen_s1_before
+        assert plugin.peek_context_revision({'umo':s2})['generation']==gen_s2_before
+    asyncio.run(run())
+
+
+def test_scene_disambiguation_fast_lane_when_background_slots_full(store):
+    async def run():
+        gate=asyncio.Event()
+        async def model(role,instruction,data):
+            if data.get('text'):
+                return {'communication_intent':'banter','expression_mode':'joke','turn_update':'continues_joke'}
+            await gate.wait()
+            return {'proposals':[]}
+        engine=Engine(store,{'sessions':[SCOPE],'scene_learning_enabled':True,'scene_disambiguation_enabled':True,'analysis_provider':'m'},model)
+        engine.current_personas[SCOPE]=PERSONA
+        bg=[asyncio.create_task(engine.invoke_model('analysis_provider','x',{'scope':SCOPE})) for _ in range(2)]
+        for _ in range(50):
+            if engine.model_active==2:
+                break
+            await asyncio.sleep(.002)
+        assert engine.model_active==2
+        res=await asyncio.wait_for(engine.scenes.disambiguate(scope=SCOPE,persona=PERSONA,member='alice',turn_id='t1',text='哈哈哈哈',context=[]),1.0)
+        assert res['expression_mode']=='joke'
+        gate.set()
+        await asyncio.gather(*bg)
+    asyncio.run(run())
+
+
+def test_jargon_propose_overflow_and_catchup_review(store,monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from astrbot_plugin_dynamics_learning import main
+
+    async def run():
+        e=event()
+        store.ingest(e)
+        p=store.propose(candidate({**raw(),'category':'jargon','member':'','key':'老梗'},[e],None),'human','fixture')
+        p=store.apply(p['id'],'human:admin',p['updated'])
+        entry=store.entries()[0]
+        calls=[]
+        async def model(role,instruction,data):
+            calls.append((role,data['proposal']['id']))
+            return {'verdict':'approve','reason':'依据充分','risks':[]}
+        plugin=main.DynamicsLearning(SimpleNamespace(),{'sessions':[e['scope']],'jargon_review':'llm','review_provider':'rm'})
+        plugin.engine=Engine(store,plugin.config,model)
+        plugin.engine.current_personas[e['scope']]=e['persona']
+        plugin.ready=True
+        await plugin.engine.refresh()
+        plugin.jobs={'busy-1','busy-2'}
+        monkeypatch.setattr(plugin,'_authorized',lambda: asyncio.sleep(0,result='human:admin'))
+        body=json.dumps({'id':entry['id'],'revision':entry['revision'],'value':'更新含义','reason':'管理员纠正'}).encode()
+        monkeypatch.setattr(main,'request',SimpleNamespace(_request=SimpleNamespace(body=lambda: asyncio.sleep(0,result=body))))
+        resp=await plugin.jargon_propose()
+        payload=json.loads(resp.body)
+        assert resp.status_code==200 and payload['data']['state']=='pending' and payload['data']['queued'] is False
+        pid=payload['data']['id']
+        await plugin.engine.review_pending_proposals()
+        assert calls==[('review_provider',pid)]
+        assert store.get(pid)['state']=='applied'
+        assert any(row['value']=='更新含义' and row['active'] for row in store.entries())
+    asyncio.run(run())
+
+
+def test_migrations_skip_private_umos_without_raising(tmp_path):
+    from astrbot_plugin_dynamics_learning.core.social import Social
+    from astrbot_plugin_dynamics_learning.migration_replacement import plan
+    from astrbot_plugin_dynamics_learning.migration_social import inspect_sources
+
+    src=tmp_path/'self.sqlite3'
+    with sqlite3.connect(src) as db:
+        db.executescript('CREATE TABLE user_affections(id INTEGER PRIMARY KEY,group_id TEXT,user_id TEXT,affection_level REAL,affection_exp TEXT,affection_growth_interval REAL,updated_at REAL); CREATE TABLE jargon(id INTEGER PRIMARY KEY,chat_id TEXT,content TEXT,meaning TEXT,is_jargon INT,is_complete INT,is_global INT,forget_stage INT,count INT,updated_at REAL); CREATE TABLE narrative_observations(scope_key TEXT,envelope TEXT,timestamp REAL);')
+        db.execute('INSERT INTO user_affections VALUES(1,"123","alice",80,NULL,20,0)')
+    rel=tmp_path/'rel.sqlite3'
+    rel_store=Store(rel)
+    Social(Engine(rel_store,{'sessions':['qq:GroupMessage:123']},None)).graph
+    sessions=['qq:GroupMessage:123','qq:FriendMessage:999']
+    p_res=plan(src,sessions)
+    assert p_res['skipped_private']==['qq:FriendMessage:999'] and len(p_res['records'])==1
+    s_res=inspect_sources(src,rel,sessions)
+    assert s_res['skipped_private']==['qq:FriendMessage:999'] and s_res['scopes']==['qq:GroupMessage:123']
+    with pytest.raises(ValueError,match='ambiguous'):
+        inspect_sources(src,rel,['qq:GroupMessage:123','other:GroupMessage:123','qq:FriendMessage:999'])
+    rel_store.close()
+
+
+def test_scene_summary_cache_invalidates_on_write(store):
+    first=store.scenes.summary()
+    second=store.scenes.summary()
+    assert first==second and first['attempts']==0
+    store.scenes.receipt({'scope':SCOPE,'persona':PERSONA,'turn_id':'t1','member':'alice','stage':'disambiguation','status':'succeeded','elapsed_ms':120,'refs':[]})
+    updated=store.scenes.summary()
+    assert updated['attempts']==1 and updated['extra_wait_ms']==120

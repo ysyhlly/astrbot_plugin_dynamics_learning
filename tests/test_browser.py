@@ -458,7 +458,8 @@ def test_batch_llm_and_rejection_share_cross_page_selection_and_confirmation(ser
     with playwright.sync_playwright() as pw:
         browser=pw.chromium.launch(headless=True)
         page=browser.new_page(viewport={'width':width,'height':1000})
-        state=snapshot();state.update(console_version=1,review_queue_version=2,entries_paged=True)
+        state=snapshot()
+        state.update(console_version=1,review_queue_version=2,entries_paged=True)
         scope=state['sessions'][0]
         original=state['proposals'][0]
         rows=[{**original,'id':f'p{i}','member':'alice' if i<50 else 'bob','key':f'待审项{i}',
@@ -473,7 +474,8 @@ def test_batch_llm_and_rejection_share_cross_page_selection_and_confirmation(ser
           if(path==='group_batch_review'){window.__jobs=[{id:'job',scope:body.scope,status:'completed',items:body.items.map(i=>({...i,member:'bob',key:'待审项50',status:'reviewed',error:''}))}];return {data:{queued:true,id:'job',count:body.items.length}};}
           if(path==='group_batch_reject')return window.__rejectConflict?{status:'error',message:'所选记录已变化'}:{data:{count:body.items.length}};
           return {data:{}};}};''')
-        errors=[];page.on('pageerror',lambda error:errors.append(str(error)))
+        errors=[]
+        page.on('pageerror',lambda error:errors.append(str(error)))
         page.goto(server)
         page.get_by_role('button',name='调整审查',exact=True).click()
         page.locator('.review-item').first.wait_for()
@@ -493,8 +495,10 @@ def test_batch_llm_and_rejection_share_cross_page_selection_and_confirmation(ser
         page.locator('#batch-jobs summary').wait_for()
         assert '已完成' in page.locator('#batch-jobs').inner_text()
         assert page.locator('input[data-proposal]:checked').count()==0
-        page.locator('#review-prev').click();page.locator('input[data-proposal="p0"]').check()
-        page.locator('#review-next').click();page.locator('input[data-proposal="p50"]').check()
+        page.locator('#review-prev').click()
+        page.locator('input[data-proposal="p0"]').check()
+        page.locator('#review-next').click()
+        page.locator('input[data-proposal="p50"]').check()
         page.get_by_role('button',name='拒绝所选（2）',exact=True).click()
         page.locator('#batch-reason').fill('证据不足，等待更多互动')
         assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
@@ -518,7 +522,8 @@ def test_job_pause_resume_cancel_and_failed_retry_controls(server,width):
     with playwright.sync_playwright() as pw:
         browser=pw.chromium.launch(headless=True)
         page=browser.new_page(viewport={'width':width,'height':1000})
-        state=snapshot();state.update(console_version=1,review_queue_version=2,entries_paged=True)
+        state=snapshot()
+        state.update(console_version=1,review_queue_version=2,entries_paged=True)
         scope=state['sessions'][0]
         jobs=[dict(id='active',scope=scope,status='running',items=[dict(id='done',member='alice',key='已完成项',status='reviewed',error=''),dict(id='working',member='bob',key='未完成项',status='running',error='')]),
               dict(id='failure',scope=scope,status='completed_with_issues',items=[dict(id='ok',member='alice',key='原成功项',status='reviewed',error=''),dict(id='bad',member='bob',key='失败项',status='failed',error='TimeoutError')])]
@@ -536,8 +541,10 @@ def test_job_pause_resume_cancel_and_failed_retry_controls(server,width):
             return {data:{id:job.id,status:job.status,count:job.items.length}};
           }
           return {data:{}};}};''')
-        errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
-        page.goto(server);page.get_by_role('button',name='调整审查',exact=True).click()
+        errors=[]
+        page.on('pageerror',lambda e:errors.append(str(e)))
+        page.goto(server)
+        page.get_by_role('button',name='调整审查',exact=True).click()
         active=page.locator('details[data-job-id="active"]')
         active.locator('summary').click()
         active.get_by_role('button',name='暂停',exact=True).click()
@@ -608,5 +615,67 @@ def test_console_home_search_paged_entries_and_provider_use(server,width):
         page.locator('#usage-records').get_by_text('喜恶',exact=False).first.wait_for()
         assert '交流长度' in page.locator('#usage-records').inner_text()
         assert '已送入模型参数' in page.locator('#usage-records').inner_text()
+        assert not errors
+        browser.close()
+
+
+def test_all_groups_grouped_batch_debounce_edit_limit_and_guidance(server):
+    with playwright.sync_playwright() as pw:
+        browser=pw.chromium.launch(headless=True)
+        page=browser.new_page(viewport={'width':1280,'height':1000})
+        state=snapshot()
+        s1='demo:GroupMessage:g1'
+        s2='demo:GroupMessage:g2'
+        state.update(
+            console_version=1,review_queue_version=2,entries_paged=True,sessions=[s1,s2],
+            legacy_kv_v1={'present':True,'count':3},
+            provider_readiness={'analysis_provider':{'configured':False,'ready':False,'provider_id':''},
+                                'review_provider':{'configured':True,'ready':True,'provider_id':'r1'}},
+            review_groups=[dict(scope=s1,persona='p',member='a',count=1),dict(scope=s2,persona='p',member='b',count=1)],
+        )
+        base=state['proposals'][0]
+        rows=[
+            {**base,'id':'r1','scope':s1,'key':'群1词条','can_approve':True,'can_llm_review':False,'can_reject':True,'updated':10},
+            {**base,'id':'r2','scope':s2,'key':'群2词条','can_approve':True,'can_llm_review':False,'can_reject':True,'updated':20},
+        ]
+        page.add_init_script('window.__state='+json.dumps(state)+';window.__rows='+json.dumps(rows)+';window.__calls=[];'+'''
+        window.AstrBotPluginPage={ready:async()=>{},apiGet:async()=>({data:window.__state}),apiPost:async(path,body)=>{
+          window.__calls.push({path,body});
+          if(path==='review_queue'){
+            if(body.query==='慢')await new Promise(r=>setTimeout(r,200));
+            return {data:{total:window.__rows.length,pending_total:2,ready_total:2,stale_total:0,held_total:0,page:1,page_size:50,
+              groups:[{scope:window.__state.sessions[0],count:1,ready_count:1,stale_count:0},{scope:window.__state.sessions[1],count:1,ready_count:1,stale_count:0}],
+              proposals:window.__rows}};
+          }
+          if(path==='review_batch_jobs')return {data:{jobs:[]}};
+          if(path==='group_batch_action')return {data:{count:body.items.length}};
+          return {data:{}};}};''')
+        errors=[]
+        page.on('pageerror',lambda e:errors.append(str(e)))
+        page.goto(server)
+        assert 'learning_*_v1' in page.locator('#backlog-list').inner_text()
+        assert '未配置分析模型' in page.locator('#backlog-list').inner_text()
+        assert page.locator('#edit-value').get_attribute('maxlength') is None
+        long_text='甲'*1200
+        page.get_by_role('button',name='调整审查',exact=True).click()
+        page.locator('.review-item').first.wait_for()
+        assert '可批 1' in page.locator('#review-group').inner_text()
+        page.locator('#review-query').fill('慢')
+        assert page.locator('.review-item').count()==2
+        page.wait_for_function("window.__calls.some(c=>c.path==='review_queue'&&c.body.query==='慢')")
+        page.locator('.review-item').first.get_by_text('查看依据与修改',exact=True).click()
+        page.locator('.review-item').first.get_by_text('修改提案',exact=True).click()
+        page.locator('#edit-value').fill(long_text)
+        assert len(page.locator('#edit-value').input_value())==1200
+        page.locator('#edit button[value="cancel"]').click()
+        page.wait_for_function("!document.querySelector('#edit').open")
+        page.locator('input[data-proposal="r1"]').check()
+        page.locator('input[data-proposal="r2"]').check()
+        page.get_by_role('button',name='批准所选（2）',exact=True).click()
+        assert '按群分组提交' in page.locator('#batch-summary').inner_text()
+        page.get_by_role('button',name='确认批准并应用',exact=True).click()
+        page.wait_for_function("window.__calls.filter(c=>c.path==='group_batch_action').length===2")
+        sent=page.evaluate("window.__calls.filter(c=>c.path==='group_batch_action').map(c=>c.body)")
+        assert [b['scope'] for b in sent]==[s1,s2]
         assert not errors
         browser.close()

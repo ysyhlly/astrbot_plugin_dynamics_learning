@@ -24,15 +24,16 @@ class SceneLearning:
         if not self.enabled(scope, persona):
             return result
         now = time.time()
+        pair_entries = self.engine._entries_for(scope, persona) if hasattr(self.engine, '_entries_for') else self.engine.cache
         if frozen is not None:
             if not isinstance(frozen, list) or len(frozen) > 1:
                 return result
             wanted = {(r.get('source_id'), r.get('revision')) for r in frozen if isinstance(r, dict)}
-            selected = [e for e in self.engine.cache if e['scope'] == scope and e['persona'] == persona
-                        and e['category'] == 'scene_pattern' and e.get('scene_policy') == 1 and not e['member']
-                        and e['active'] and e['expires'] > now and (e['proposal_id'], e['revision']) in wanted]
+            selected = [row for row in pair_entries if row['scope'] == scope and row['persona'] == persona
+                        and row['category'] == 'scene_pattern' and row.get('scene_policy') == 1 and not row['member']
+                        and row['active'] and row['expires'] > now and (row['proposal_id'], row['revision']) in wanted]
         else:
-            selected = select_patterns(self.engine.cache, scope, persona, scene, now, self.recent, query)
+            selected = select_patterns(pair_entries, scope, persona, scene, now, self.recent, query)
         for e in selected[:1]:
             value = {k: e['value'][k] for k in ('scene', 'method', 'conditions', 'avoid', 'examples', 'support')}
             item = {'source_id': e['proposal_id'], 'revision': e['revision'], 'member': '', 'category': 'scene_pattern',
@@ -56,7 +57,8 @@ class SceneLearning:
             async with asyncio.timeout(5):
                 result = await e.invoke_model('analysis_provider', DISAMBIGUATE,
                     {'scope': scope, 'member': member, 'text': text, 'context': context},
-                    lambda: self.enabled(scope, persona) and token == e.scope_token(scope))
+                    lambda: self.enabled(scope, persona) and token == e.scope_token(scope),
+                    fast_lane=True)
             if token != e.scope_token(scope) or provider != e.config.get('analysis_provider') or not self.enabled(scope, persona):
                 return {}
             if not isinstance(result, dict) or set(result) != set(scene_labels({})):

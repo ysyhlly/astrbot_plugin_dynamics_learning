@@ -6,9 +6,17 @@ import pytest
 
 from astrbot_plugin_dynamics_learning import main
 from astrbot_plugin_dynamics_learning.core.engine import Engine
+from astrbot_plugin_dynamics_learning.core.store import Store
 from astrbot_plugin_dynamics_learning.core.workbench import govern
-from test_audit_review_recovery import APPROVE, SCOPE, proposal, store
+from test_audit_review_recovery import APPROVE, SCOPE, proposal
 from test_affection_view import put
+
+
+@pytest.fixture
+def store(tmp_path):
+    s = Store(tmp_path / "round2.sqlite3")
+    yield s
+    s.close()
 
 
 @pytest.mark.parametrize("view", ["active", "all"])

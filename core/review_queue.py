@@ -75,6 +75,10 @@ def query_queue(store,scopes,modes,names,personas,latest,*,scope='',query='',cat
         # Classify once into a connection-local temp table. The production DB remains read-only.
         db.execute('CREATE TEMP TABLE queue_result AS '+SQL+'SELECT * FROM flags',args)
         groups=[dict(r) for r in db.execute("SELECT scope,count(*) AS count FROM proposals WHERE state IN ('pending','reviewed') AND scope IN (SELECT value FROM json_each(?)) GROUP BY scope ORDER BY min(created),scope",(args['scopes'],))]
+        if not scope and not query and not category and not state:
+            per_scope={r['scope']:dict(r) for r in db.execute("SELECT scope,coalesce(sum(reason='ready'),0) AS ready_count,coalesce(sum(stale_reason!=''),0) AS stale_count,coalesce(sum(claim IS NOT NULL),0) AS held_count FROM queue_result GROUP BY scope")}
+            for g in groups:
+                g.update(per_scope.get(g['scope'],{'ready_count':0,'stale_count':0,'held_count':0}))
         counts=db.execute("SELECT count(*) AS pending_total,coalesce(sum(reason='ready'),0) ready_total,coalesce(sum(stale_reason!=''),0) stale_total,coalesce(sum(claim IS NOT NULL),0) held_total,coalesce(sum("+restriction+") ,0) total FROM queue_result",args).fetchone()
         reasons={r[0]:r[1] for r in db.execute('SELECT reason,count(*) FROM queue_result GROUP BY reason',args)}
         page=min(page,max(1,(counts['total']+49)//50))

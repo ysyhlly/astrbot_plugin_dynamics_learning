@@ -15,9 +15,10 @@ let reviewGroupKey=null,reviewPage=1,reviewTotal=0,reviewProposals=[],reviewEpoc
 let globalScope=null,scopeControlsReady=false;
 const reviewSelected=new Set();
 let pendingBatch=null;
-let pendingBatchAction="approve",batchJobsEpoch=0;
+let pendingBatchAction="approve",batchJobsEpoch=0,hasActiveBatchJobs=false;
 let reviewView="ready";
 let queueData=null,reviewBusy=false,reviewFailure='',reviewTimer;
+const reviewGroupCounts=new Map();
 const reviewSelectionRows=new Map();
 const groupReview=()=>Boolean(snapshot.review_queue_version);
 const batchActions=()=>Number(snapshot.review_queue_version)>=2;
@@ -25,10 +26,10 @@ const actionAllowed=(p,action)=>action==='archive'?p.can_archive===true:action==
 const canSelect=p=>batchActions()?(p.can_approve||p.can_llm_review||p.can_reject):canApprove(p);
 const batchLimit=()=>groupReview()?100:20;
 function clearReviewSelection(){reviewSelected.clear();reviewSelectionRows.clear();}
-function queueGroups(){const groups=new Map();for(const g of snapshot.review_groups||[]){if(!g.scope.includes(':GroupMessage:'))continue;groups.set(g.scope,(groups.get(g.scope)||0)+g.count);}return queueData?.groups||[...groups].map(([scope,count])=>({scope,count}));}
+function queueGroups(){const groups=new Map();for(const g of snapshot.review_groups||[]){if(!g.scope.includes(':GroupMessage:'))continue;groups.set(g.scope,(groups.get(g.scope)||0)+g.count);}const base=queueData?.groups||[...groups].map(([scope,count])=>({scope,count}));return base.map(g=>({...g,...(reviewGroupCounts.get(g.scope)||{})}));}
 function reviewGroups(){return groupReview()?queueGroups():snapshot.review_groups||[];}
 function reviewKey(g){return groupReview()?g.scope:groupKey(g);}
-function updateReviewFilters(){clearReviewSelection();reviewPage=1;clearTimeout(reviewTimer);if(groupReview()){++reviewEpoch;reviewBusy=true;reviewProposals=[];renderReviewCards();reviewTimer=setTimeout(()=>fetchReviewGroup().then(renderReviewCards).catch(e=>note(e.message,'error')),250);}else renderReviewCards();}
+function updateReviewFilters(){clearReviewSelection();reviewPage=1;clearTimeout(reviewTimer);if(groupReview()){++reviewEpoch;reviewBusy=true;renderReviewCards();reviewTimer=setTimeout(()=>fetchReviewGroup().then(renderReviewCards).catch(e=>note(e.message,'error')),250);}else renderReviewCards();}
 
 const groupKey=p=>JSON.stringify([p.scope,p.persona,p.member||'']);
 function canApprove(p){if(groupReview())return p.can_approve===true;const approved=[...p.reviews].reverse().find(r=>r.actor.startsWith('llm:'))?.verdict==='approve';const mode=snapshot.review_modes[p.category]||p.mode;return ['pending','reviewed'].includes(p.state)&&mode!=='auto'&&!(mode==='llm'&&['style','typing_habit','preference','expression_example'].includes(p.category))&&(p.mode==='human'||approved)&&(mode==='human'||approved);}
@@ -40,25 +41,25 @@ function visibleReviews(){
   .sort((a,b)=>Number(canApprove(b))-Number(canApprove(a)));
 }
 function selectionStatus(){
- const eligible=visibleReviews().filter(canApprove), selected=reviewSelected.size;
+ const eligible=visibleReviews().filter(canApprove), selected=reviewSelected.size, scopeEnabled=Boolean(groupReview()||reviewGroupKey);
  $('#preview-batch').textContent=selected?`批准所选（${selected}）`:`批准本页（${Math.min(batchLimit(),eligible.length)}）`;
- $('#preview-batch').disabled=reviewBusy||!reviewGroupKey||(!selected&&!eligible.length);
- $('#select-review-page').disabled=reviewBusy||!reviewGroupKey||!visibleReviews().some(canSelect);
+ $('#preview-batch').disabled=reviewBusy||!scopeEnabled||(!selected&&!eligible.length);
+ $('#select-review-page').disabled=reviewBusy||!scopeEnabled||!visibleReviews().some(canSelect);
  $('#select-review-page').textContent=batchActions()?'选择本页待审项':'选择本页可批准项';
- $('#select-review-page').hidden=!reviewGroupKey;
- $('.review-bottom').hidden=!reviewGroupKey;
+ $('#select-review-page').hidden=!scopeEnabled;
+ $('.review-bottom').hidden=!scopeEnabled;
  $('.review-bottom').dataset.hasSelection=String(selected>0);
  $('#clear-review-selection').hidden=!selected;
- $('#selection-note').textContent=selected?`已选择 ${selected} 项${groupReview()?'（可跨页）':''}`:`批准前核对变更，每次最多 ${batchLimit()} 项`;
+ $('#selection-note').textContent=selected?`已选择 ${selected} 项${groupReview()?'（可跨页'+(reviewGroupKey?'':' · 自动按群分组')+'）':''}`:`批准前核对变更，每次最多 ${batchLimit()} 项`;
  const candidates=selected?[...reviewSelectionRows.values()]:visibleReviews();
- for(const [action,id,label] of [['review','preview-batch-review','LLM 审查'],['reject','preview-batch-reject','拒绝'],['archive','preview-batch-archive','归档'],['release','preview-batch-release','交回自动']]){const b=$('#'+id),count=candidates.filter(p=>actionAllowed(p,action)).length;b.hidden=!batchActions()||(action==='archive'&&reviewView!=='stale')||(action==='release'&&reviewView!=='held');b.disabled=reviewBusy||!reviewGroupKey||!count;b.textContent=`${label}${selected?'所选':'本页'}（${count}）`;}
- if(batchActions()){const count=candidates.filter(canApprove).length;$('#preview-batch').disabled=reviewBusy||!reviewGroupKey||!count;$('#preview-batch').textContent=`批准${selected?'所选':'本页'}（${count}）`;}
+ for(const [action,id,label] of [['review','preview-batch-review','LLM 审查'],['reject','preview-batch-reject','拒绝'],['archive','preview-batch-archive','归档'],['release','preview-batch-release','交回自动']]){const b=$('#'+id),count=candidates.filter(p=>actionAllowed(p,action)).length;b.hidden=!batchActions()||(action==='archive'&&reviewView!=='stale')||(action==='release'&&reviewView!=='held');b.disabled=reviewBusy||!scopeEnabled||!count;b.textContent=`${label}${selected?'所选':'本页'}（${count}）`;}
+ if(batchActions()){const count=candidates.filter(canApprove).length;$('#preview-batch').disabled=reviewBusy||!scopeEnabled||!count;$('#preview-batch').textContent=`批准${selected?'所选':'本页'}（${count}）`;}
  for(const c of document.querySelectorAll('.review-item'))c.classList.toggle('is-selected',reviewSelected.has(c.dataset.proposalId));
 }
 function renderReviewCards(){
  const groups=reviewGroups(),chooser=$('#review-group');chooser.replaceChildren();
  const recent=el('option','',groupReview()?'全部群 · 待审内容':'最近记录');recent.value='';chooser.append(recent);
- for(const group of groups){const option=el('option','',groupReview()?`${shortScope(group.scope)} (${group.count})`:`${shortScope(group.scope)} / ${group.display_name||group.member||'全群'} (${group.count})`);option.value=reviewKey(group);chooser.append(option);}if(groupReview()&&reviewGroupKey&&!groups.some(g=>g.scope===reviewGroupKey)){const o=el('option','',shortScope(reviewGroupKey)+' (0)');o.value=reviewGroupKey;chooser.append(o);}chooser.value=reviewGroupKey||'';
+ for(const group of groups){const badge=group.ready_count!==undefined?`可批 ${group.ready_count} / 失效 ${group.stale_count} / 共 ${group.count}`:String(group.count);const option=el('option','',groupReview()?`${shortScope(group.scope)} (${badge})`:`${shortScope(group.scope)} / ${group.display_name||group.member||'全群'} (${group.count})`);option.value=reviewKey(group);chooser.append(option);}if(groupReview()&&reviewGroupKey&&!groups.some(g=>g.scope===reviewGroupKey)){const o=el('option','',shortScope(reviewGroupKey)+' (0)');o.value=reviewGroupKey;chooser.append(o);}chooser.value=reviewGroupKey||'';
  const category=$('#review-category').value;$('#review-category').replaceChildren(...[['','全部类别'],...Object.entries(categories)].map(([key,label])=>{const option=el('option','',msg(label));option.value=key;return option;}));$('#review-category').value=category;
  const filters=Number(Boolean(category))+Number(Boolean($('#state').value))+Number(Boolean($('#review-reason').value));setText($('.review-filter-menu>summary'),filters?msg('筛选 · {0}',filters):msg('筛选'));
  const ready=reviewProposals.filter(canApprove).length;
@@ -66,17 +67,17 @@ function renderReviewCards(){
  setText($('#review-stale'),msg('失效治理 {0}',queueData?.stale_total??0));setText($('#review-held'),msg('人工保留 {0}',queueData?.held_total??0));
  setText($('#review-all'),msg(groupReview()?'全部待审 {0}':'本页全部 {0}',groupReview()?queueData?.pending_total??0:reviewProposals.length));
  for(const b of document.querySelectorAll('[data-review-view]'))b.setAttribute('aria-pressed',String(b.dataset.reviewView===reviewView));
- $('#review-summary').textContent=groupReview()?`${reviewGroupKey?shortScope(reviewGroupKey):'全部群'} · 匹配 ${reviewTotal} 项 · 第 ${reviewPage} / ${Math.max(1,Math.ceil(reviewTotal/50))} 页${!reviewGroupKey?' · 选择单个群可批量批准':''}`:reviewGroupKey?`本组 ${reviewTotal} 项 · 第 ${reviewPage} / ${Math.max(1,Math.ceil(reviewTotal/30))} 页`:`最近 ${reviewProposals.length} 条记录`;
+ $('#review-summary').textContent=groupReview()?`${reviewGroupKey?shortScope(reviewGroupKey):'全部群'} · 匹配 ${reviewTotal} 项 · 第 ${reviewPage} / ${Math.max(1,Math.ceil(reviewTotal/50))} 页`:reviewGroupKey?`本组 ${reviewTotal} 项 · 第 ${reviewPage} / ${Math.max(1,Math.ceil(reviewTotal/30))} 页`:`最近 ${reviewProposals.length} 条记录`;
  $('#review-prev').disabled=reviewBusy||(!groupReview()&&!reviewGroupKey)||reviewPage<=1;$('#review-next').disabled=reviewBusy||(!groupReview()&&!reviewGroupKey)||reviewPage*(groupReview()?50:30)>=reviewTotal;
  $('.review-pagination').hidden=(!groupReview()&&!reviewGroupKey)||reviewTotal<=(groupReview()?50:30);
  const index=groups.findIndex(g=>reviewKey(g)===reviewGroupKey);
  $('#review-next-group').disabled=!groups.length||(groups.length===1&&index===0);
  $('#review-next-group').hidden=groups.length<2;
- const cards=$('#cards');cards.replaceChildren();cards.setAttribute('aria-busy',String(reviewBusy));if(groupReview()&&(reviewBusy||reviewFailure)){cards.append(el('div','review-empty',reviewBusy?'正在查询全部待审内容…':reviewFailure));selectionStatus();return;}
+ const cards=$('#cards');cards.replaceChildren();cards.setAttribute('aria-busy',String(reviewBusy));if(groupReview()&&reviewFailure){cards.append(el('div','review-empty',reviewFailure));selectionStatus();return;}if(groupReview()&&reviewBusy&&!reviewProposals.length){cards.append(el('div','review-empty','正在查询全部待审内容…'));selectionStatus();return;}
  for(const p of visibleReviews()){
   const mode=snapshot.review_modes[p.category]||p.mode,ready=canApprove(p),pending=['pending','reviewed'].includes(p.state);
   const c=el('article','review-item'),top=el('div','review-item-head'),head=el('div','review-title');c.dataset.proposalId=p.id;c.tabIndex=0;
-  if(reviewGroupKey&&canSelect(p)){const check=el('input');check.type='checkbox';check.dataset.proposal=p.id;check.checked=reviewSelected.has(p.id);check.setAttribute('aria-label','选择调整 '+p.key);check.onchange=()=>{if(check.checked&&reviewSelected.size>=batchLimit()){check.checked=false;note(`每次最多选择 ${batchLimit()} 条`);return;}if(check.checked){reviewSelected.add(p.id);reviewSelectionRows.set(p.id,p);}else{reviewSelected.delete(p.id);reviewSelectionRows.delete(p.id);}selectionStatus();};top.append(check);}
+  if((groupReview()||reviewGroupKey)&&canSelect(p)){const check=el('input');check.type='checkbox';check.dataset.proposal=p.id;check.checked=reviewSelected.has(p.id);check.setAttribute('aria-label','选择调整 '+p.key);check.onchange=()=>{if(check.checked&&reviewSelected.size>=batchLimit()){check.checked=false;note(`每次最多选择 ${batchLimit()} 条`);return;}if(check.checked){reviewSelected.add(p.id);reviewSelectionRows.set(p.id,p);}else{reviewSelected.delete(p.id);reviewSelectionRows.delete(p.id);}selectionStatus();};top.append(check);}
   head.append(el('span','review-category',categories[p.category]||p.category),el('h3','',p.key));top.append(head);
   const status=p.can_archive?'已失效':p.reason_code==='held'?'批次保留':ready?'待确认':p.state==='reviewed'&&mode==='llm'?'已通过 · 自动生效中':pending&&mode!=='human'?'等待 LLM 审查':states[p.state];
   top.append(el('span','badge',status));c.append(top);
@@ -196,7 +197,7 @@ function syncGlobalScopeToSubtabs(scope,triggerFetch=true){
  if(groupReview())reviewGroupKey=globalScope;
  else{const group=reviewGroups().find(g=>g.scope===globalScope);reviewGroupKey=group?groupKey(group):'';}
  if(!triggerFetch)return;
- ++socialRequest;++memberRequest;++historyRequest;++reviewEpoch;++batchJobsEpoch;
+ ++socialRequest;++memberRequest;++historyRequest;++reviewEpoch;++batchJobsEpoch;hasActiveBatchJobs=false;
  clearTimeout(jargonTimer);
  socialSnapshot=null;
  network?.setData({users:{},all_relations:[]});
@@ -325,7 +326,7 @@ $('#history-scope').onchange=$('#history-category').onchange=()=>{historyPage=1;
 $('#history-prev').onclick=()=>{if(historyPage>1){historyPage--;loadHistory();}};
 $('#history-next').onclick=()=>{if(historyPage*20<historyCount){historyPage++;loadHistory();}};
 
-async function fetchReviewGroup(preserveSelection=false){
+async function fetchReviewGroup(preserveSelection=false, clearExisting=false){
  clearTimeout(reviewTimer);const epoch=++reviewEpoch;
  if(!preserveSelection)clearReviewSelection();
  if(groupReview()){
@@ -333,9 +334,12 @@ async function fetchReviewGroup(preserveSelection=false){
    reviewBusy=false;reviewProposals=[];reviewTotal=0;queueData=null;reviewFailure=msg('所选会话未启用群间学习。');
    renderReviewCards();return;
   }
-  reviewBusy=true;reviewFailure='';reviewProposals=[];renderReviewCards();
-  try{const result=await api('apiPost','review_queue',{scope:reviewGroupKey||'',query:$('#review-query').value.trim(),category:$('#review-category').value,state:$('#state').value,reason:$('#review-reason').value,view:reviewView,page:reviewPage});
+  reviewBusy=true;reviewFailure='';if(clearExisting)reviewProposals=[];renderReviewCards();
+  try{const query=$('#review-query').value.trim(),category=$('#review-category').value,state=$('#state').value,reason=$('#review-reason').value;
+   const result=await api('apiPost','review_queue',{scope:reviewGroupKey||'',query,category,state,reason,view:reviewView,page:reviewPage});
    if(epoch!==reviewEpoch)return;queueData=result;reviewProposals=result.proposals;reviewTotal=result.total;reviewPage=result.page;
+   for(const g of result.groups||[])if(g.ready_count!==undefined)reviewGroupCounts.set(g.scope,{ready_count:g.ready_count,stale_count:g.stale_count,held_count:g.held_count||0});
+   if(reviewGroupKey&&!query&&!category&&!state)reviewGroupCounts.set(reviewGroupKey,{ready_count:result.ready_total||0,stale_count:result.stale_total||0,held_count:result.held_total||0});
    for(const p of result.proposals)if(reviewSelected.has(p.id)){if(canSelect(p)&&reviewSelectionRows.get(p.id)?.updated===p.updated)reviewSelectionRows.set(p.id,p);else{reviewSelected.delete(p.id);reviewSelectionRows.delete(p.id);}}
   }catch(e){if(epoch===reviewEpoch){reviewFailure='查询失败，请刷新重试：'+e.message;reviewProposals=[];clearReviewSelection();}throw e;}
   finally{if(epoch===reviewEpoch){reviewBusy=false;renderReviewCards();if(batchActions())loadBatchJobs();}}
@@ -344,7 +348,7 @@ async function fetchReviewGroup(preserveSelection=false){
  if(!reviewGroupKey){reviewProposals=snapshot.proposals;reviewTotal=reviewProposals.length;return;}
  const [scope,persona,member]=JSON.parse(reviewGroupKey);const result=await api('apiPost','review_group',{scope,persona,member,page:reviewPage});if(epoch!==reviewEpoch)return;reviewProposals=result.proposals;reviewTotal=result.total;
 }
-$('#review-group').onchange=async()=>{try{reviewGroupKey=$('#review-group').value;reviewPage=1;reviewProposals=[];clearReviewSelection();await fetchReviewGroup();render();}catch(e){note(e.message,'error');}};
+$('#review-group').onchange=async()=>{try{reviewGroupKey=$('#review-group').value;reviewPage=1;clearReviewSelection();await fetchReviewGroup(false,true);render();}catch(e){note(e.message,'error');}};
 $('#review-prev').onclick=async()=>{try{if(reviewPage>1){reviewPage--;await fetchReviewGroup(groupReview());render();}}catch(e){note(e.message,'error');}};
 $('#review-next').onclick=async()=>{try{if(reviewPage*(groupReview()?50:30)<reviewTotal){reviewPage++;await fetchReviewGroup(groupReview());render();}}catch(e){note(e.message,'error');}};
 for(const b of document.querySelectorAll('[data-review-view]'))b.onclick=()=>{reviewView=b.dataset.reviewView;updateReviewFilters();};
@@ -358,13 +362,30 @@ function previewBatch(action='approve'){
  const selected=groupReview()?[...reviewSelectionRows.values()]:reviewProposals.filter(p=>reviewSelected.has(p.id));
  const candidates=reviewSelected.size?selected:visibleReviews();
  const rows=candidates.filter(p=>actionAllowed(p,action)).slice(0,batchLimit());
- if(!rows.length||!reviewGroupKey)return;
+ if(!rows.length||(!reviewGroupKey&&!groupReview()))return;
  pendingBatchAction=action;
  const items=rows.map(p=>({id:p.id,updated:p.updated}));
  if(groupReview()){
-  if(rows.some(p=>p.scope!==reviewGroupKey)){note('请选择同群的调整');return;}
-  pendingBatch={scope:reviewGroupKey,items};
-  $('#batch-summary').textContent=`${shortScope(reviewGroupKey)} · ${new Set(rows.map(p=>p.member)).size} 位成员/全群对象 · ${rows.length} 条调整`;
+  if(reviewGroupKey){
+   if(rows.some(p=>p.scope!==reviewGroupKey)){note('请选择同群的调整');return;}
+   pendingBatch={scope:reviewGroupKey,items};
+   $('#batch-summary').textContent=`${shortScope(reviewGroupKey)} · ${new Set(rows.map(p=>p.member)).size} 位成员/全群对象 · ${rows.length} 条调整`;
+  }else{
+   const byScope=new Map();
+   for(const row of rows){
+    if(!byScope.has(row.scope))byScope.set(row.scope,[]);
+    byScope.get(row.scope).push({id:row.id,updated:row.updated});
+   }
+   if(byScope.size===1){
+    const [onlyScope,scopeItems]=[...byScope.entries()][0];
+    pendingBatch={scope:onlyScope,items:scopeItems};
+    $('#batch-summary').textContent=`${shortScope(onlyScope)} · ${new Set(rows.map(p=>p.member)).size} 位成员/全群对象 · ${rows.length} 条调整`;
+   }else{
+    const grouped=[...byScope.entries()].map(([s,scopeItems])=>({scope:s,items:scopeItems}));
+    pendingBatch={grouped};
+    $('#batch-summary').textContent=`全部群（${grouped.length} 个群聊 · 按群分组提交） · ${new Set(rows.map(p=>p.member)).size} 位成员/全群对象 · ${rows.length} 条调整`;
+   }
+  }
  }else{const [scope,persona,member]=JSON.parse(reviewGroupKey);pendingBatch={scope,persona,member,items};$('#batch-summary').textContent=`${scope} · ${member?'成员 '+member:'本群整体'} · ${rows.length} 条调整`;}
  const labels={approve:['核对批量批准','确认批准并应用','逐项核对调整前后内容。提交时重新校验记录版本，任一项失效则整批不应用。'],
   review:['核对批量 LLM 审查','确认开始 LLM 审查','后台逐项审查，单项失败不撤销已完成项。成员资料通过后按现有规则自动生效，其他类别继续保留人工确认。'],
@@ -388,8 +409,24 @@ $('#commit-batch').onclick=async()=>{
  const b=$('#commit-batch');b.disabled=true;
  try{
   const action=pendingBatchAction,endpoint=['archive','release'].includes(action)?'governance_action':action==='review'?'group_batch_review':action==='reject'?'group_batch_reject':groupReview()?'group_batch_action':'batch_action';
-  const body={...pendingBatch};if(['archive','release'].includes(action))body.action=action;if(action==='reject')body.reason=$('#batch-reason').value;
-  const r=await api('apiPost',endpoint,body);$('#batch-confirm').close();clearReviewSelection();
+  let r;
+  if(pendingBatch?.grouped){
+   let count=0,completedGroups=0;const totalGroups=pendingBatch.grouped.length;
+   try{
+    for(const grp of pendingBatch.grouped){
+     const body={scope:grp.scope,items:grp.items};if(['archive','release'].includes(action))body.action=action;if(action==='reject')body.reason=$('#batch-reason').value;
+     const resp=await api('apiPost',endpoint,body);count+=resp.count||0;completedGroups++;
+    }
+   }catch(err){
+    if(completedGroups>0){clearReviewSelection();await load();throw new Error(`已完成 ${completedGroups}/${totalGroups} 个群（共 ${count} 项），后续失败：${err.message}`);}
+    throw err;
+   }
+   r={count};
+  }else{
+   const body={...pendingBatch};if(['archive','release'].includes(action))body.action=action;if(action==='reject')body.reason=$('#batch-reason').value;
+   r=await api('apiPost',endpoint,body);
+  }
+  $('#batch-confirm').close();clearReviewSelection();
   if(action==='review'){renderReviewCards();await loadBatchJobs();note(`已提交 ${r.count} 项 LLM 审查，可在任务进度查看逐项结果。`);}
   else{await load();note(action==='archive'?`已归档 ${r.count} 项失效提案，原始证据已保留。`:action==='release'?`已将 ${r.count} 项交回自动审查。`:action==='reject'?`已拒绝 ${r.count} 项，理由保留在各项审查历史中。`:`已应用 ${r.count} 条调整，每项均保留独立回滚记录。`);}
   selectionStatus();
@@ -422,7 +459,19 @@ function renderHome() {
   scene.attempts||0,scene.prepared_turns||0,scene.attempt_rate==null?'—':(scene.attempt_rate*100).toFixed(1)+'%',
   scene.timeouts||0,((scene.extra_wait_ms||0)/1000).toFixed(1));
  const nextCheck = snapshot.next_check_at ? formatTime(snapshot.next_check_at) : msg('等待调度');
+ const readiness = snapshot.provider_readiness;
+ const guidance = [];
+ if (snapshot.legacy_kv_v1?.present) {
+  guidance.push(el('p', 'muted', msg('检测到旧版 v1.4.1 共享 KV（{0} 条 learning_*_v1）：v2.0 使用独立 learning.sqlite3，不会自动导入旧调参数据，请在「会话与设置」核对生效会话并绑定模型。', snapshot.legacy_kv_v1.count || 1)));
+ }
+ if (readiness) {
+  const missing = [];
+  if (!readiness.analysis_provider?.ready) missing.push(msg(readiness.analysis_provider?.configured ? '分析模型不可用' : '未配置分析模型'));
+  if (!readiness.review_provider?.ready) missing.push(msg(readiness.review_provider?.configured ? '审查模型不可用' : '未配置审查模型'));
+  if (missing.length) guidance.push(el('p', 'muted', msg('模型配置状态：{0}；请在插件配置中绑定普通聊天模型。', missing.join(' · '))));
+ }
  $('#backlog-list').replaceChildren(
+  ...guidance,
   el('p','muted',status),
   el('p','muted',msg('采集队列 {0} · 模型排队 {1} · 下次检查 {2}',snapshot.queue,snapshot.scheduler?.waiting_models||0,nextCheck)),
   table(['群会话','待分析回合','原始回调'].map(key=>msg(key)),pending.map(batch=>[batch.scope,batch.count,batch.callbacks??batch.count]))
@@ -518,6 +567,7 @@ async function loadBatchJobs(){
  const names={queued:'排队',running:'审查中',pausing:'暂停中 · 等待当前项结束',paused:'已暂停',cancelling:'取消中 · 等待在途请求结束',cancelled:'已取消',reviewed:'审查通过',applied:'通过已生效',rejected:'已拒绝',deferred:'需补充证据',skipped:'已跳过',failed:'失败',interrupted:'已中断',completed:'已完成',completed_with_issues:'已结束 · 含失败或跳过'};
  try{
   const result=await api('apiPost','review_batch_jobs',{scope});if(epoch!==batchJobsEpoch||scope!==(reviewGroupKey||''))return;
+  hasActiveBatchJobs=(result.jobs||[]).some(j=>['queued','running','pausing','cancelling'].includes(j.status));
   const box=$('#batch-jobs'),openJobs=new Set([...box.querySelectorAll('details[open][data-job-id]')].map(d=>d.dataset.jobId));box.hidden=!result.jobs.length;box.replaceChildren();if(!result.jobs.length)return;
   const head=el('div','job-heading');head.append(el('h3','','批量 LLM 审查'),button(msg("更新待审列表"),()=>fetchReviewGroup().then(renderReviewCards)));box.append(head);
   for(const job of result.jobs){
@@ -543,7 +593,7 @@ async function controlBatchJob(job,action){
  await loadBatchJobs();
  note(action==='retry'?`已提交重试（${r.count} 项）${r.retry_skipped?'，另有 '+r.retry_skipped+' 项因已变化而跳过':''}`:action==='pause'?'已请求暂停，当前项结束后停止。':action==='resume'?'已恢复未完成项，已完成结果不会重跑。':'已请求取消，已完成结果保留。');
 }
-setInterval(()=>{if(activeSection==='proposals'&&!document.hidden)loadBatchJobs();},5000);
+setInterval(()=>{if(activeSection==='proposals'&&!document.hidden&&hasActiveBatchJobs)loadBatchJobs();},5000);
 
 
 for(const id of ['entries-scope','entries-state'])$('#'+id).onchange=()=>{clearEntries();return loadEntries();};

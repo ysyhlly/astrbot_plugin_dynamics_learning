@@ -8,7 +8,7 @@ ensure_current(
     __package__,
     __name__,
     __file__,
-    version="0.14.0-beta.2.culture.1.affection.1",
+    version="2.0.0-rc.2",
     checks=[("core.engine", "Engine", "_review_contract_v1")],
 )
 
@@ -42,6 +42,47 @@ class DynamicsLearning(Star):
         self.ready = False
         self.jobs = set()
         self.projection_error = ""
+        self.legacy_kv_v1 = {"present": False, "count": 0}
+
+    async def _detect_legacy_kv_v1(self):
+        """Read-only check for residual v1.4.1 learning_*_v1 shared KV keys; never migrates or applies them."""
+        try:
+            from astrbot.core import sp
+        except Exception:
+            return {"present": False, "count": 0}
+        if getattr(sp, "db_helper", None) is None:
+            return {"present": False, "count": 0}
+        count = 0
+        plugin_id = getattr(self, "name", None) or PLUGIN
+        for scope, scope_id in (("plugin", plugin_id), ("global", "global"), ("global", None)):
+            try:
+                rows = await sp.range_get_async(scope, scope_id, None)
+            except Exception:
+                continue
+            for pref in rows or ():
+                key = str(getattr(pref, "key", "") or "")
+                if key.startswith("learning_") and key.endswith("_v1"):
+                    count += 1
+            if count:
+                break
+        return {"present": count > 0, "count": count}
+
+    def _provider_status(self):
+        status = {}
+        get_provider = getattr(self.context, "get_provider_by_id", None)
+        for role in ("analysis_provider", "review_provider"):
+            pid = str(self.config.get(role, "") or "")
+            if not pid:
+                status[role] = {"configured": False, "ready": False, "provider_id": ""}
+                continue
+            provider = get_provider(pid) if callable(get_provider) else None
+            ready = bool(
+                provider is not None
+                and callable(getattr(provider, "text_chat", None))
+                and not getattr(provider, "is_native_decision_provider", False)
+            )
+            status[role] = {"configured": True, "ready": ready, "provider_id": pid}
+        return status
 
     async def initialize(self):
         from importlib import reload
@@ -53,6 +94,7 @@ class DynamicsLearning(Star):
         store = await asyncio.to_thread(Store, path)
         await asyncio.to_thread(store.enforce_personality_policy)
         await asyncio.to_thread(store.native.bootstrap_scopes)
+        self.legacy_kv_v1 = await self._detect_legacy_kv_v1()
         self.engine = Engine(store, self.config, self._model)
         await self.engine.refresh()
         self.engine.social = await asyncio.to_thread(Social, self.engine, self.context, logger)
@@ -107,10 +149,11 @@ class DynamicsLearning(Star):
         }
 
     def peek_context_revision(self, scope):
+        scope_key = str(scope.get("umo", ""))
         return {
             "available": bool(self.ready and replacement_allowed(self)),
-            "scope_key": str(scope.get("umo", "")),
-            "generation": self.engine.projection_generation if self.engine else 0,
+            "scope_key": scope_key,
+            "generation": self.engine.scope_projection_generation(scope_key) if self.engine else 0,
         }
 
     async def observe_events(self, events):
@@ -208,13 +251,12 @@ class DynamicsLearning(Star):
         if not persona or not isinstance(query, str) or len(query) > 16000:
             return empty
         terms = []
-        for entry in self.engine.cache:
+        now = time.time()
+        for entry in self.engine._entries_for(scope, persona):
             if (
-                entry["scope"] != scope
-                or entry["persona"] != persona
-                or entry["category"] != "jargon"
+                entry["category"] != "jargon"
                 or not entry["active"]
-                or entry["expires"] <= time.time()
+                or entry["expires"] <= now
             ):
                 continue
             if query and entry["key"] not in query:
@@ -568,6 +610,8 @@ class DynamicsLearning(Star):
                 "social_queue": self.engine.social.queue.qsize(),
                 "social_dropped": self.engine.social.dropped,
                 "social_last_error": self.engine.social.last_error,
+                "provider_readiness": self._provider_status(),
+                "legacy_kv_v1": self.legacy_kv_v1,
             }
 
         return await self._serve(operation)
@@ -863,9 +907,14 @@ class DynamicsLearning(Star):
                 text(body.get("reason"), "reason", 1000),
                 actor,
             )
+            queued = False
             if p["mode"] != "human" and p["state"] == "pending":
-                self._enqueue_job("review:" + p["id"], lambda: self.engine.review(p["id"]))
-            return {"id": p["id"], "state": p["state"]}
+                try:
+                    self._enqueue_job("review:" + p["id"], lambda: self.engine.review(p["id"]))
+                    queued = True
+                except ValueError:
+                    queued = False
+            return {"id": p["id"], "state": p["state"], "queued": queued}
 
         return await self._serve(operation, ("id", "revision", "value", "reason"))
 
