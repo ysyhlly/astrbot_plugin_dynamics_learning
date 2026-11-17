@@ -26,6 +26,7 @@ from .core.native import current_persona, group_projection, private_projection, 
 from .core.profiles import native_message
 from .core.social import Social, character_key, observed_event
 from .core.store import Store
+from .series_panels import get_series_defaults, inherit_provider, inherit_umos
 
 PLUGIN = "astrbot_plugin_dynamics_learning"
 
@@ -67,11 +68,39 @@ class DynamicsLearning(Star):
                 break
         return {"present": count > 0, "count": count}
 
+    def _effective_sessions(self) -> list[str]:
+        fn = getattr(self.engine, "effective_sessions", None)
+        if callable(fn):
+            return fn()
+        explicit = self.config.get("sessions")
+        if explicit:
+            return list(explicit)
+        return inherit_umos([], self.context) if self.context is not None else []
+
+    def _effective_provider(self, role: str) -> str:
+        if self.engine is not None:
+            return str(self.engine.provider_for(role) or "").strip()
+        explicit = str(self.config.get(role, "") or "").strip()
+        if explicit:
+            return explicit
+        if role == "analysis_provider":
+            return inherit_provider("", self.context, role="reply")
+        if role == "review_provider":
+            defaults = get_series_defaults(self.context)
+            candidate = str(defaults.get("decision_provider") or "").strip()
+            if candidate:
+                getter = getattr(self.context, "get_provider_by_id", None)
+                provider = getter(candidate) if callable(getter) else None
+                if provider is None or not getattr(provider, "is_native_decision_provider", False):
+                    return candidate
+            return str(defaults.get("reply_provider") or "").strip()
+        return ""
+
     def _provider_status(self):
         status = {}
         get_provider = getattr(self.context, "get_provider_by_id", None)
         for role in ("analysis_provider", "review_provider"):
-            pid = str(self.config.get(role, "") or "")
+            pid = self._effective_provider(role)
             if not pid:
                 status[role] = {"configured": False, "ready": False, "provider_id": ""}
                 continue
@@ -95,7 +124,7 @@ class DynamicsLearning(Star):
         await asyncio.to_thread(store.enforce_personality_policy)
         await asyncio.to_thread(store.native.bootstrap_scopes)
         self.legacy_kv_v1 = await self._detect_legacy_kv_v1()
-        self.engine = Engine(store, self.config, self._model)
+        self.engine = Engine(store, self.config, self._model, host_context=self.context)
         await self.engine.refresh()
         self.engine.social = await asyncio.to_thread(Social, self.engine, self.context, logger)
         await self.engine.social.initialize()
@@ -136,7 +165,7 @@ class DynamicsLearning(Star):
             ("usage", self.usage, ["POST"]),
         ):
             self.context.register_web_api(f"/{PLUGIN}/{endpoint}", handler, methods, "群间学习审查中心")
-        logger.info("[DynamicsLearning] Ready; configured scopes=%s", len(self.config.get("sessions", [])))
+        logger.info("[DynamicsLearning] Ready; configured scopes=%s", len(self._effective_sessions()))
         self.ready = True
 
     def get_dynamics_capabilities(self):
@@ -163,7 +192,7 @@ class DynamicsLearning(Star):
             raise ValueError("invalid native event batch")
         async with self.engine.lock:
             accepted = await asyncio.to_thread(
-                self.engine.store.native.observe, events, self.config.get("sessions", [])
+                self.engine.store.native.observe, events, self._effective_sessions()
             )
         return {"schema_version": 1, "available": True, "accepted": accepted}
 
@@ -517,7 +546,7 @@ class DynamicsLearning(Star):
         return encode(self.engine.social.query(scope, member, kind, str(term or "").strip()))
 
     async def _model(self, role, instruction, data):
-        provider_id = str(self.config.get(role, "") or "")
+        provider_id = self._effective_provider(role)
         if not provider_id:
             raise ValueError("请先配置" + ("分析模型" if role == "analysis_provider" else "审查模型"))
         provider = self.context.get_provider_by_id(provider_id)
@@ -537,7 +566,7 @@ class DynamicsLearning(Star):
         if (
             self.closed
             or self.context.get_provider_by_id(provider_id) is not provider
-            or self.config.get(role) != provider_id
+            or self._effective_provider(role) != provider_id
         ):
             raise ValueError("模型绑定已改变，本次结果失效")
         content = getattr(response, "completion_text", None)
@@ -647,7 +676,7 @@ class DynamicsLearning(Star):
     async def entries(self):
         async def operation(body, actor):
             scope = text(body.get("scope", ""), "scope", 512, empty=True)
-            scopes = tuple(self.config.get("sessions", []))
+            scopes = tuple(self._effective_sessions())
             if scope and scope not in scopes:
                 raise ValueError("scope not enabled")
             return await asyncio.to_thread(
@@ -667,7 +696,7 @@ class DynamicsLearning(Star):
     async def proposal_detail(self):
         async def operation(body, actor):
             p = await asyncio.to_thread(self.engine.store.get, text(body.get("id"), "id", 128))
-            if p["scope"] not in self.config.get("sessions", []):
+            if p["scope"] not in self._effective_sessions():
                 raise ValueError("scope not enabled")
             if p["state"] in {"applied", "rolled_back"}:
                 p["observations"] = await asyncio.to_thread(self.engine.store.observations, p)
@@ -678,7 +707,7 @@ class DynamicsLearning(Star):
     async def usage(self):
         async def operation(body, actor):
             scope = text(body.get("scope"), "scope", 512)
-            if scope not in self.config.get("sessions", []):
+            if scope not in self._effective_sessions():
                 raise ValueError("scope not enabled")
             return await asyncio.to_thread(self.engine.store.console.usage, scope, body.get("page", 1))
 
@@ -695,7 +724,7 @@ class DynamicsLearning(Star):
     async def history(self):
         async def operation(body, actor):
             scope = text(body.get("scope"), "scope", 512)
-            if scope not in self.config.get("sessions", []):
+            if scope not in self._effective_sessions():
                 raise ValueError("scope not enabled")
             return await asyncio.to_thread(
                 self.engine.store.native.history,
@@ -709,7 +738,7 @@ class DynamicsLearning(Star):
     async def review_group(self):
         async def operation(body, actor):
             scope = text(body.get("scope"), "scope", 512)
-            if scope not in self.config.get("sessions", []):
+            if scope not in self._effective_sessions():
                 raise ValueError("scope not enabled")
             result = await asyncio.to_thread(
                 self.engine.store.review_group,
@@ -756,7 +785,7 @@ class DynamicsLearning(Star):
             return await asyncio.to_thread(
                 library,
                 self.engine.store,
-                self.config.get("sessions", []),
+                self._effective_sessions(),
                 text(body.get("scope", ""), "scope", 512, empty=True),
                 text(body.get("state", ""), "state", 32, empty=True),
                 text(body.get("category", ""), "category", 80, empty=True),
@@ -773,7 +802,7 @@ class DynamicsLearning(Star):
             return await asyncio.to_thread(
                 detail,
                 self.engine.store,
-                self.config.get("sessions", []),
+                self._effective_sessions(),
                 text(body.get("proposal_id", ""), "proposal_id", 128, empty=True),
                 text(body.get("entry_id", ""), "entry_id", 256, empty=True),
             )
@@ -837,7 +866,7 @@ class DynamicsLearning(Star):
             key = "batch-review:" + scope
             if key in self.jobs or len(self.jobs) >= 2:
                 raise ValueError("已有任务运行，请等待完成")
-            if not self.config.get("review_provider"):
+            if not self._effective_provider("review_provider"):
                 raise ValueError("请先配置审查模型")
             job = await self.engine.review_batches.prepare(scope, body.get("items"), actor)
             try:

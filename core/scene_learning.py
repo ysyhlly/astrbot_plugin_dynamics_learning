@@ -51,7 +51,7 @@ class SceneLearning:
         if not isinstance(text, str) or len(text) > 4000 or not isinstance(context, list) or len(encode(context)) > 8000:
             return {}
         token = e.scope_token(scope)
-        provider = e.config.get('analysis_provider')
+        provider = e.provider_for('analysis_provider')
         # This is also capped by the host; queue time counts towards the five seconds.
         try:
             async with asyncio.timeout(5):
@@ -59,7 +59,7 @@ class SceneLearning:
                     {'scope': scope, 'member': member, 'text': text, 'context': context},
                     lambda: self.enabled(scope, persona) and token == e.scope_token(scope),
                     fast_lane=True)
-            if token != e.scope_token(scope) or provider != e.config.get('analysis_provider') or not self.enabled(scope, persona):
+            if token != e.scope_token(scope) or provider != e.provider_for('analysis_provider') or not self.enabled(scope, persona):
                 return {}
             if not isinstance(result, dict) or set(result) != set(scene_labels({})):
                 return {}

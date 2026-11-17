@@ -170,7 +170,7 @@ class ReviewBatches:
                     raise ValueError("没有未完成项；失败项请使用一键重试")
                 if (
                     require_provider
-                    and not self.engine.config.get("review_provider")
+                    and not self.engine.provider_for("review_provider")
                     and any(i["status"] == "queued" and not i.get("apply_only") for i in job["items"])
                 ):
                     raise ValueError("请先配置审查模型")
@@ -203,7 +203,7 @@ class ReviewBatches:
                         apply_ids.add(p["id"])
                 if not rows:
                     raise ValueError("没有可重试的记录；提案可能已被处理或修改")
-                if require_provider and not self.engine.config.get("review_provider") and len(apply_ids) != len(rows):
+                if require_provider and not self.engine.provider_for("review_provider") and len(apply_ids) != len(rows):
                     raise ValueError("请先配置审查模型")
                 with self.store.transaction():
                     child = self.create(job["scope"], rows, actor, parent=job, apply_only=apply_ids)
@@ -217,7 +217,7 @@ class ReviewBatches:
             return job
 
     def recent(self, scope=""):
-        scopes = [s for s in self.engine.config.get("sessions", []) if self.engine.allowed(s)]
+        scopes = [s for s in self.engine.effective_sessions() if self.engine.allowed(s)]
         if scope and scope not in scopes:
             raise ValueError("scope not enabled")
         with self.store.lock:

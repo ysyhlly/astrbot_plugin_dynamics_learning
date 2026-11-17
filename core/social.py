@@ -104,7 +104,7 @@ class Social:
 
     async def initialize(self):
         await self.write(self.graph.apply_daily_decay(self.settings['daily_decay']))
-        for scope in self.engine.config.get('sessions', []):
+        for scope in self.engine.effective_sessions():
             if group_id(scope):
                 self.request_refresh(scope)
         with self.store.lock:
