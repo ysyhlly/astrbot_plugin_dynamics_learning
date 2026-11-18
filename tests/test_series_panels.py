@@ -57,8 +57,11 @@ def test_status_requires_admin_and_owned_routes_unregister(monkeypatch):
     response=asyncio.run(first.status())
     assert response.status_code==403
     panels.register_series_panels(owner,'test')
-    assert len(context.registered_web_apis)==1
+    expected={"/test/series_presence", "/test/series_workspace/open/<target>",
+              "/test/series_workspace/panel/<target>/<path:operation>"}
+    assert len(context.registered_web_apis)==len(expected)
+    assert {row[0] for row in context.registered_web_apis}==expected
     first.close()
-    assert len(context.registered_web_apis)==1
+    assert {row[0] for row in context.registered_web_apis}==expected
     owner._series_panels.close()
     assert not context.registered_web_apis

@@ -32,5 +32,8 @@ def test_presence_buttons_and_safe_navigation_fallback(server,width):  # noqa: F
         assert page.evaluate('window.__nav[0].slice(0,2)')==['astrbot_plugin_chat_dynamics','app']
         page.evaluate('delete window.AstrBotPluginPage.navigateToPlugin')
         root.get_by_role('button').filter(has_text='对话主控').click()
-        assert '宿主未提供跨插件导航' in root.inner_text()
+        assert '请更新入口和目标群间插件后重试' in root.inner_text()
+        page.evaluate('window.DynamicsWorkspace={open:async(id,view)=>window.__nav.push([id,view])}')
+        root.get_by_role('button').filter(has_text='对话主控').click()
+        assert page.evaluate('window.__nav[1]')==['astrbot_plugin_chat_dynamics','app']
         browser.close()
