@@ -460,3 +460,27 @@ def test_scene_summary_cache_invalidates_on_write(store):
     store.scenes.receipt({'scope':SCOPE,'persona':PERSONA,'turn_id':'t1','member':'alice','stage':'disambiguation','status':'succeeded','elapsed_ms':120,'refs':[]})
     updated=store.scenes.summary()
     assert updated['attempts']==1 and updated['extra_wait_ms']==120
+
+
+def test_same_session_rotates_personas_even_if_one_fails(store):
+    async def run():
+        engine = Engine(store, {"sessions": [SCOPE], "batch_events": 1}, None)
+        engine.current_personas[SCOPE] = "current"
+        batches = [{"scope": SCOPE, "persona": name, "count": 50, "oldest": i}
+                   for i, name in enumerate(("old", "older", "current"))]
+        store.batches = lambda minimum: batches
+        calls = []
+
+        async def analyze(scope, persona):
+            calls.append(persona)
+            if persona == "old":
+                raise ValueError("fixture failure")
+
+        engine.analyze = analyze
+        await engine.analysis_cycle()
+        assert calls[0] == "current"
+        assert set(calls) == {"old", "older", "current"}
+        assert calls.count("old") == 1
+        assert len(calls) == 4
+
+    asyncio.run(run())

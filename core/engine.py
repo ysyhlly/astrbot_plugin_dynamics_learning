@@ -99,6 +99,7 @@ class Engine:
         self.latest = {}
         self.social = None
         self.current_personas = {}
+        self.analysis_last_served = {}
         self.character_scopes = {}
         self.projection_generation = 0
         self.scope_projection_generations = {}
@@ -1291,32 +1292,42 @@ class Engine:
         interval = max(60, int(self.config.get("analysis_interval", 600)))
         failed = set()
         visited = set()
-        # Round-robin catch-up: one page per scope before any second page.
-        for _ in range(4):
+        for round_number in range(4):
             batches = await asyncio.to_thread(self.store.batches, 1)
-            selected = [
-                b
-                for b in batches
-                if self.allowed(b["scope"])
-                and b["scope"] not in failed
-                and (b["count"] >= threshold or b["scope"] in visited or b["oldest"] <= time.time() - interval)
-            ]
-            unique = {}
-            for batch in selected:
-                unique.setdefault(batch["scope"], batch)
-            selected = list(unique.values())
+            now = time.time()
+            pending = {(b["scope"], b["persona"]) for b in batches}
+            self.analysis_last_served = {
+                pair: served for pair, served in self.analysis_last_served.items() if pair in pending
+            }
+            # Reserve the first eligible page for the current character after a switch.
+            # The other pages rotate even when an older character has a large backlog.
+            selected = {}
+            for batch in batches:
+                scope, persona = pair = (batch["scope"], batch["persona"])
+                if pair in failed or not self.allowed(scope):
+                    continue
+                if batch["count"] < threshold and pair not in visited and batch["oldest"] > now - interval:
+                    continue
+                priority = (
+                    round_number == 0 and self.current_personas.get(scope) != persona,
+                    self.analysis_last_served.get(pair, 0.0),
+                    batch["oldest"],
+                )
+                if scope not in selected or priority < selected[scope][0]:
+                    selected[scope] = (priority, pair)
             if not selected:
                 break
 
-            async def run(batch):
+            async def run(pair):
+                self.analysis_last_served[pair] = time.monotonic()
                 try:
-                    await self.analyze(batch["scope"], batch["persona"])
-                    visited.add(batch["scope"])
+                    await self.analyze(*pair)
+                    visited.add(pair)
                 except Exception as exc:
-                    failed.add(batch["scope"])
+                    failed.add(pair)
                     self.last_error = type(exc).__name__
 
-            await asyncio.gather(*(run(batch) for batch in selected))
+            await asyncio.gather(*(run(pair) for _, pair in selected.values()))
 
     async def review_pending_proposals(self):
         rows = await asyncio.to_thread(self.store.pending_catchup_proposals, 200)

@@ -6,12 +6,34 @@ import json
 import os
 import re
 import zipfile
+import subprocess
 from pathlib import Path
 
 SKIP_DIRS = {'.git', '.omo', '.agents', '.codex', 'node_modules', '__pycache__', '.pytest_cache', '.ruff_cache', '.mypy_cache', '.venv', 'venv', 'data', 'backups', 'dist', 'output', 'htmlcov'}
 SOURCE_ONLY = {'tests', 'integration', 'integration_tests', '.github', 'docs', 'tools', 'scripts', 'frontend'}
 SKIP_FILES = {'validation.json', 'cmd_config.json', 'requirements-dev.txt', 'nul'}
 STATE_SUFFIXES = {'.db', '.sqlite', '.sqlite3', '.pyc', '.pyo', '.log', '.zip', '.tar', '.tgz', '.pem', '.key'}
+
+def release_metadata(root):
+    """Identify clean checkouts and preserve the commit recorded by git archive."""
+    raw = (root / "metadata.yaml").read_bytes()
+    marker = b"$Format:%H$"
+    if marker not in raw or not (root / ".git").exists():
+        return raw
+    try:
+        if subprocess.check_output(
+            ["git", "-C", str(root), "status", "--porcelain"], stderr=subprocess.DEVNULL, timeout=5
+        ).strip():
+            return raw
+        revision = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"], stderr=subprocess.DEVNULL, timeout=5
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return raw
+    if len(revision) not in (40, 64) or any(c not in b"0123456789abcdef" for c in revision):
+        return raw
+    return raw.replace(marker, revision)
+
 
 def files(root: Path):
     for base, directories, names in os.walk(root):
@@ -23,7 +45,8 @@ def files(root: Path):
             yield path
 
 def build(root: Path, output: Path):
-    metadata = (root / 'metadata.yaml').read_text('utf-8-sig')
+    metadata_raw = release_metadata(root)
+    metadata = metadata_raw.decode('utf-8-sig')
     name = re.search(r'^name:\s*[\"\']?([^\s\"\']+)', metadata, re.M).group(1)
     version = re.search(r'^version:\s*[\"\']?([^\s\"\']+)', metadata, re.M).group(1)
     assert re.fullmatch(r'[A-Za-z0-9_.+-]+', name + version)
@@ -36,7 +59,7 @@ def build(root: Path, output: Path):
             rel = path.relative_to(root)
             if kind == 'install' and (rel.parts[0] in SOURCE_ONLY or rel.name in SKIP_FILES or rel.name in {'package.json', 'package-lock.json', 'pyproject.toml', 'pytest.ini', '.coveragerc', '.gitignore', '.gitattributes'}):
                 continue
-            raw = path.read_bytes()
+            raw = metadata_raw if rel.as_posix() == 'metadata.yaml' else path.read_bytes()
             if path.suffix == '.py':
                 compile(raw, rel.as_posix(), 'exec')
             contents[rel.as_posix()] = raw
