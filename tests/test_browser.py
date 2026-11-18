@@ -32,6 +32,14 @@ def test_shared_theme_preference_survives_reload_and_host_theme(server):
 @pytest.fixture(scope="module")
 def server():
     class Handler(SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/api/plugin/page/bridge-sdk.js":
+                # Tests install the bridge with page.add_init_script before loading the view.
+                self.send_response(204)
+                self.end_headers()
+                return
+            super().do_GET()
+
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(ROOT / "pages" / "review"), **kwargs)
 
