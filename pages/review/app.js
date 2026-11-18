@@ -121,7 +121,7 @@ const displayValue=v=>{
 };
 const el = (tag, cls, value) => {const e=document.createElement(tag);if(cls)e.className=cls;if(value!==undefined)setText(e,typeof value==='string'&&['badge','review-category'].includes(cls)?msg(value):value);return e;};
 const note = (value,state='info') => {feedback($('#notice'),value,state);};
-async function api(method,path,body){const bridge=window.AstrBotPluginPage;if(!bridge)throw Error('请从 AstrBot 插件详情打开此页面。');const r=await bridge[method](path,body||{});if(r.status==='error'||r.ok===false)throw Error(r.message||r.error||'请求失败');return r.data??r;}
+async function api(method,path,body){const bridge=(window.DynamicsPanelBridge || window.AstrBotPluginPage);if(!bridge)throw Error('请从 AstrBot 插件详情打开此页面。');const r=await bridge[method](path,body||{});if(r.status==='error'||r.ok===false)throw Error(r.message||r.error||'请求失败');return r.data??r;}
 function button(label,fn,cls=''){const b=el('button',cls,label);b.type='button';b.addEventListener('click',async()=>{if(b.disabled)return;b.disabled=true;b.setAttribute('aria-busy','true');try{await fn();}catch(e){note(e.message,'error');}finally{b.disabled=false;b.removeAttribute('aria-busy');}});return b;}
 function details(label,value){const d=el('details');d.append(el('summary','',label),el('pre','',typeof value==='string'?value:JSON.stringify(value,null,2)));return d;}
 function scopeLine(p){return `${p.scope} · 人格 ${p.persona.slice(0,12)} · ${p.member?'成员 '+p.member:'当前会话'}`;}
@@ -296,7 +296,7 @@ $('#social-scope').onchange=()=>{
  loadSocial();
 };
 let jargonTimer;$('#jargon-search').oninput=()=>{if(!socialSnapshot?.details_paged){renderJargon();return;}clearTimeout(jargonTimer);jargonTimer=setTimeout(()=>{socialPages.jargon=1;loadSocialTable('jargon');},250);};
-if(window.AstrBotPluginPage?.ready)await window.AstrBotPluginPage.ready();
+if((window.DynamicsPanelBridge || window.AstrBotPluginPage)?.ready)await (window.DynamicsPanelBridge || window.AstrBotPluginPage).ready();
 await load();
 
 $('#profile-load').onclick=async()=>{const current=ticket('profile');try{

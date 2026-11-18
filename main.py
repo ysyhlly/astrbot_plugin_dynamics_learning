@@ -8,7 +8,7 @@ ensure_current(
     __package__,
     __name__,
     __file__,
-    version="2.0.0-rc.2",
+    version="2.0.0-rc.3",
     checks=[("core.engine", "Engine", "_review_contract_v1")],
 )
 
@@ -117,6 +117,7 @@ class DynamicsLearning(Star):
         from importlib import reload
 
         from . import series_panels
+        from .series_workspace import register_panel_api
 
         reload(series_panels).register_series_panels(self, "astrbot_plugin_dynamics_learning")
         path = StarTools.get_data_dir(PLUGIN) / "learning.sqlite3"
@@ -164,7 +165,7 @@ class DynamicsLearning(Star):
             ("member_detail", self.member_detail, ["POST"]),
             ("usage", self.usage, ["POST"]),
         ):
-            self.context.register_web_api(f"/{PLUGIN}/{endpoint}", handler, methods, "群间学习审查中心")
+            register_panel_api(self, self.context.register_web_api, f"/{PLUGIN}/{endpoint}", handler, methods, "群间学习审查中心")
         logger.info("[DynamicsLearning] Ready; configured scopes=%s", len(self._effective_sessions()))
         self.ready = True
 
