@@ -443,7 +443,10 @@ class DynamicsLearning(Star):
             if content and isinstance(getattr(req, "extra_user_content_parts", None), list):
                 from astrbot.core.agent.message import TextPart
 
-                req.extra_user_content_parts.append(TextPart(text=content))
+                part = TextPart(text=content)
+                if hasattr(part, "mark_as_temp"):
+                    part = part.mark_as_temp() or part
+                req.extra_user_content_parts.append(part)
                 setter = getattr(event, "set_extra", None)
                 if callable(setter):
                     setter("_dynamics_learning_injected_v1", True)

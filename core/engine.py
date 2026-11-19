@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from decimal import Decimal
 
 from .affection import state as affection_state
@@ -15,6 +15,7 @@ from .contract import (
     MODES,
     PERSONALITY_POLICY,
     candidate,
+    digest,
     encode,
     entry_key,
     event_record,
@@ -22,7 +23,9 @@ from .contract import (
     policy_allowed,
     review_result,
 )
+from .expressions import REVIEW_STYLE
 from .review_batches import ReviewUnavailable
+from .scenes import REVIEW_SCENES
 from .store import Conflict
 from ..series_panels import get_series_defaults, inherit_provider, inherit_umos
 
@@ -69,6 +72,53 @@ evidence_ids 必须包含这条 source_id。只描述群友自己的喜恶，不
 REVIEW += """\nexpression_example 是程序提取的真人原话对，adjacent 仅说明相邻，不保证在回应对方；审查真实语境、归属、隐私和角色兼容性。
 typing_habit 的 observed_typing 是可复算统计，检查样本是否有代表性，不把数字当成固定性格。
 preference 检查 quote 是否为该成员本人认真表达的自述，condition 是否准确；特别拒绝他人引语、讽刺、玩笑和假设句。"""
+
+BATCH_REVIEW_RULE = (
+    "\n当输入包含 proposals 列表与 evidence_pool 证据池时，按每条提案的 evidence_ids 在 evidence_pool 中核对真实证据，"
+    "对列表中的每条提案独立审查，输出且仅输出 JSON："
+    '{"verdicts":[{"proposal_id":"提案id","verdict":"approve|reject|defer","reason":"审查理由","risks":["风险或待观察项"]}]}。'
+    "每条提案必须且仅输出一条对应 proposal_id 的审查结果；若输入为单条 proposal，仍输出单个 verdict JSON 对象。"
+)
+UNIFIED_REVIEW = REVIEW + REVIEW_SCENES + REVIEW_STYLE + BATCH_REVIEW_RULE
+
+GROUP_ANALYZE_CATEGORIES = frozenset({"jargon", "participation", "decision_guidance"})
+DEDICATED_ANALYZE_CATEGORIES = frozenset(
+    {"scene_pattern", "scene_adjustment", "expression_style", "expression_adjustment"}
+)
+REVIEW_BATCH_MAX = 8
+REVIEW_BATCH_PAYLOAD_BUDGET = 120_000
+
+
+def parse_batch_review_verdicts(raw, expected_ids):
+    """Validate a batched LLM review response against review_result().
+
+    Returns (valid_verdicts, fallback_ids). Any omitted, duplicated, or malformed
+    verdict is routed to fallback_ids for safe single-proposal review.
+    """
+    expected_list = list(expected_ids)
+    expected_set = set(expected_list)
+    if not isinstance(raw, dict) or set(raw) != {"verdicts"} or not isinstance(raw["verdicts"], list):
+        return {}, expected_list
+    valid = {}
+    ambiguous = set()
+    for item in raw["verdicts"]:
+        if not isinstance(item, dict) or set(item) != {"proposal_id", "verdict", "reason", "risks"}:
+            continue
+        pid = item.get("proposal_id")
+        if not isinstance(pid, str) or pid not in expected_set or pid in ambiguous:
+            continue
+        if pid in valid:
+            valid.pop(pid, None)
+            ambiguous.add(pid)
+            continue
+        try:
+            verdict = review_result({k: item[k] for k in ("verdict", "reason", "risks")})
+        except (ValueError, TypeError):
+            ambiguous.add(pid)
+            continue
+        valid[pid] = verdict
+    fallback = [pid for pid in expected_list if pid not in valid]
+    return valid, fallback
 
 
 class Engine:
@@ -639,7 +689,7 @@ class Engine:
                 native = await asyncio.to_thread(
                     self.store.profiles.sources_for_events, scope, persona, batch["events"]
                 )
-                base_payload_len = len(encode({"events": [], "member_sources": []}))
+                base_payload_len = len(encode({"current": [], "events": [], "member_sources": []}))
                 selected = []
                 supplied = {}
                 frontiers = []
@@ -680,9 +730,25 @@ class Engine:
                     and (e["category"] == "affection" or e["expires"] > now)
                     and policy_allowed(e)
                 ]
+                batch_members = {
+                    str(e.get("member") or "")
+                    for e in (*selected, *supplied)
+                    if e.get("member")
+                }
+                relevant_active = [
+                    e
+                    for e in active
+                    if e.get("category") not in DEDICATED_ANALYZE_CATEGORIES
+                    and (
+                        (e.get("member") or "") in batch_members
+                        or not (e.get("member") or "")
+                        or e.get("category") in GROUP_ANALYZE_CATEGORIES
+                    )
+                ]
+                relevant_active.sort(key=lambda e: (e.get("created_at", 0), e["id"]))
                 current = []
                 current_len = 2
-                for entry in reversed(active):
+                for entry in relevant_active:
                     next_len = current_len + len(encode(entry)) + (1 if current else 0)
                     if next_len > 16_000:
                         break
@@ -692,7 +758,7 @@ class Engine:
             output = await self.invoke_model(
                 "analysis_provider",
                 ANALYZE,
-                {"events": selected, "current": current, "member_sources": supplied},
+                {"current": current, "events": selected, "member_sources": supplied},
                 lambda: (
                     self.allowed(scope)
                     and token == self.scope_token(scope)
@@ -799,18 +865,16 @@ class Engine:
                 )
                 self.completed_batches += 1
         await self.apply_pending_affection()
-        for proposal in created:
-            if proposal["state"] not in {"pending", "reviewed"} or self.store.review_claim(proposal["id"]):
-                continue
-            if proposal["category"] == "affection" and self.mode("affection") == "auto":
-                continue
-            if proposal["mode"] not in {"human", "auto"} and proposal["state"] == "pending":
-                try:
-                    await self.review(proposal["id"])
-                except ReviewUnavailable:
-                    pass
-                except Exception as exc:
-                    self.last_error = type(exc).__name__
+        pending_ids = [
+            proposal["id"]
+            for proposal in created
+            if proposal["state"] == "pending"
+            and not self.store.review_claim(proposal["id"])
+            and not (proposal["category"] == "affection" and self.mode("affection") == "auto")
+            and proposal["mode"] not in {"human", "auto"}
+        ]
+        if pending_ids:
+            await self.review_batch(pending_ids)
         return {
             "proposals": len(created),
             "invalid_candidates": rejected,
@@ -945,13 +1009,6 @@ class Engine:
                 provider_id = self.provider_for("review_provider")
                 if started and not start_recorded:
                     started(p)
-            from .scenes import REVIEW_SCENES, SCENE_CATEGORIES
-
-            instruction = REVIEW + (REVIEW_SCENES if p["category"] in SCENE_CATEGORIES else "")
-            from .expressions import EXPRESSION_CATEGORIES, REVIEW_STYLE
-
-            if p["category"] in EXPRESSION_CATEGORIES:
-                instruction += REVIEW_STYLE
             review_data = {"proposal": p}
             if p["category"] in {"expression_adjustment", "scene_adjustment"}:
                 target = next(
@@ -971,7 +1028,7 @@ class Engine:
             result = review_result(
                 await self.invoke_model(
                     "review_provider",
-                    instruction,
+                    UNIFIED_REVIEW,
                     review_data,
                     lambda: (
                         valid()
@@ -1014,6 +1071,420 @@ class Engine:
                         p, actor, owner=owner, applied=(lambda row: receipt(row, result)) if receipt else None
                     )
                 return await asyncio.to_thread(self.store.get, p["id"])
+
+    def _build_batch_review_payload(self, scope, persona, proposals):
+        evidence_pool = {}
+        compact_proposals = []
+        for p in proposals:
+            ev_ids = []
+            for ev in p.get("evidence") or []:
+                ev_id = str(ev.get("id") or "") if isinstance(ev, dict) else ""
+                if not ev_id:
+                    ev_id = digest(ev)
+                if ev_id not in evidence_pool:
+                    evidence_pool[ev_id] = ev
+                ev_ids.append(ev_id)
+            compact = {k: v for k, v in p.items() if k != "evidence"}
+            compact["evidence_ids"] = ev_ids
+            if p["category"] in {"expression_adjustment", "scene_adjustment"}:
+                target = next(
+                    (
+                        r
+                        for r in self.cache
+                        if r["scope"] == p["scope"]
+                        and r["persona"] == p["persona"]
+                        and r["proposal_id"] == p["value"]["target_id"]
+                        and r["revision"] == p["value"]["target_revision"]
+                    ),
+                    None,
+                )
+                compact["target_material"] = (
+                    {k: target[k] for k in ("category", "value", "proposal_id", "revision")} if target else None
+                )
+            compact_proposals.append(compact)
+        ordered_pool = {k: evidence_pool[k] for k in sorted(evidence_pool)}
+        return {
+            "scope": scope,
+            "persona": persona,
+            "evidence_pool": ordered_pool,
+            "proposals": compact_proposals,
+        }
+
+    def _pack_review_chunks(
+        self,
+        scope,
+        persona,
+        proposals,
+        *,
+        max_batch_size=REVIEW_BATCH_MAX,
+        max_payload_bytes=REVIEW_BATCH_PAYLOAD_BUDGET,
+    ):
+        chunks = []
+        current = []
+        limit = max(1, int(max_batch_size))
+        for p in proposals:
+            candidate_chunk = current + [p]
+            payload = self._build_batch_review_payload(scope, persona, candidate_chunk)
+            if len(candidate_chunk) <= limit and len(encode(payload)) <= max_payload_bytes:
+                current = candidate_chunk
+                continue
+            if current:
+                chunks.append(current)
+                current = []
+            single_payload = self._build_batch_review_payload(scope, persona, [p])
+            if limit >= 2 and len(encode(single_payload)) <= max_payload_bytes:
+                current = [p]
+            else:
+                chunks.append([p])
+        if current:
+            chunks.append(current)
+        return chunks
+
+    async def _execute_review_chunk(
+        self,
+        items,
+        *,
+        owner=None,
+        valid=lambda: True,
+        started=None,
+        receipt=None,
+        defer_apply=False,
+        require_llm=False,
+        max_payload_bytes=REVIEW_BATCH_PAYLOAD_BUDGET,
+    ):
+        """Review a homogeneous (scope, persona) chunk in one LLM call.
+
+        Returns a dict with keys: committed, unavailable, fallback, errors.
+        Never leaves operation locks held when returning fallback IDs.
+        """
+        committed = {}
+        unavailable = {}
+        fallback = []
+        errors = {}
+        ordered_ids = sorted({item["id"] for item in items})
+        async with AsyncExitStack() as stack:
+            for pid in ordered_ids:
+                await stack.enter_async_context(self.operation("review", pid))
+            async with self.lock:
+                if self.closed or not valid():
+                    raise ReviewUnavailable("review job cancelled")
+                prepared = []
+                for item in items:
+                    pid = item["id"]
+                    expected_updated = item.get("expected_updated")
+                    try:
+                        p = await asyncio.to_thread(self.store.get, pid)
+                    except ValueError as exc:
+                        unavailable[pid] = ReviewUnavailable(str(exc))
+                        continue
+                    claim = self.store.review_claim(pid)
+                    if claim and claim != owner:
+                        unavailable[pid] = ReviewUnavailable("提案由批量任务保留，请恢复任务或明确交回自动审查")
+                        continue
+                    if not valid():
+                        raise ReviewUnavailable("review job cancelled")
+                    if expected_updated is not None and p["updated"] != expected_updated:
+                        unavailable[pid] = ReviewUnavailable("proposal changed before review")
+                        continue
+                    if require_llm and not self.can_llm_review(p, owner=owner):
+                        unavailable[pid] = ReviewUnavailable("proposal no longer needs LLM review")
+                        continue
+                    if not self.allowed(p["scope"]) or p["state"] not in {"pending", "reviewed"}:
+                        unavailable[pid] = ValueError("proposal unavailable")
+                        continue
+                    if not policy_allowed(p):
+                        unavailable[pid] = ValueError("fixed personality policy rejects proposal")
+                        continue
+                    if p["category"] == "affection" and self.mode("affection") == "auto":
+                        fallback.append(pid)
+                        continue
+                    start_recorded = False
+                    if p["category"] in MEMBER_PROFILES and self.mode(p["category"]) == "llm":
+
+                        def adopt(proposal=p):
+                            with self.store.transaction():
+                                row = self.store.adopt_profile_llm_mode(proposal["id"], proposal["updated"])
+                                if started:
+                                    started(row)
+                                return row
+
+                        try:
+                            p = await self.review_write(adopt)
+                        except (Conflict, ReviewUnavailable) as exc:
+                            unavailable[pid] = exc
+                            continue
+                        start_recorded = True
+                    if p["state"] == "reviewed" and llm_approved(p):
+                        fallback.append(pid)
+                        continue
+                    if started and not start_recorded:
+                        started(p)
+                    prepared.append(p)
+
+                if len(prepared) < 2:
+                    fallback.extend(p["id"] for p in prepared)
+                    return {
+                        "committed": committed,
+                        "unavailable": unavailable,
+                        "fallback": fallback,
+                        "errors": errors,
+                    }
+
+                scope, persona = prepared[0]["scope"], prepared[0]["persona"]
+                same_group = [p for p in prepared if (p["scope"], p["persona"]) == (scope, persona)]
+                for p in prepared:
+                    if (p["scope"], p["persona"]) != (scope, persona):
+                        fallback.append(p["id"])
+                prepared = same_group
+                if len(prepared) < 2:
+                    fallback.extend(p["id"] for p in prepared)
+                    return {
+                        "committed": committed,
+                        "unavailable": unavailable,
+                        "fallback": fallback,
+                        "errors": errors,
+                    }
+
+                token = self.scope_token(scope)
+                persona_at_start = self.current_personas.get(scope)
+                provider_id = self.provider_for("review_provider")
+                payload = self._build_batch_review_payload(scope, persona, prepared)
+                if len(encode(payload)) > max_payload_bytes:
+                    fallback.extend(p["id"] for p in prepared)
+                    return {
+                        "committed": committed,
+                        "unavailable": unavailable,
+                        "fallback": fallback,
+                        "errors": errors,
+                    }
+
+            try:
+                raw_output = await self.invoke_model(
+                    "review_provider",
+                    UNIFIED_REVIEW,
+                    payload,
+                    lambda: (
+                        valid()
+                        and self.allowed(scope)
+                        and token == self.scope_token(scope)
+                        and self.provider_for("review_provider") == provider_id
+                        and all(self.store.review_claim(p["id"]) in (None, owner) for p in prepared)
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if (
+                    not valid()
+                    or self.closed
+                    or not self.allowed(scope)
+                    or token != self.scope_token(scope)
+                    or self.provider_for("review_provider") != provider_id
+                ):
+                    self.stale_results += 1
+                    raise ReviewUnavailable("review invalidated")
+                fallback.extend(p["id"] for p in prepared)
+                return {
+                    "committed": committed,
+                    "unavailable": unavailable,
+                    "fallback": fallback,
+                    "errors": errors,
+                }
+
+            valid_verdicts, missing_ids = parse_batch_review_verdicts(raw_output, [p["id"] for p in prepared])
+            fallback.extend(missing_ids)
+            if not valid_verdicts:
+                return {
+                    "committed": committed,
+                    "unavailable": unavailable,
+                    "fallback": fallback,
+                    "errors": errors,
+                }
+
+            async with self.lock:
+                if (
+                    not valid()
+                    or self.closed
+                    or token != self.scope_token(scope)
+                    or not self.allowed(scope)
+                    or self.current_personas.get(scope) != persona_at_start
+                    or self.provider_for("review_provider") != provider_id
+                ):
+                    self.stale_results += 1
+                    raise ReviewUnavailable("review invalidated")
+                actor = "llm:" + str(provider_id)
+                for p in prepared:
+                    pid = p["id"]
+                    if pid not in valid_verdicts:
+                        continue
+                    if self.store.review_claim(pid) not in (None, owner):
+                        self.stale_results += 1
+                        unavailable[pid] = ReviewUnavailable("proposal claimed during batch review")
+                        continue
+                    result = valid_verdicts[pid]
+
+                    def record_decision(proposal=p, verdict=result):
+                        with self.store.transaction():
+                            row = self.store.review(proposal["id"], verdict, actor, proposal["updated"])
+                            if receipt:
+                                receipt(row, verdict)
+                            return row
+
+                    try:
+                        updated = await self.review_write(record_decision)
+                    except (Conflict, ReviewUnavailable) as exc:
+                        unavailable[pid] = exc
+                        continue
+                    except Exception as exc:
+                        errors[pid] = exc
+                        continue
+
+                    if (
+                        result["verdict"] == "approve"
+                        and updated["mode"] == "llm"
+                        and self.mode(updated["category"]) == "llm"
+                        and not defer_apply
+                    ):
+                        try:
+                            updated = await self._apply(
+                                updated,
+                                actor,
+                                owner=owner,
+                                applied=(lambda row, verdict=result: receipt(row, verdict)) if receipt else None,
+                            )
+                        except Exception as exc:
+                            errors[pid] = exc
+                            committed[pid] = await asyncio.to_thread(self.store.get, pid)
+                            continue
+                    committed[pid] = await asyncio.to_thread(self.store.get, pid)
+        return {
+            "committed": committed,
+            "unavailable": unavailable,
+            "fallback": fallback,
+            "errors": errors,
+        }
+
+    async def review_batch(
+        self,
+        proposal_ids,
+        *,
+        owner=None,
+        valid=lambda: True,
+        defer_apply=False,
+        max_batch_size=REVIEW_BATCH_MAX,
+        max_payload_bytes=REVIEW_BATCH_PAYLOAD_BUDGET,
+        failed_out=None,
+    ):
+        """Review pending proposals in batches grouped by (scope, persona) with safe single-review fallback."""
+        ids = list(dict.fromkeys(proposal_ids))
+        if not ids:
+            return {}
+        if len(ids) == 1:
+            pid = ids[0]
+            try:
+                return {pid: await self.review(pid, owner=owner, valid=valid, defer_apply=defer_apply)}
+            except ReviewUnavailable:
+                return {}
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                if failed_out is not None:
+                    failed_out.add(pid)
+                return {}
+
+        groups = {}
+        single_only = []
+        for pid in ids:
+            try:
+                p = await asyncio.to_thread(self.store.get, pid)
+            except ValueError:
+                continue
+            claim = self.store.review_claim(pid)
+            if claim and claim != owner:
+                continue
+            if not self.allowed(p["scope"]) or p["state"] not in {"pending", "reviewed"}:
+                continue
+            if p["category"] == "affection" and self.mode("affection") == "auto":
+                single_only.append(pid)
+                continue
+            if p["state"] == "reviewed":
+                single_only.append(pid)
+                continue
+            groups.setdefault((p["scope"], p["persona"]), []).append(p)
+
+        results = {}
+        for (scope, persona), proposals in groups.items():
+            if self.closed or not valid() or not self.allowed(scope):
+                break
+            chunks = self._pack_review_chunks(
+                scope,
+                persona,
+                proposals,
+                max_batch_size=max_batch_size,
+                max_payload_bytes=max_payload_bytes,
+            )
+            for chunk in chunks:
+                if self.closed or not valid() or not self.allowed(scope):
+                    break
+                if len(chunk) == 1:
+                    pid = chunk[0]["id"]
+                    try:
+                        results[pid] = await self.review(pid, owner=owner, valid=valid, defer_apply=defer_apply)
+                    except ReviewUnavailable:
+                        pass
+                    except Exception as exc:
+                        self.last_error = type(exc).__name__
+                        if failed_out is not None:
+                            failed_out.add(pid)
+                    continue
+                try:
+                    outcome = await self._execute_review_chunk(
+                        [{"id": p["id"], "expected_updated": None} for p in chunk],
+                        owner=owner,
+                        valid=valid,
+                        defer_apply=defer_apply,
+                        max_payload_bytes=max_payload_bytes,
+                    )
+                except ReviewUnavailable:
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.last_error = type(exc).__name__
+                    outcome = {
+                        "committed": {},
+                        "unavailable": {},
+                        "fallback": [p["id"] for p in chunk],
+                        "errors": {},
+                    }
+                results.update(outcome["committed"])
+                for pid, exc in outcome["errors"].items():
+                    self.last_error = type(exc).__name__
+                    if failed_out is not None:
+                        failed_out.add(pid)
+                for pid in outcome["fallback"]:
+                    if self.closed or not valid() or not self.allowed(scope):
+                        break
+                    try:
+                        results[pid] = await self.review(pid, owner=owner, valid=valid, defer_apply=defer_apply)
+                    except ReviewUnavailable:
+                        pass
+                    except Exception as exc:
+                        self.last_error = type(exc).__name__
+                        if failed_out is not None:
+                            failed_out.add(pid)
+
+        for pid in single_only:
+            if self.closed or not valid():
+                break
+            try:
+                results[pid] = await self.review(pid, owner=owner, valid=valid, defer_apply=defer_apply)
+            except ReviewUnavailable:
+                pass
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                if failed_out is not None:
+                    failed_out.add(pid)
+        return results
 
     async def apply_approved_profiles(self):
         result = {"applied": 0, "stale": 0, "awaiting_llm": 0}
@@ -1066,9 +1537,9 @@ class Engine:
 
     async def review_pending_profiles(self):
         rows = await asyncio.to_thread(self.store.pending_profiles)
-        selected = []
-        scopes = set()
+        by_scope = {}
         interval = max(60, int(self.config.get("analysis_interval", 600)))
+        now = time.time()
         for p in reversed(rows):
             if self.store.review_claim(p["id"]):
                 continue
@@ -1077,26 +1548,23 @@ class Engine:
                 or self.mode(p["category"]) != "llm"
                 or not self.allowed(p["scope"])
                 or self.current_personas.get(p["scope"]) != p["persona"]
-                or p["scope"] in scopes
             ):
                 continue
             latest = max((r.get("created", 0) for r in p["reviews"]), default=0)
-            if latest and time.time() - latest < interval:
+            if latest and now - latest < interval:
                 continue
-            selected.append(p["id"])
-            scopes.add(p["scope"])
-            if len(selected) == 2:
-                break
+            scope = p["scope"]
+            if scope not in by_scope:
+                if len(by_scope) >= 2:
+                    continue
+                by_scope[scope] = []
+            if len(by_scope[scope]) < REVIEW_BATCH_MAX:
+                by_scope[scope].append(p["id"])
 
-        async def run(pid):
-            try:
-                await self.review(pid)
-            except ReviewUnavailable:
-                pass
-            except Exception as exc:
-                self.last_error = type(exc).__name__
+        async def run_scope(pids):
+            await self.review_batch(pids)
 
-        await asyncio.gather(*(run(pid) for pid in selected))
+        await asyncio.gather(*(run_scope(pids) for pids in by_scope.values()))
 
     def validate_apply(self, p, actor):
         if p["category"] in {"expression_adjustment", "scene_adjustment"} and not any(
@@ -1331,8 +1799,9 @@ class Engine:
 
     async def review_pending_proposals(self):
         rows = await asyncio.to_thread(self.store.pending_catchup_proposals, 200)
-        selected = []
-        scopes = set()
+        pending_by_scope = {}
+        apply_only_by_scope = {}
+        scopes_order = []
         now = time.time()
         interval = max(60, int(self.config.get("analysis_interval", 600)))
         for p in rows:
@@ -1350,36 +1819,51 @@ class Engine:
                 continue
             if p["created"] + p["days"] * 86400 <= now or not policy_allowed(p):
                 continue
-            if p["scope"] in scopes:
-                continue
             latest = max((r.get("created", 0) for r in p.get("reviews", [])), default=0)
             if latest and now - latest < interval:
                 continue
             if self.review_retry_at.get(p["id"], 0) > now:
                 continue
+            scope = p["scope"]
             if p["state"] == "pending":
                 if llm_approved(p):
                     continue
-                selected.append((p["id"], False))
+                if scope not in scopes_order:
+                    if len(scopes_order) >= 2:
+                        continue
+                    scopes_order.append(scope)
+                bucket = pending_by_scope.setdefault(scope, [])
+                if len(bucket) < REVIEW_BATCH_MAX:
+                    bucket.append(p["id"])
             elif p["state"] == "reviewed" and p["mode"] == "llm" and mode == "llm" and llm_approved(p):
-                selected.append((p["id"], True))
-            else:
-                continue
-            scopes.add(p["scope"])
-            if len(selected) == 2:
-                break
+                if scope not in scopes_order:
+                    if len(scopes_order) >= 2:
+                        continue
+                    scopes_order.append(scope)
+                if scope not in apply_only_by_scope:
+                    apply_only_by_scope[scope] = p["id"]
 
-        async def run(pid, apply_only):
-            try:
-                await self.review(pid, apply_only=apply_only)
-                self.review_retry_at.pop(pid, None)
-            except ReviewUnavailable:
-                pass
-            except Exception as exc:
-                self.last_error = type(exc).__name__
-                self.review_retry_at[pid] = time.time() + interval
+        async def run_scope(scope):
+            apply_pid = apply_only_by_scope.get(scope)
+            if apply_pid:
+                try:
+                    await self.review(apply_pid, apply_only=True)
+                    self.review_retry_at.pop(apply_pid, None)
+                except ReviewUnavailable:
+                    pass
+                except Exception as exc:
+                    self.last_error = type(exc).__name__
+                    self.review_retry_at[apply_pid] = time.time() + interval
+            pids = pending_by_scope.get(scope, [])
+            if pids:
+                failed = set()
+                reviewed = await self.review_batch(pids, failed_out=failed)
+                for pid in reviewed:
+                    self.review_retry_at.pop(pid, None)
+                for pid in failed:
+                    self.review_retry_at[pid] = time.time() + interval
 
-        await asyncio.gather(*(run(pid, apply_only) for pid, apply_only in selected))
+        await asyncio.gather(*(run_scope(scope) for scope in scopes_order))
 
     async def maintenance(self):
         while not self.closed:

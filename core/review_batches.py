@@ -279,8 +279,109 @@ class ReviewBatches:
             else "completed"
         )
 
+    def _select_batch_chunk(self, queued, single_only_ids):
+        first = queued[0]
+        if first.get("apply_only") or first["id"] in single_only_ids:
+            return [first]
+        try:
+            first_p = self.store.get(first["id"])
+        except ValueError:
+            return [first]
+        target_pair = (first_p["scope"], first_p["persona"])
+        from .engine import REVIEW_BATCH_MAX
+
+        candidates = [(first, first_p)]
+        for item in queued[1:]:
+            if len(candidates) >= REVIEW_BATCH_MAX:
+                break
+            if item.get("apply_only") or item["id"] in single_only_ids:
+                break
+            try:
+                p = self.store.get(item["id"])
+            except ValueError:
+                break
+            if (p["scope"], p["persona"]) != target_pair:
+                break
+            candidates.append((item, p))
+        if len(candidates) < 2:
+            return [first]
+        chunks = self.engine._pack_review_chunks(target_pair[0], target_pair[1], [p for _, p in candidates])
+        if not chunks or len(chunks[0]) < 2:
+            return [first]
+        chosen_ids = {p["id"] for p in chunks[0]}
+        return [item for item, p in candidates if p["id"] in chosen_ids]
+
+    async def _run_batch_chunk(self, identity, job, current, batch_items, single_only_ids):
+        current["status"] = "running"
+        batch_ids = {i["id"] for i in batch_items}
+        for item in current["items"]:
+            if item["id"] in batch_ids:
+                item["status"] = "running"
+        if not self.save(current):
+            return
+        chunk_specs = [{"id": i["id"], "expected_updated": i["updated"]} for i in batch_items]
+        try:
+            outcome = await self.engine._execute_review_chunk(
+                chunk_specs,
+                owner=identity,
+                valid=lambda: self.permits_result(identity),
+                started=lambda p: self.started(identity, p),
+                receipt=lambda p, r: self.committed(identity, p, r),
+                require_llm=True,
+            )
+        except ReviewUnavailable:
+            outcome = {
+                "committed": {},
+                "unavailable": {i["id"]: ReviewUnavailable("batch unavailable") for i in batch_items},
+                "fallback": [],
+                "errors": {},
+            }
+        except Exception as exc:
+            outcome = {
+                "committed": {},
+                "unavailable": {},
+                "fallback": [],
+                "errors": {i["id"]: exc for i in batch_items},
+            }
+        current = self.get(identity)
+        if not current:
+            return
+        cancelling = current["status"] == "cancelling"
+        for batch_item in batch_items:
+            pid = batch_item["id"]
+            item = next(i for i in current["items"] if i["id"] == pid)
+            if item.get("committed") and item["status"] in RESULTS:
+                if pid in outcome["errors"]:
+                    err = type(outcome["errors"][pid]).__name__
+                    item["error"] = "审查结果已保存；后续生效或刷新未完成（" + err + "）"
+                continue
+            if pid in outcome["fallback"]:
+                if cancelling:
+                    item.update(status="cancelled", error="已取消，未提交审查结果")
+                else:
+                    item.update(status="queued", error="")
+                    single_only_ids.add(pid)
+            elif pid in outcome["unavailable"]:
+                if cancelling:
+                    item.update(status="cancelled", error="已取消，未提交审查结果")
+                else:
+                    item.update(status="skipped", error="记录、审查设置或版本已变化；请刷新核对")
+            elif pid in outcome["errors"]:
+                if cancelling:
+                    item.update(status="cancelled", error="已取消，未提交审查结果")
+                else:
+                    item.update(status="failed", error=type(outcome["errors"][pid]).__name__)
+            elif cancelling:
+                item.update(status="cancelled", error="已取消，未提交审查结果")
+            else:
+                item.update(status="queued", error="")
+                single_only_ids.add(pid)
+        self.save(current)
+        job.update(current)
+
     async def run(self, job):
         identity = job["id"]
+        single_only_ids = set()
         async with self.engine.operation("review-batch", identity):
             try:
                 while True:
@@ -302,8 +403,8 @@ class ReviewBatches:
                         # A previous worker vanished; do not silently mark or skip its work.
                         self.interrupt(job)
                         return
-                    pending = next((i for i in current["items"] if i["status"] == "queued"), None)
-                    if not pending:
+                    queued = [i for i in current["items"] if i["status"] == "queued"]
+                    if not queued:
                         current["status"] = self.completed_status(current)
                         self.save(current)
                         job.update(current)
@@ -313,6 +414,11 @@ class ReviewBatches:
                         self.save(current)
                         job.update(current)
                         return
+                    batch_items = self._select_batch_chunk(queued, single_only_ids)
+                    if len(batch_items) >= 2:
+                        await self._run_batch_chunk(identity, job, current, batch_items, single_only_ids)
+                        continue
+                    pending = queued[0]
                     current["status"] = "running"
                     pending["status"] = "running"
                     if not self.save(current):

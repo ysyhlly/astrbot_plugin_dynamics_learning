@@ -182,6 +182,7 @@ class ExpressionLearning:
         e = self.engine
         await e.scenes.propose_adjustments(scope, persona, token, expression=True)
         rows = await asyncio.to_thread(e.store.proposals, scope, 2000)
+        pending_ids = []
         for p in [p for p in rows if p['persona'] == persona and p['category'] in EXPRESSION_CATEGORIES
                   and p['state'] in {'pending', 'reviewed'} and not e.store.review_claim(p['id'])][:8]:
             if not self.enabled(scope, persona) or token != e.scope_token(scope):
@@ -194,4 +195,9 @@ class ExpressionLearning:
                 if p['mode'] == 'llm' and e.mode(p['category']) == 'llm' and llm_approved(p):
                     await e.action(p['id'], 'approve', 'system:expression-review', p['updated'])
             else:
-                await e.review(p['id'])
+                pending_ids.append(p['id'])
+        if pending_ids and self.enabled(scope, persona) and token == e.scope_token(scope):
+            await e.review_batch(
+                pending_ids,
+                valid=lambda: self.enabled(scope, persona) and token == e.scope_token(scope),
+            )
