@@ -8,23 +8,37 @@ ensure_current(
     __package__,
     __name__,
     __file__,
-    version="2.0.0-rc.3",
-    checks=[("core.engine", "Engine", "_review_contract_v1")],
+    version="2.0.0-rc.3+cost.1",
+    checks=[
+        ("core.engine", "Engine", "_review_contract_v1"),
+        ("core.engine", "Engine", "_automatic_review_contract_v1"),
+    ],
 )
 
 import asyncio
 import json
+from contextlib import nullcontext
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import json_response, request
 
-from .core.contract import PERSONALITY_POLICY, decode_model_object, encode, text
+from .core.contract import (
+    MODEL_INPUT_LIMIT,
+    PERSONALITY_POLICY,
+    MalformedModelResponse,
+    decode_model_object,
+    encode,
+    text,
+)
 from .core.engine import Engine
 from .core.native import current_persona, group_projection, private_projection, replacement_allowed, role_provider
 from .core.profiles import native_message
+from .core.review_batches import ReviewUnavailable
+from .core.review_evidence import provider_model
 from .core.social import Social, character_key, observed_event
+from .core.source_withdrawals import recall_source
 from .core.store import Store
 from .series_panels import get_series_defaults, inherit_provider, inherit_umos
 
@@ -125,7 +139,7 @@ class DynamicsLearning(Star):
         await asyncio.to_thread(store.enforce_personality_policy)
         await asyncio.to_thread(store.native.bootstrap_scopes)
         self.legacy_kv_v1 = await self._detect_legacy_kv_v1()
-        self.engine = Engine(store, self.config, self._model, host_context=self.context)
+        self.engine = Engine(store, self.config, self._model, host_context=self.context, provider_tracks_reviews=True)
         await self.engine.refresh()
         self.engine.social = await asyncio.to_thread(Social, self.engine, self.context, logger)
         await self.engine.social.initialize()
@@ -133,6 +147,7 @@ class DynamicsLearning(Star):
         await self.engine.apply_approved_profiles()
         self.tasks = [
             asyncio.create_task(self.engine.consume()),
+            asyncio.create_task(self.engine.automatic_reviews.run()),
             asyncio.create_task(self.engine.maintenance()),
             asyncio.create_task(self.engine.social.consume()),
         ]
@@ -512,6 +527,23 @@ class DynamicsLearning(Star):
             }
         )
 
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=201)
+    async def observe_source_recall(self, event: AstrMessageEvent):
+        if self.closed or self.engine is None:
+            return
+        source = recall_source(event)
+        if source is None:
+            return
+        scope, member, message_id = source
+        async with self.engine.lock:
+            authorized = self.engine.allowed(scope)
+            changed = await self.engine.review_write(
+                lambda: self.engine.store.source_withdrawals.record(scope, member, message_id, authorized=authorized)
+            )
+            if changed:
+                self.engine.automatic_reviews.notify_context_change()
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=200)
     async def observe_group_message(self, event: AstrMessageEvent):
         if self.closed or not self.engine or not self.engine.social:
@@ -549,7 +581,7 @@ class DynamicsLearning(Star):
             return encode(self.engine.member_profile(scope, member))
         return encode(self.engine.social.query(scope, member, kind, str(term or "").strip()))
 
-    async def _model(self, role, instruction, data):
+    async def _model(self, role, instruction, data, *, review_dispatch=None):
         provider_id = self._effective_provider(role)
         if not provider_id:
             raise ValueError("请先配置" + ("分析模型" if role == "analysis_provider" else "审查模型"))
@@ -563,18 +595,44 @@ class DynamicsLearning(Star):
             raise ValueError("所选模型不可用或不是普通聊天模型")
         timeout = max(5, min(180, int(self.config.get("model_timeout", 60))))
         payload = encode(data)
-        if len(payload) > 140_000:
+        if len(payload) > MODEL_INPUT_LIMIT:
             raise ValueError("证据超出单次模型输入预算，请缩小提案引用范围")
+        model = provider_model(provider)
+        if review_dispatch and (
+            review_dispatch.provider_id != provider_id
+            or review_dispatch.provider_instance is not provider
+            or review_dispatch.model != model
+            or not self.engine.allowed(review_dispatch.scope)
+        ):
+            raise ReviewUnavailable("模型绑定或会话权限已改变")
+        attributed_call = getattr(provider, "_series_attributed_call_v1", None)
+        source = data.get("proposal") or next(iter(data.get("events", [])), {}) or data
+        scope = review_dispatch.scope if review_dispatch else source.get("scope", "")
+        operation_id = review_dispatch.operation_id if review_dispatch else ""
+        attribution = (
+            attributed_call(
+                f"dynamics_learning.{role.removesuffix('_provider')}", scope=scope, operation_id=operation_id
+            )
+            if callable(attributed_call)
+            else nullcontext()
+        )
         async with asyncio.timeout(timeout):
-            response = await provider.text_chat(prompt=payload, system_prompt=instruction, contexts=[])
+            with attribution:
+                if review_dispatch:
+                    self.engine.store.automatic_reviews.record_dispatch(review_dispatch)
+                response = await provider.text_chat(prompt=payload, system_prompt=instruction, contexts=[])
         if (
             self.closed
             or self.context.get_provider_by_id(provider_id) is not provider
             or self._effective_provider(role) != provider_id
+            or provider_model(provider) != model
         ):
-            raise ValueError("模型绑定已改变，本次结果失效")
+            raise ReviewUnavailable("模型绑定已改变，本次结果失效")
         content = getattr(response, "completion_text", None)
-        return decode_model_object(content)
+        try:
+            return decode_model_object(content)
+        except ValueError as exc:
+            raise MalformedModelResponse(str(exc)) from exc
 
     async def _authorized(self):
         from astrbot.dashboard.api.auth import require_dashboard_user
@@ -778,7 +836,9 @@ class DynamicsLearning(Star):
             action = text(body.get("action"), "action", 16)
             async with self.engine.lock:
                 rows = await self.engine.batch_snapshot(scope, body.get("items"), actor)
-                return await self.engine.review_write(lambda: govern(self.engine, scope, rows, action, actor))
+                result = await self.engine.review_write(lambda: govern(self.engine, scope, rows, action, actor))
+            self.engine.automatic_reviews.notify_context_change()
+            return result
 
         return await self._serve(operation, ("scope", "action", "items"))
 

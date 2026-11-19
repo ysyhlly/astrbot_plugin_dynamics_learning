@@ -893,3 +893,206 @@ def test_parse_batch_review_verdicts_edge_cases():
     assert list(valid.keys()) == ["p1"]
     assert valid["p1"]["verdict"] == "defer"
     assert fallback == ["p2", "p3"]
+
+
+# ---------------------------------------------------------------------------
+# Preserved live (+cost.1) features integrated with DL-1..DL-3
+# ---------------------------------------------------------------------------
+
+
+def test_preserved_source_withdrawal_archives_proposals_and_blocks_apply(store):
+    ev = _make_event(member="alice", message_id="90001", turn_id="0:90001", text="待撤回消息")
+    store.ingest(ev)
+    p = store.propose(
+        candidate(
+            {
+                "category": "style",
+                "key": "withdrawn_case",
+                "value": "基于待撤回消息的观察",
+                "member": "alice",
+                "reason": "test",
+                "evidence_ids": [ev["id"]],
+                "days": 30,
+            },
+            [ev],
+            None,
+        ),
+        "llm",
+        "llm:analysis",
+    )
+    assert store.source_withdrawals.record(SCOPE, "alice", "90001") is True
+    archived = store.get(p["id"])
+    assert archived["state"] == "archived"
+    assert archived["archive_reason"] == "source_withdrawn"
+    assert store.source_withdrawals.has_withdrawn(SCOPE, [ev]) is True
+
+    # New proposals citing the withdrawn source are rejected
+    with pytest.raises(ValueError, match="withdrawn"):
+        store.propose(
+            candidate(
+                {
+                    "category": "style",
+                    "key": "another_withdrawn",
+                    "value": "不应再次建提案",
+                    "member": "alice",
+                    "reason": "test",
+                    "evidence_ids": [ev["id"]],
+                    "days": 30,
+                },
+                [ev],
+                None,
+            ),
+            "llm",
+            "llm:analysis",
+        )
+
+
+def test_preserved_defer_fingerprint_sleeps_until_evidence_refreshed(store):
+    from astrbot_plugin_dynamics_learning.core.review_evidence import DEFER_FINGERPRINT
+
+    async def run():
+        ev1 = _make_event(member="alice", message_id="df1", turn_id="0:df1", text="第一条证据")
+        store.ingest(ev1)
+        p = store.propose(
+            candidate(
+                {
+                    "category": "style",
+                    "key": "defer_key",
+                    "value": "该成员偏简短回复",
+                    "member": "alice",
+                    "reason": "单条证据",
+                    "evidence_ids": [ev1["id"]],
+                    "days": 30,
+                },
+                [ev1],
+                None,
+            ),
+            "llm",
+            "llm:analysis",
+        )
+        calls = []
+
+        async def model(role, instruction, data):
+            calls.append((role, instruction))
+            return {"verdict": "defer", "reason": "证据尚不足", "risks": ["样本太少"]}
+
+        engine = Engine(store, {"sessions": [SCOPE], "review_provider": "rp"}, model)
+        engine.current_personas[SCOPE] = PERSONA
+
+        first = await engine.review(p["id"], expected_updated=p["updated"], automatic=True)
+        assert first["state"] == "pending"
+        assert first.get(DEFER_FINGERPRINT)
+        assert len(calls) == 1
+        assert calls[0][1] == UNIFIED_REVIEW
+
+        # Unchanged evidence sleeps: automatic catchup does NOT re-call the LLM
+        assert engine.automatic_review_waiting(first, time.time()) is True
+        second = await engine.review(p["id"], expected_updated=first["updated"], automatic=True)
+        assert second["id"] == p["id"]
+        assert len(calls) == 1
+
+        # Refreshing pending evidence via store.propose clears DEFER_FINGERPRINT and wakes review
+        ev2 = _make_event(member="alice", message_id="df2", turn_id="0:df2", text="第二条补充证据")
+        store.ingest(ev2)
+        refreshed = store.propose(
+            candidate(
+                {
+                    "category": "style",
+                    "key": "defer_key",
+                    "value": "该成员偏简短回复",
+                    "member": "alice",
+                    "reason": "补充第二条证据",
+                    "evidence_ids": [ev1["id"], ev2["id"]],
+                    "days": 30,
+                },
+                [ev1, ev2],
+                None,
+            ),
+            "llm",
+            "llm:analysis",
+        )
+        assert refreshed["id"] == p["id"]
+        assert DEFER_FINGERPRINT not in refreshed
+        assert engine.automatic_review_waiting(refreshed, time.time()) is False
+
+    asyncio.run(run())
+
+
+def test_preserved_automatic_reviews_queue_uses_unified_prompt_and_evidence_pool(store):
+    async def run():
+        ev1 = _make_event(member="alice", message_id="aq1", turn_id="0:aq1", text="共享证据一")
+        ev2 = _make_event(member="alice", message_id="aq2", turn_id="0:aq2", text="共享证据二")
+        store.ingest(ev1)
+        store.ingest(ev2)
+        p1 = store.propose(
+            candidate(
+                {
+                    "category": "style",
+                    "key": "aq_k1",
+                    "value": "表达习惯一",
+                    "member": "alice",
+                    "reason": "r1",
+                    "evidence_ids": [ev1["id"], ev2["id"]],
+                    "days": 30,
+                },
+                [ev1, ev2],
+                None,
+            ),
+            "llm",
+            "llm:analysis",
+        )
+        p2 = store.propose(
+            candidate(
+                {
+                    "category": "style",
+                    "key": "aq_k2",
+                    "value": "表达习惯二",
+                    "member": "alice",
+                    "reason": "r2",
+                    "evidence_ids": [ev1["id"], ev2["id"]],
+                    "days": 30,
+                },
+                [ev1, ev2],
+                None,
+            ),
+            "llm",
+            "llm:analysis",
+        )
+
+        seen = []
+
+        async def model(role, instruction, data):
+            seen.append((role, instruction, data))
+            return {
+                "verdicts": [
+                    {"proposal_id": item["id"], "verdict": "approve", "reason": "ok", "risks": []}
+                    for item in data["proposals"]
+                ]
+            }
+
+        engine = Engine(store, {"sessions": [SCOPE], "review_provider": "rp"}, model)
+        engine.current_personas[SCOPE] = PERSONA
+        engine.automatic_reviews.running = True
+        engine.automatic_reviews.wait_seconds = 0
+
+        accepted = await engine.automatic_reviews.enqueue([p1, p2])
+        assert accepted == {p1["id"], p2["id"]}
+        groups, _ = engine.automatic_reviews.ready(time.time(), set(), discover=False)
+        assert len(groups) == 1 and len(groups[0]) == 2
+
+        await engine.automatic_reviews.dispatch(groups[0])
+        assert len(seen) == 1
+        role, instruction, data = seen[0]
+        assert role == "review_provider"
+        assert instruction == UNIFIED_REVIEW
+        assert set(data["evidence_pool"].keys()) == {ev1["id"], ev2["id"]}
+        assert all("evidence" not in item and item["evidence_ids"] for item in data["proposals"])
+        assert store.get(p1["id"])["state"] == "applied"
+        assert store.get(p2["id"])["state"] == "applied"
+
+        overview = await engine.overview()
+        stats = overview["scheduler"]["review_dispatches"]
+        assert stats["provider_invocations"] == 1
+        assert stats["logical_automatic_first_reviews"] == 2
+
+    asyncio.run(run())

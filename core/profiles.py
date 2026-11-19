@@ -163,8 +163,10 @@ class Profiles:
 
     def sources(self, scope, persona, member='', days=30):
         with self.store.lock:
-            rows = self.store.db.execute('''SELECT body FROM profile_messages WHERE scope=? AND persona=?
-                AND (?='' OR member=?) AND created>? ORDER BY created DESC,rowid DESC LIMIT 600''',
+            rows = self.store.db.execute('''SELECT p.body FROM profile_messages p WHERE p.scope=? AND p.persona=?
+                AND (?='' OR p.member=?) AND p.created>? AND NOT EXISTS (SELECT 1 FROM withdrawn_review_sources w
+                WHERE w.scope=p.scope AND w.member=p.member AND w.message_id=p.source_id)
+                ORDER BY p.created DESC,p.rowid DESC LIMIT 600''',
                 (scope, persona, member, member, time.time()-days*86400)).fetchall()
             return [json.loads(r[0]) for r in reversed(rows)]
 
@@ -174,7 +176,10 @@ class Profiles:
             result={}
             for offset in range(0,len(ids),400):
                 batch=ids[offset:offset+400]
-                rows=self.store.db.execute('SELECT source_id,body FROM profile_messages WHERE scope=? AND persona=? AND source_id IN ('+','.join('?' for _ in batch)+')', (scope,persona,*batch)).fetchall()
+                rows=self.store.db.execute('''SELECT p.source_id,p.body FROM profile_messages p
+                    WHERE p.scope=? AND p.persona=? AND NOT EXISTS (SELECT 1 FROM withdrawn_review_sources w
+                    WHERE w.scope=p.scope AND w.member=p.member AND w.message_id=p.source_id)
+                    AND p.source_id IN ('''+','.join('?' for _ in batch)+')', (scope,persona,*batch)).fetchall()
                 result.update({r[0]:json.loads(r[1]) for r in rows})
             return result
 

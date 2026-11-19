@@ -7,6 +7,13 @@ import re
 import time
 
 VERSION = 1
+MODEL_INPUT_LIMIT = 140_000
+
+
+class MalformedModelResponse(ValueError):
+    """The provider responded but the response was not a complete JSON object."""
+
+
 CATEGORIES = {"expression_example", "style", "typing_habit", "preference", "jargon", "affection", "relationship", "state", "decision_guidance", "participation"}
 CATEGORIES |= {'scene_pattern', 'scene_adjustment', 'expression_style', 'expression_adjustment'}
 MEMBER_PROFILES = {"expression_example", "style", "typing_habit", "preference"}

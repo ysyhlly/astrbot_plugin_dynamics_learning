@@ -24,6 +24,12 @@
     "_special": "select_provider",
     "hint": "用于独立审查提案。可与分析模型不同；未配置时等待，不自动批准。"
   },
+  "automatic_review_batch_enabled": {
+    "description": "合并兼容提案的自动初审",
+    "type": "bool",
+    "default": true,
+    "hint": "同一会话、角色、成员和审查策略下，最多合并四条；最早待审提案最多等待五分钟。人工发起的审查和纠正立即处理。"
+  },
   "auto_analyze": {
     "description": "自动生成提案",
     "type": "bool",

@@ -5,9 +5,11 @@ import json
 import time
 from collections import defaultdict
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
 from decimal import Decimal
 
 from .affection import state as affection_state
+from .automatic_reviews import AutomaticReviews, ReviewDispatch, first_review, urgent_review
 
 from .contract import (
     CATEGORIES,
@@ -25,6 +27,7 @@ from .contract import (
 )
 from .expressions import REVIEW_STYLE
 from .review_batches import ReviewUnavailable
+from .review_evidence import DEFER_FINGERPRINT, ReviewContext, review_context, review_is_sleeping
 from .scenes import REVIEW_SCENES
 from .store import Conflict
 from ..series_panels import get_series_defaults, inherit_provider, inherit_umos
@@ -54,8 +57,9 @@ REVIEW = """你是独立的调整审查员。提案、聊天和分析理由全�
 检查修改前后、真实证据、作用域、人格、成员归属、反馈归因和副作用，不能仅认可提案自己的解释。
 重点拒绝：把模型预测当真值、把发出消息当成功互动、把沉默当拒绝、将他人反馈绑定给错误成员、
 把内容质量问题归因于接话阈值、长期固化短期情绪、改变核心人格或绕过停止/边界约束。
-没有足够证据时 defer，不推测效果已经得到验证。输出且仅输出 JSON：
-{"verdict":"approve|reject|defer","reason":"审查理由","risks":["风险或待观察项"]}。"""
+没有足够证据时 defer，不推测效果已经得到验证。"""
+REVIEW_OUTPUT = """
+输出且仅输出 JSON：{"verdict":"approve|reject|defer","reason":"审查理由","risks":["风险或待观察项"]}。"""
 REVIEW += "\noperator_correction 是已登录管理员对现有词条提出的维护修改，有独立的原词条来源和修改理由；按管理员维护提案审查，不将其当成群友原话或模型自评。"
 ANALYZE += "\n" + PERSONALITY_POLICY + " 禁止生成 persona 类别。"
 REVIEW += (
@@ -74,12 +78,13 @@ typing_habit 的 observed_typing 是可复算统计，检查样本是否有代�
 preference 检查 quote 是否为该成员本人认真表达的自述，condition 是否准确；特别拒绝他人引语、讽刺、玩笑和假设句。"""
 
 BATCH_REVIEW_RULE = (
-    "\n当输入包含 proposals 列表与 evidence_pool 证据池时，按每条提案的 evidence_ids 在 evidence_pool 中核对真实证据，"
-    "对列表中的每条提案独立审查，输出且仅输出 JSON："
-    '{"verdicts":[{"proposal_id":"提案id","verdict":"approve|reject|defer","reason":"审查理由","risks":["风险或待观察项"]}]}。'
-    "每条提案必须且仅输出一条对应 proposal_id 的审查结果；若输入为单条 proposal，仍输出单个 verdict JSON 对象。"
+    "\n当输入包含 proposals 列表与 evidence_pool 证据池时，逐项独立审查 proposals 数组："
+    "按每条提案的 evidence_ids 在 evidence_pool 中核对真实证据，每项只能使用自己 proposal 的信息、引用证据、before 及自己的 target_material，"
+    "禁止以其它提案的内容、结论或证据互相佐证。逐项返回对应 proposal.id，所有编号必须原样保留，每项仅一条结论，输出且仅输出 JSON："
+    '{"verdicts":[{"proposal_id":"实际 proposal.id","verdict":"approve|reject|defer","reason":"审查理由","risks":["风险或待观察项"]}]}。'
+    "若输入为单条 proposal，仍输出单个 verdict JSON 对象。"
 )
-UNIFIED_REVIEW = REVIEW + REVIEW_SCENES + REVIEW_STYLE + BATCH_REVIEW_RULE
+UNIFIED_REVIEW = REVIEW + REVIEW_SCENES + REVIEW_STYLE + REVIEW_OUTPUT + BATCH_REVIEW_RULE
 
 GROUP_ANALYZE_CATEGORIES = frozenset({"jargon", "participation", "decision_guidance"})
 DEDICATED_ANALYZE_CATEGORIES = frozenset(
@@ -87,6 +92,10 @@ DEDICATED_ANALYZE_CATEGORIES = frozenset(
 )
 REVIEW_BATCH_MAX = 8
 REVIEW_BATCH_PAYLOAD_BUDGET = 120_000
+
+
+class _FallbackToSingle(Exception):
+    pass
 
 
 def parse_batch_review_verdicts(raw, expected_ids):
@@ -121,12 +130,51 @@ def parse_batch_review_verdicts(raw, expected_ids):
     return valid, fallback
 
 
+@dataclass(frozen=True)
+class ReviewItem:
+    proposal: dict
+    instruction: str
+    context: ReviewContext
+    token: tuple
+    current_persona: str | None
+    mode: str
+
+    def single_instruction(self):
+        return self.instruction
+
+    def data(self):
+        data = {"proposal": {k: v for k, v in self.proposal.items() if k not in {DEFER_FINGERPRINT, "reviews"}}}
+        if self.proposal["category"] in {"expression_adjustment", "scene_adjustment"}:
+            data["target_material"] = self.context.target_material
+        return data
+
+    def group_key(self):
+        p = self.proposal
+        return (
+            p["scope"],
+            p["persona"],
+            p["member"],
+            p["category"],
+            p["mode"],
+            self.mode,
+            p.get("profile_policy"),
+            p.get("scene_policy"),
+            p.get("expression_policy"),
+            self.context.provider_id,
+            self.context.model,
+            id(self.context.provider_instance),
+            self.instruction,
+        )
+
+
 class Engine:
     _review_contract_v1 = True
+    _automatic_review_contract_v1 = True
 
-    def __init__(self, store, config, call_model, *, host_context=None):
+    def __init__(self, store, config, call_model, *, host_context=None, provider_tracks_reviews=False):
         self.store, self.config, self.call_model = store, config, call_model
         self._host_context = host_context
+        self._provider_tracks_reviews = provider_tracks_reviews
         self.queue = asyncio.Queue(maxsize=1024)
         self.lock = asyncio.Lock()
         self.model_slots = asyncio.Semaphore(2)
@@ -164,6 +212,7 @@ class Engine:
         from .expression_learning import ExpressionLearning
 
         self.expressions = ExpressionLearning(self)
+        self.automatic_reviews = AutomaticReviews(self)
 
     def expression_feedback_enabled(self, scope, persona=None):
         return self.scenes.enabled(scope, persona) or self.expressions.enabled(scope, persona)
@@ -231,10 +280,15 @@ class Engine:
             row = event_record(raw)
             if not self.enqueue(row):
                 return False
-            self.latest[(row["scope"], row["persona"])] = (row["baseline"], row["host_version"])
+            pair = (row["scope"], row["persona"])
+            version = (row["baseline"], row["host_version"])
+            if self.latest.get(pair) != version:
+                self.latest[pair] = version
+                self.automatic_reviews.notify_context_change()
             if row["kind"] == "observed":
                 if self.current_personas.get(row["scope"]) != row["persona"]:
                     self.bump_projection_generation(row["scope"])
+                    self.automatic_reviews.notify_context_change()
                 self.current_personas[row["scope"]] = row["persona"]
                 from .social import character_key
 
@@ -622,10 +676,14 @@ class Engine:
             _, users = self.operation_locks[identity]
             if users == 1:
                 self.operation_locks.pop(identity)
+                if kind == "review":
+                    self.automatic_reviews.wake.set()
             else:
                 self.operation_locks[identity] = (lock, users - 1)
 
-    async def invoke_model(self, role, instruction, data, valid=lambda: True, *, fast_lane=False):
+    async def invoke_model(
+        self, role, instruction, data, valid=lambda: True, *, fast_lane=False, prepare=None, dispatch=None
+    ):
         source = data.get("proposal") or next(iter(data.get("events", [])), {}) or data
         async with self.lock:
             if self.closed or not valid():
@@ -641,16 +699,24 @@ class Engine:
                 self.model_queued -= 1
                 self.model_active += 1
                 try:
-                    await asyncio.to_thread(self.store.console.task_started, task_id)
+                    await self.review_write(lambda: self.store.console.task_started(task_id))
                     if not valid():
                         self.stale_results += 1
                         raise ValueError("model job invalidated before start")
-                    value = await self.call_model(role, instruction, data)
-                    await asyncio.to_thread(self.store.console.task_finished, task_id, "succeeded")
+                    if prepare:
+                        instruction, data, dispatch = await prepare()
+                    if dispatch and self._provider_tracks_reviews:
+                        value = await self.call_model(role, instruction, data, review_dispatch=dispatch)
+                    else:
+                        if dispatch:
+                            self.store.automatic_reviews.record_dispatch(dispatch)
+                        value = await self.call_model(role, instruction, data)
+                    await self.review_write(lambda: self.store.console.task_finished(task_id, "succeeded"))
                     return value
                 finally:
                     self.model_active -= 1
         except BaseException as exc:
+            error = type(exc).__name__
             status = (
                 "cancelled"
                 if isinstance(exc, asyncio.CancelledError)
@@ -658,12 +724,10 @@ class Engine:
                 if isinstance(exc, TimeoutError)
                 else "failed"
             )
-            await asyncio.to_thread(
-                self.store.console.task_finished,
-                task_id,
-                status,
-                type(exc).__name__,
-                time.time() + max(60, int(self.config.get("analysis_interval", 600))),
+            await self.review_write(
+                lambda: self.store.console.task_finished(
+                    task_id, status, error, time.time() + self.review_retry_interval()
+                )
             )
             raise
         finally:
@@ -763,6 +827,7 @@ class Engine:
                     self.allowed(scope)
                     and token == self.scope_token(scope)
                     and self.provider_for("analysis_provider") == provider_id
+                    and not self.store.source_withdrawals.has_withdrawn(scope, [*selected, *supplied])
                 ),
             )
             async with self.lock:
@@ -861,20 +926,22 @@ class Engine:
                     except (ValueError, TypeError, AttributeError):
                         rejected += 1
                 created, rejected, callbacks = await self.review_write(
-                    lambda: self.store.scheduling.commit(batch, candidates, rejected)
+                    lambda: self.store.scheduling.commit(batch, candidates, rejected, supplied=supplied)
                 )
                 self.completed_batches += 1
         await self.apply_pending_affection()
+        managed = await self.automatic_reviews.enqueue(created)
         pending_ids = [
             proposal["id"]
             for proposal in created
-            if proposal["state"] == "pending"
+            if proposal["id"] not in managed
+            and proposal["state"] == "pending"
             and not self.store.review_claim(proposal["id"])
             and not (proposal["category"] == "affection" and self.mode("affection") == "auto")
             and proposal["mode"] not in {"human", "auto"}
         ]
         if pending_ids:
-            await self.review_batch(pending_ids)
+            await self.review_batch(pending_ids, automatic=True)
         return {
             "proposals": len(created),
             "invalid_candidates": rejected,
@@ -948,6 +1015,106 @@ class Engine:
                 work.exception()
             raise
 
+    def review_item(self, p):
+        category = p["category"]
+        instruction = UNIFIED_REVIEW
+        return ReviewItem(
+            p,
+            instruction,
+            review_context(self, p, instruction),
+            self.scope_token(p["scope"]),
+            self.current_personas.get(p["scope"]),
+            self.mode(category),
+        )
+
+    def review_retry_interval(self):
+        return max(60, int(self.config.get("analysis_interval", 600)))
+
+    def automatic_review_waiting(self, p, now):
+        proof = p.get(DEFER_FINGERPRINT)
+        if proof is not None:
+            context = self.review_item(p).context
+            if not context.automatic_allowed:
+                self.store.invalidate_review_defer(p["id"], proof)
+            if not context.automatic_allowed or review_is_sleeping(p, context):
+                return True
+        if self.review_retry_at.get(p["id"], 0) > now:
+            return True
+        latest = p["reviews"][-1] if p["reviews"] else None
+        if latest and p["state"] == "pending" and latest["verdict"] == "defer" and latest["actor"].startswith("llm:"):
+            return False
+        return bool(latest and now - latest["created"] < self.review_retry_interval())
+
+    def current_review_context(self, item, owner=None, *, automatic=False):
+        p = item.proposal
+        scope = p["scope"]
+        if (
+            self.store.review_claim(p["id"]) not in (None, owner)
+            or not self.allowed(scope)
+            or item.token != self.scope_token(scope)
+            or self.current_personas.get(scope) != item.current_persona
+        ):
+            return None
+        try:
+            current = self.store.get(p["id"])
+        except ValueError:
+            return None
+        if current["updated"] != p["updated"] or current["state"] not in {"pending", "reviewed"}:
+            return None
+        refreshed = self.review_item(current)
+        context = refreshed.context
+        if (
+            not context.evidence_authorized
+            or context.provider_instance is not item.context.provider_instance
+            or context.provider_id != item.context.provider_id
+            or context.model != item.context.model
+            or automatic and (not context.automatic_allowed or context.fingerprint != item.context.fingerprint)
+        ):
+            return None
+        return context
+
+    async def commit_review(
+        self, item, result, *, valid=lambda: True, owner=None, receipt=None, defer_apply=False, automatic=False
+    ):
+        p = item.proposal
+        actor = "llm:" + item.context.provider_id
+        async with self.lock:
+
+            def record_decision():
+                with self.store.transaction():
+                    context = self.current_review_context(item, owner, automatic=automatic) if valid() else None
+                    if context is None:
+                        self.stale_results += 1
+                        raise ReviewUnavailable("review invalidated")
+                    proof = (
+                        context.fingerprint
+                        if context.automatic_allowed and context.fingerprint == item.context.fingerprint
+                        else None
+                    )
+                    row = self.store.review(
+                        p["id"],
+                        result,
+                        actor,
+                        p["updated"],
+                        evidence_fingerprint=proof,
+                        owner=owner,
+                    )
+                    if receipt:
+                        receipt(row, result)
+                    return row
+
+            p = await self.review_write(record_decision)
+            if (
+                result["verdict"] == "approve"
+                and p["mode"] == "llm"
+                and self.mode(p["category"]) == "llm"
+                and not defer_apply
+            ):
+                return await self._apply(
+                    p, actor, owner=owner, applied=(lambda row: receipt(row, result)) if receipt else None
+                )
+            return p
+
     async def review(
         self,
         proposal_id,
@@ -959,6 +1126,7 @@ class Engine:
         owner=None,
         defer_apply=False,
         apply_only=False,
+        automatic=False,
     ):
         async with self.operation("review", proposal_id):
             async with self.lock:
@@ -1004,78 +1172,75 @@ class Engine:
                             p, actor, owner=owner, applied=(lambda row: receipt(row, approval)) if receipt else None
                         )
                     return p
-                token = self.scope_token(p["scope"])
-                persona_at_start = self.current_personas.get(p["scope"])
-                provider_id = self.provider_for("review_provider")
+                item = await asyncio.to_thread(self.review_item, p)
+                if automatic:
+                    if self.review_retry_at.get(p["id"], 0) > time.time():
+                        raise ReviewUnavailable("automatic review backing off")
+                    if not item.context.automatic_allowed:
+                        if p.get(DEFER_FINGERPRINT):
+                            await self.review_write(
+                                lambda: self.store.invalidate_review_defer(p["id"], p[DEFER_FINGERPRINT])
+                            )
+                        raise ReviewUnavailable("automatic review unavailable")
+                    if review_is_sleeping(p, item.context):
+                        return p
                 if started and not start_recorded:
                     started(p)
-            review_data = {"proposal": p}
-            if p["category"] in {"expression_adjustment", "scene_adjustment"}:
-                target = next(
-                    (
-                        r
-                        for r in self.cache
-                        if r["scope"] == p["scope"]
-                        and r["persona"] == p["persona"]
-                        and r["proposal_id"] == p["value"]["target_id"]
-                        and r["revision"] == p["value"]["target_revision"]
-                    ),
-                    None,
-                )
-                review_data["target_material"] = (
-                    {k: target[k] for k in ("category", "value", "proposal_id", "revision")} if target else None
-                )
-            result = review_result(
-                await self.invoke_model(
-                    "review_provider",
-                    UNIFIED_REVIEW,
-                    review_data,
-                    lambda: (
-                        valid()
-                        and self.store.review_claim(proposal_id) in (None, owner)
-                        and self.allowed(p["scope"])
-                        and token == self.scope_token(p["scope"])
-                        and self.provider_for("review_provider") == provider_id
-                    ),
-                )
-            )
-            async with self.lock:
-                if (
-                    not valid()
-                    or self.store.review_claim(proposal_id) not in (None, owner)
-                    or self.closed
-                    or token != self.scope_token(p["scope"])
-                    or not self.allowed(p["scope"])
-                    or self.current_personas.get(p["scope"]) != persona_at_start
-                    or self.provider_for("review_provider") != provider_id
-                ):
-                    self.stale_results += 1
-                    raise ReviewUnavailable("review invalidated")
-                actor = "llm:" + str(provider_id)
 
-                def record_decision():
-                    with self.store.transaction():
-                        row = self.store.review(p["id"], result, actor, p["updated"])
-                        if receipt:
-                            receipt(row, result)
-                        return row
+            def dispatch():
+                if not valid() or self.current_review_context(item, owner, automatic=automatic) is None:
+                    raise ReviewUnavailable("review invalidated before dispatch")
+                kind = "manual"
+                if automatic:
+                    kind = "automatic_first" if first_review(p) else "automatic"
+                return item.single_instruction(), item.data(), ReviewDispatch.for_items([item], kind)
 
-                p = await self.review_write(record_decision)
-                if (
-                    result["verdict"] == "approve"
-                    and p["mode"] == "llm"
-                    and self.mode(p["category"]) == "llm"
-                    and not defer_apply
-                ):
-                    return await self._apply(
-                        p, actor, owner=owner, applied=(lambda row: receipt(row, result)) if receipt else None
+            async def prepare():
+                async with self.lock:
+                    return await asyncio.to_thread(dispatch)
+
+            try:
+                if getattr(self.invoke_model, "__func__", None) is Engine.invoke_model:
+                    raw_review = await self.invoke_model(
+                        "review_provider",
+                        "",
+                        {"scope": p["scope"]},
+                        fast_lane=owner is None and (not automatic or urgent_review(p)),
+                        prepare=prepare,
                     )
-                return await asyncio.to_thread(self.store.get, p["id"])
+                else:
+                    instruction, review_data, _ = await prepare()
+                    raw_review = await self.invoke_model(
+                        "review_provider",
+                        instruction,
+                        review_data,
+                        lambda: valid() and self.current_review_context(item, owner, automatic=automatic) is not None,
+                    )
+                result = review_result(raw_review)
+                reviewed = await self.commit_review(
+                    item, result, valid=valid, owner=owner, receipt=receipt, defer_apply=defer_apply, automatic=automatic
+                )
+            except (ReviewUnavailable, Conflict):
+                raise
+            except Exception:
+                if automatic:
+                    self.review_retry_at[p["id"]] = time.time() + self.review_retry_interval()
+                raise
+            if automatic:
+                self.review_retry_at.pop(p["id"], None)
+            return reviewed
 
-    def _build_batch_review_payload(self, scope, persona, proposals):
+    def _build_batch_review_payload(self, scope, persona, proposals_or_items):
         evidence_pool = {}
         compact_proposals = []
-        for p in proposals:
+        for entry in proposals_or_items:
+            if isinstance(entry, ReviewItem):
+                data = entry.data()
+                p = data["proposal"]
+                target_material = data.get("target_material") if "target_material" in data else ...
+            else:
+                p = {k: v for k, v in entry.items() if k not in {DEFER_FINGERPRINT, "reviews"}}
+                target_material = ...
             ev_ids = []
             for ev in p.get("evidence") or []:
                 ev_id = str(ev.get("id") or "") if isinstance(ev, dict) else ""
@@ -1086,7 +1251,9 @@ class Engine:
                 ev_ids.append(ev_id)
             compact = {k: v for k, v in p.items() if k != "evidence"}
             compact["evidence_ids"] = ev_ids
-            if p["category"] in {"expression_adjustment", "scene_adjustment"}:
+            if target_material is not ...:
+                compact["target_material"] = target_material
+            elif p["category"] in {"expression_adjustment", "scene_adjustment"}:
                 target = next(
                     (
                         r
@@ -1150,6 +1317,7 @@ class Engine:
         receipt=None,
         defer_apply=False,
         require_llm=False,
+        automatic=False,
         max_payload_bytes=REVIEW_BATCH_PAYLOAD_BUDGET,
     ):
         """Review a homogeneous (scope, persona) chunk in one LLM call.
@@ -1168,10 +1336,10 @@ class Engine:
             async with self.lock:
                 if self.closed or not valid():
                     raise ReviewUnavailable("review job cancelled")
-                prepared = []
-                for item in items:
-                    pid = item["id"]
-                    expected_updated = item.get("expected_updated")
+                prepared_items = []
+                for spec in items:
+                    pid = spec["id"]
+                    expected_updated = spec.get("expected_updated")
                     try:
                         p = await asyncio.to_thread(self.store.get, pid)
                     except ValueError as exc:
@@ -1217,12 +1385,29 @@ class Engine:
                     if p["state"] == "reviewed" and llm_approved(p):
                         fallback.append(pid)
                         continue
+                    item = await asyncio.to_thread(self.review_item, p)
+                    if automatic:
+                        if self.review_retry_at.get(p["id"], 0) > time.time():
+                            unavailable[pid] = ReviewUnavailable("automatic review backing off")
+                            continue
+                        if not item.context.automatic_allowed:
+                            if p.get(DEFER_FINGERPRINT):
+                                await self.review_write(
+                                    lambda pid_=p["id"], fp_=p[DEFER_FINGERPRINT]: self.store.invalidate_review_defer(
+                                        pid_, fp_
+                                    )
+                                )
+                            unavailable[pid] = ReviewUnavailable("automatic review unavailable")
+                            continue
+                        if review_is_sleeping(p, item.context):
+                            committed[pid] = p
+                            continue
                     if started and not start_recorded:
                         started(p)
-                    prepared.append(p)
+                    prepared_items.append(item)
 
-                if len(prepared) < 2:
-                    fallback.extend(p["id"] for p in prepared)
+                if len(prepared_items) < 2:
+                    fallback.extend(i.proposal["id"] for i in prepared_items)
                     return {
                         "committed": committed,
                         "unavailable": unavailable,
@@ -1230,14 +1415,14 @@ class Engine:
                         "errors": errors,
                     }
 
-                scope, persona = prepared[0]["scope"], prepared[0]["persona"]
-                same_group = [p for p in prepared if (p["scope"], p["persona"]) == (scope, persona)]
-                for p in prepared:
-                    if (p["scope"], p["persona"]) != (scope, persona):
-                        fallback.append(p["id"])
-                prepared = same_group
-                if len(prepared) < 2:
-                    fallback.extend(p["id"] for p in prepared)
+                scope, persona = prepared_items[0].proposal["scope"], prepared_items[0].proposal["persona"]
+                same_group = [i for i in prepared_items if (i.proposal["scope"], i.proposal["persona"]) == (scope, persona)]
+                for i in prepared_items:
+                    if (i.proposal["scope"], i.proposal["persona"]) != (scope, persona):
+                        fallback.append(i.proposal["id"])
+                prepared_items = same_group
+                if len(prepared_items) < 2:
+                    fallback.extend(i.proposal["id"] for i in prepared_items)
                     return {
                         "committed": committed,
                         "unavailable": unavailable,
@@ -1246,11 +1431,10 @@ class Engine:
                     }
 
                 token = self.scope_token(scope)
-                persona_at_start = self.current_personas.get(scope)
                 provider_id = self.provider_for("review_provider")
-                payload = self._build_batch_review_payload(scope, persona, prepared)
-                if len(encode(payload)) > max_payload_bytes:
-                    fallback.extend(p["id"] for p in prepared)
+                initial_payload = self._build_batch_review_payload(scope, persona, prepared_items)
+                if len(encode(initial_payload)) > max_payload_bytes:
+                    fallback.extend(i.proposal["id"] for i in prepared_items)
                     return {
                         "committed": committed,
                         "unavailable": unavailable,
@@ -1258,19 +1442,52 @@ class Engine:
                         "errors": errors,
                     }
 
+            sent_items = []
+
+            def dispatch():
+                if not valid() or self.closed or not self.allowed(scope) or token != self.scope_token(scope):
+                    raise ReviewUnavailable("review invalidated before dispatch")
+                ready_items = []
+                for item in prepared_items:
+                    if self.current_review_context(item, owner, automatic=automatic) is None:
+                        unavailable[item.proposal["id"]] = ReviewUnavailable("review invalidated before dispatch")
+                        continue
+                    ready_items.append(item)
+                if not ready_items:
+                    raise ReviewUnavailable("review invalidated before dispatch")
+                if len(ready_items) < 2:
+                    sent_items[:] = ready_items
+                    raise _FallbackToSingle()
+                payload = self._build_batch_review_payload(scope, persona, ready_items)
+                if len(encode(payload)) > max_payload_bytes:
+                    sent_items[:] = ready_items
+                    raise _FallbackToSingle()
+                sent_items[:] = ready_items
+                kind = "automatic_batch" if automatic else "manual_batch"
+                return UNIFIED_REVIEW, payload, ReviewDispatch.for_items(ready_items, kind)
+
+            async def prepare():
+                async with self.lock:
+                    return await asyncio.to_thread(dispatch)
+
             try:
                 raw_output = await self.invoke_model(
                     "review_provider",
-                    UNIFIED_REVIEW,
-                    payload,
-                    lambda: (
-                        valid()
-                        and self.allowed(scope)
-                        and token == self.scope_token(scope)
-                        and self.provider_for("review_provider") == provider_id
-                        and all(self.store.review_claim(p["id"]) in (None, owner) for p in prepared)
-                    ),
+                    "",
+                    {"scope": scope},
+                    fast_lane=owner is None and not automatic,
+                    prepare=prepare,
                 )
+            except _FallbackToSingle:
+                fallback.extend(i.proposal["id"] for i in sent_items)
+                return {
+                    "committed": committed,
+                    "unavailable": unavailable,
+                    "fallback": fallback,
+                    "errors": errors,
+                }
+            except ReviewUnavailable:
+                raise
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1283,7 +1500,7 @@ class Engine:
                 ):
                     self.stale_results += 1
                     raise ReviewUnavailable("review invalidated")
-                fallback.extend(p["id"] for p in prepared)
+                fallback.extend(i.proposal["id"] for i in (sent_items or prepared_items))
                 return {
                     "committed": committed,
                     "unavailable": unavailable,
@@ -1291,7 +1508,10 @@ class Engine:
                     "errors": errors,
                 }
 
-            valid_verdicts, missing_ids = parse_batch_review_verdicts(raw_output, [p["id"] for p in prepared])
+            active_items = sent_items or prepared_items
+            valid_verdicts, missing_ids = parse_batch_review_verdicts(
+                raw_output, [i.proposal["id"] for i in active_items]
+            )
             fallback.extend(missing_ids)
             if not valid_verdicts:
                 return {
@@ -1301,62 +1521,36 @@ class Engine:
                     "errors": errors,
                 }
 
-            async with self.lock:
-                if (
-                    not valid()
-                    or self.closed
-                    or token != self.scope_token(scope)
-                    or not self.allowed(scope)
-                    or self.current_personas.get(scope) != persona_at_start
-                    or self.provider_for("review_provider") != provider_id
-                ):
-                    self.stale_results += 1
-                    raise ReviewUnavailable("review invalidated")
-                actor = "llm:" + str(provider_id)
-                for p in prepared:
-                    pid = p["id"]
-                    if pid not in valid_verdicts:
-                        continue
-                    if self.store.review_claim(pid) not in (None, owner):
-                        self.stale_results += 1
-                        unavailable[pid] = ReviewUnavailable("proposal claimed during batch review")
-                        continue
-                    result = valid_verdicts[pid]
-
-                    def record_decision(proposal=p, verdict=result):
-                        with self.store.transaction():
-                            row = self.store.review(proposal["id"], verdict, actor, proposal["updated"])
-                            if receipt:
-                                receipt(row, verdict)
-                            return row
-
+            for item in active_items:
+                pid = item.proposal["id"]
+                if pid not in valid_verdicts:
+                    continue
+                result = valid_verdicts[pid]
+                try:
+                    updated = await self.commit_review(
+                        item,
+                        result,
+                        valid=valid,
+                        owner=owner,
+                        receipt=receipt,
+                        defer_apply=defer_apply,
+                        automatic=automatic,
+                    )
+                except (Conflict, ReviewUnavailable) as exc:
+                    unavailable[pid] = exc
+                    continue
+                except Exception as exc:
+                    errors[pid] = exc
                     try:
-                        updated = await self.review_write(record_decision)
-                    except (Conflict, ReviewUnavailable) as exc:
-                        unavailable[pid] = exc
-                        continue
-                    except Exception as exc:
-                        errors[pid] = exc
-                        continue
-
-                    if (
-                        result["verdict"] == "approve"
-                        and updated["mode"] == "llm"
-                        and self.mode(updated["category"]) == "llm"
-                        and not defer_apply
-                    ):
-                        try:
-                            updated = await self._apply(
-                                updated,
-                                actor,
-                                owner=owner,
-                                applied=(lambda row, verdict=result: receipt(row, verdict)) if receipt else None,
-                            )
-                        except Exception as exc:
-                            errors[pid] = exc
-                            committed[pid] = await asyncio.to_thread(self.store.get, pid)
-                            continue
-                    committed[pid] = await asyncio.to_thread(self.store.get, pid)
+                        saved = await asyncio.to_thread(self.store.get, pid)
+                        if saved["updated"] != item.proposal["updated"]:
+                            committed[pid] = saved
+                    except ValueError:
+                        pass
+                    continue
+                if automatic:
+                    self.review_retry_at.pop(pid, None)
+                committed[pid] = updated
         return {
             "committed": committed,
             "unavailable": unavailable,
@@ -1371,6 +1565,7 @@ class Engine:
         owner=None,
         valid=lambda: True,
         defer_apply=False,
+        automatic=False,
         max_batch_size=REVIEW_BATCH_MAX,
         max_payload_bytes=REVIEW_BATCH_PAYLOAD_BUDGET,
         failed_out=None,
@@ -1382,7 +1577,11 @@ class Engine:
         if len(ids) == 1:
             pid = ids[0]
             try:
-                return {pid: await self.review(pid, owner=owner, valid=valid, defer_apply=defer_apply)}
+                return {
+                    pid: await self.review(
+                        pid, owner=owner, valid=valid, defer_apply=defer_apply, automatic=automatic
+                    )
+                }
             except ReviewUnavailable:
                 return {}
             except Exception as exc:
@@ -1428,7 +1627,9 @@ class Engine:
                 if len(chunk) == 1:
                     pid = chunk[0]["id"]
                     try:
-                        results[pid] = await self.review(pid, owner=owner, valid=valid, defer_apply=defer_apply)
+                        results[pid] = await self.review(
+                            pid, owner=owner, valid=valid, defer_apply=defer_apply, automatic=automatic
+                        )
                     except ReviewUnavailable:
                         pass
                     except Exception as exc:
@@ -1442,6 +1643,7 @@ class Engine:
                         owner=owner,
                         valid=valid,
                         defer_apply=defer_apply,
+                        automatic=automatic,
                         max_payload_bytes=max_payload_bytes,
                     )
                 except ReviewUnavailable:
@@ -1465,7 +1667,9 @@ class Engine:
                     if self.closed or not valid() or not self.allowed(scope):
                         break
                     try:
-                        results[pid] = await self.review(pid, owner=owner, valid=valid, defer_apply=defer_apply)
+                        results[pid] = await self.review(
+                            pid, owner=owner, valid=valid, defer_apply=defer_apply, automatic=automatic
+                        )
                     except ReviewUnavailable:
                         pass
                     except Exception as exc:
@@ -1477,7 +1681,9 @@ class Engine:
             if self.closed or not valid():
                 break
             try:
-                results[pid] = await self.review(pid, owner=owner, valid=valid, defer_apply=defer_apply)
+                results[pid] = await self.review(
+                    pid, owner=owner, valid=valid, defer_apply=defer_apply, automatic=automatic
+                )
             except ReviewUnavailable:
                 pass
             except Exception as exc:
@@ -1537,11 +1743,13 @@ class Engine:
 
     async def review_pending_profiles(self):
         rows = await asyncio.to_thread(self.store.pending_profiles)
+        managed = await self.automatic_reviews.enqueue(rows)
         by_scope = {}
-        interval = max(60, int(self.config.get("analysis_interval", 600)))
         now = time.time()
         for p in reversed(rows):
-            if self.store.review_claim(p["id"]):
+            if p["id"] in managed or self.store.review_claim(p["id"]):
+                continue
+            if p["state"] == "pending" and self.automatic_review_waiting(p, now):
                 continue
             if (
                 p["state"] != "pending"
@@ -1549,9 +1757,6 @@ class Engine:
                 or not self.allowed(p["scope"])
                 or self.current_personas.get(p["scope"]) != p["persona"]
             ):
-                continue
-            latest = max((r.get("created", 0) for r in p["reviews"]), default=0)
-            if latest and now - latest < interval:
                 continue
             scope = p["scope"]
             if scope not in by_scope:
@@ -1562,7 +1767,7 @@ class Engine:
                 by_scope[scope].append(p["id"])
 
         async def run_scope(pids):
-            await self.review_batch(pids)
+            await self.review_batch(pids, automatic=True)
 
         await asyncio.gather(*(run_scope(pids) for pids in by_scope.values()))
 
@@ -1754,6 +1959,7 @@ class Engine:
             await self.social.purge(scope)
         await asyncio.to_thread(self.store.purge, scope)
         await self.refresh()
+        self.automatic_reviews.notify_context_change()
 
     async def analysis_cycle(self):
         threshold = max(1, int(self.config.get("batch_events", 20)))
@@ -1798,70 +2004,71 @@ class Engine:
             await asyncio.gather(*(run(pair) for _, pair in selected.values()))
 
     async def review_pending_proposals(self):
-        rows = await asyncio.to_thread(self.store.pending_catchup_proposals, 200)
         pending_by_scope = {}
         apply_only_by_scope = {}
         scopes_order = []
         now = time.time()
-        interval = max(60, int(self.config.get("analysis_interval", 600)))
-        for p in rows:
-            if p["category"] in MEMBER_PROFILES or self.store.review_claim(p["id"]):
-                continue
-            if p["category"] == "affection" and self.mode("affection") == "auto":
-                continue
-            try:
-                mode = self.mode(p["category"])
-            except ValueError:
-                continue
-            if mode not in {"llm", "llm_then_human"} or not self.allowed(p["scope"]):
-                continue
-            if self.current_personas.get(p["scope"]) != p["persona"]:
-                continue
-            if p["created"] + p["days"] * 86400 <= now or not policy_allowed(p):
-                continue
-            latest = max((r.get("created", 0) for r in p.get("reviews", [])), default=0)
-            if latest and now - latest < interval:
-                continue
-            if self.review_retry_at.get(p["id"], 0) > now:
-                continue
-            scope = p["scope"]
-            if p["state"] == "pending":
-                if llm_approved(p):
+        after = None
+        while len(scopes_order) < 2 or any(len(pending_by_scope.get(s, [])) < REVIEW_BATCH_MAX for s in scopes_order):
+            rows = await asyncio.to_thread(self.store.pending_catchup_proposals, 200, after=after)
+            if not rows:
+                break
+            managed = await self.automatic_reviews.enqueue(p for p in rows if p["category"] not in MEMBER_PROFILES)
+            for p in rows:
+                if p["id"] in managed or p["category"] in MEMBER_PROFILES or self.store.review_claim(p["id"]):
                     continue
-                if scope not in scopes_order:
-                    if len(scopes_order) >= 2:
-                        continue
-                    scopes_order.append(scope)
-                bucket = pending_by_scope.setdefault(scope, [])
-                if len(bucket) < REVIEW_BATCH_MAX:
-                    bucket.append(p["id"])
-            elif p["state"] == "reviewed" and p["mode"] == "llm" and mode == "llm" and llm_approved(p):
-                if scope not in scopes_order:
-                    if len(scopes_order) >= 2:
-                        continue
-                    scopes_order.append(scope)
-                if scope not in apply_only_by_scope:
-                    apply_only_by_scope[scope] = p["id"]
+                if self.automatic_review_waiting(p, now):
+                    continue
+                try:
+                    mode = self.mode(p["category"])
+                except ValueError:
+                    continue
+                if mode not in {"llm", "llm_then_human"} or not self.allowed(p["scope"]):
+                    continue
+                if self.current_personas.get(p["scope"]) != p["persona"]:
+                    continue
+                if p["created"] + p["days"] * 86400 <= now or not policy_allowed(p):
+                    continue
+                scope = p["scope"]
+                if p["state"] == "pending" and not llm_approved(p):
+                    if scope not in scopes_order:
+                        if len(scopes_order) >= 2:
+                            continue
+                        scopes_order.append(scope)
+                    bucket = pending_by_scope.setdefault(scope, [])
+                    if len(bucket) < REVIEW_BATCH_MAX:
+                        bucket.append(p["id"])
+                elif p["state"] == "reviewed" and p["mode"] == mode == "llm" and llm_approved(p):
+                    if scope not in scopes_order:
+                        if len(scopes_order) >= 2:
+                            continue
+                        scopes_order.append(scope)
+                    if scope not in apply_only_by_scope:
+                        apply_only_by_scope[scope] = (p["id"], p["updated"])
+            after = (rows[-1]["created"], rows[-1]["id"])
+            if len(rows) < 200:
+                break
 
         async def run_scope(scope):
-            apply_pid = apply_only_by_scope.get(scope)
-            if apply_pid:
+            apply_item = apply_only_by_scope.get(scope)
+            if apply_item:
+                apply_pid, apply_updated = apply_item
                 try:
-                    await self.review(apply_pid, apply_only=True)
+                    await self.review(apply_pid, expected_updated=apply_updated, apply_only=True, automatic=True)
                     self.review_retry_at.pop(apply_pid, None)
                 except ReviewUnavailable:
                     pass
                 except Exception as exc:
                     self.last_error = type(exc).__name__
-                    self.review_retry_at[apply_pid] = time.time() + interval
+                    self.review_retry_at[apply_pid] = time.time() + self.review_retry_interval()
             pids = pending_by_scope.get(scope, [])
             if pids:
                 failed = set()
-                reviewed = await self.review_batch(pids, failed_out=failed)
+                reviewed = await self.review_batch(pids, automatic=True, failed_out=failed)
                 for pid in reviewed:
                     self.review_retry_at.pop(pid, None)
                 for pid in failed:
-                    self.review_retry_at[pid] = time.time() + interval
+                    self.review_retry_at[pid] = time.time() + self.review_retry_interval()
 
         await asyncio.gather(*(run_scope(scope) for scope in scopes_order))
 
@@ -2098,6 +2305,7 @@ class Engine:
                 "waiting_models": self.model_queued,
                 "completed_batches": self.completed_batches,
                 "stale_results": self.stale_results,
+                "review_dispatches": await asyncio.to_thread(self.store.automatic_reviews.stats),
             },
             "analysis_runs": [],
             "personality_locked": True,

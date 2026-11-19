@@ -7,6 +7,12 @@ import uuid
 
 from .contract import encode
 
+_INBOX_SOURCES = """
+    LEFT JOIN events e ON e.id=q.event_id
+    LEFT JOIN profile_messages p ON q.turn_id LIKE 'source:%' AND p.scope=q.scope AND p.persona=q.persona
+        AND p.source_id=substr(q.turn_id,8) AND json_extract(p.body,'$.id')=q.event_id
+"""
+
 
 class Scheduling:
     def __init__(self, store):
@@ -44,6 +50,17 @@ class Scheduling:
         self.store.db.execute('INSERT OR IGNORE INTO analysis_inbox(event_id,scope,persona,turn_id,created) VALUES(?,?,?,?,?)',
             (event['id'],event['scope'],event['persona'],event['turn_id'],event['received_at']))
         self._sources(event)
+
+    def requeue(self, source):
+        self.ingest(source)
+        self.store.db.execute('UPDATE analysis_inbox SET processed=0 WHERE event_id=?', (source['id'],))
+
+    def pending_with_sources(self, scope):
+        return self.store.db.execute(
+            f'SELECT q.seq,coalesce(e.body,p.body) FROM analysis_inbox q {_INBOX_SOURCES} '
+            'WHERE q.scope=? AND q.processed=0',
+            (scope,),
+        ).fetchall()
 
     def batches(self, minimum=0):
         with self.store.lock:
@@ -115,7 +132,8 @@ class Scheduling:
             rows_by_seq = {
                 r[0]: r[1]
                 for r in self.store.db.execute(
-                    f'SELECT q.seq,e.body FROM analysis_inbox q JOIN events e ON q.event_id=e.id WHERE q.seq IN ({placeholders})',
+                    f'SELECT q.seq,coalesce(e.body,p.body) FROM analysis_inbox q {_INBOX_SOURCES} '
+                    f'WHERE q.seq IN ({placeholders})',
                     seqs,
                 )
             }
@@ -129,9 +147,11 @@ class Scheduling:
                 frontiers.append(dict(group))
             return {'scope': scope, 'persona': persona, 'events': events, 'frontiers': frontiers}
 
-    def commit(self, batch, candidates, rejected):
+    def commit(self, batch, candidates, rejected, *, supplied=()):
         created=[]
         with self.store.transaction():
+            if self.store.source_withdrawals.has_withdrawn(batch['scope'], supplied):
+                raise ValueError('analysis evidence withdrawn; retry from remaining sources')
             for frontier in batch['frontiers']:
                 found=self.store.db.execute('SELECT processed FROM analysis_inbox WHERE seq=? AND scope=? AND persona=? AND turn_id=?',
                     (frontier['frontier'],batch['scope'],batch['persona'],frontier['turn_id'])).fetchone()

@@ -111,8 +111,11 @@ class SceneLearning:
                     row = e.store.db.execute('SELECT fingerprint FROM scene_analysis WHERE scope=? AND persona=?', (scope, persona)).fetchone()
                     return row[0] if row else None
             if len(pairs) >= 3 and fingerprint != await asyncio.to_thread(previous):
+                ids = {identity for pair in pairs for identity in pair['source_ids']}
+                submitted = [row for row in sources if row['id'] in ids]
                 result = await e.invoke_model('analysis_provider', ANALYZE_SCENES, {'scope': scope, 'episodes': pairs},
-                                             lambda: self.enabled(scope, persona) and token == e.scope_token(scope))
+                    lambda: self.enabled(scope, persona) and token == e.scope_token(scope)
+                    and not e.store.source_withdrawals.has_withdrawn(scope, submitted))
                 if not isinstance(result, dict) or set(result) != {'patterns'} or not isinstance(result['patterns'], list) or len(result['patterns']) > 2:
                     raise ValueError('invalid scene analysis output')
                 by_id = {p['id']: p for p in pairs}
@@ -134,6 +137,8 @@ class SceneLearning:
                         return
                     def commit():
                         with e.store.transaction():
+                            if e.store.source_withdrawals.has_withdrawn(scope, submitted):
+                                return
                             for data in new:
                                 e.store.propose(data, e.mode('scene_pattern'), 'llm:scene-analysis')
                             e.store.db.execute('INSERT OR REPLACE INTO scene_analysis VALUES(?,?,?)', (scope, persona, fingerprint))
@@ -141,9 +146,12 @@ class SceneLearning:
             await self.propose_adjustments(scope, persona, token)
             # Retry deferred/failed scene reviews on subsequent cycles, without bypassing claims.
             proposals = await asyncio.to_thread(e.store.proposals, scope, 2000)
+            pending = [p for p in proposals if p['persona'] == persona and p['category'] in SCENE_CATEGORIES
+                       and p['state'] in {'pending', 'reviewed'} and not e.store.review_claim(p['id'])]
+            managed = await e.automatic_reviews.enqueue(pending)
             pending_ids = []
-            for p in [p for p in proposals if p['persona'] == persona and p['category'] in SCENE_CATEGORIES
-                      and p['state'] in {'pending', 'reviewed'} and not e.store.review_claim(p['id'])][:8]:
+            for p in [p for p in pending if p['id'] not in managed
+                      and (p['state'] == 'reviewed' or not e.automatic_review_waiting(p, time.time()))][:8]:
                 if not self.enabled(scope, persona) or token != e.scope_token(scope):
                     break
                 if p['state'] == 'reviewed':
@@ -156,6 +164,7 @@ class SceneLearning:
                 await e.review_batch(
                     pending_ids,
                     valid=lambda: self.enabled(scope, persona) and token == e.scope_token(scope),
+                    automatic=True,
                 )
 
     async def propose_adjustments(self, scope, persona, token, expression=False):

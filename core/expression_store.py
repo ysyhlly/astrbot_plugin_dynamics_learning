@@ -27,7 +27,9 @@ class ExpressionStore:
         with self.store.lock:
             rows = self.store.db.execute('''SELECT body FROM (SELECT body,created,
                 row_number() OVER(PARTITION BY member,cast(created/86400 AS INTEGER) ORDER BY created DESC,rowid DESC) AS n
-                FROM profile_messages WHERE scope=? AND persona=? AND created>?) WHERE n<=10 ORDER BY created DESC LIMIT 8000''',
+                FROM profile_messages p WHERE scope=? AND persona=? AND created>? AND NOT EXISTS (
+                SELECT 1 FROM withdrawn_review_sources w WHERE w.scope=p.scope AND w.member=p.member AND w.message_id=p.source_id
+                )) WHERE n<=10 ORDER BY created DESC LIMIT 8000''',
                 (scope, persona, time.time() - 30 * 86400)).fetchall()
             selected = balanced_sample([json.loads(r[0]) for r in rows])
             parents = {e.get('context', {}).get('reply_to') for e in selected} - {None, ''} - {e['message_id'] for e in selected}
@@ -45,6 +47,11 @@ class ExpressionStore:
                     return False
             self.store.db.execute('INSERT OR REPLACE INTO expression_analysis VALUES(?,?,?,?)', (scope, persona, now, frontier))
             return True
+
+    def release_reservation(self, scope, persona, frontier, reserved_at):
+        with self.store.transaction():
+            self.store.db.execute('DELETE FROM expression_analysis WHERE scope=? AND persona=? AND frontier=? AND last_attempt=?',
+                                  (scope, persona, frontier, reserved_at))
 
     def delivered(self, event, entries):
         reply = event.get('reply', {})

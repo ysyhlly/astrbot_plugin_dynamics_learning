@@ -59,6 +59,8 @@ class SceneStore:
 
     def observe(self, event):
         with self.store.transaction():
+            if self.store.source_withdrawals.has_withdrawn(event['scope'], [event]):
+                return
             reply = event.get('reply', {})
             if reply.get('delivered') is True and reply.get('message_id'):
                 self.store.db.execute('INSERT OR IGNORE INTO scene_deliveries VALUES(?,?,?,?,?,?)',
@@ -125,6 +127,8 @@ class SceneStore:
                 source = self.store.db.execute('SELECT body FROM events WHERE id=?', (fact['event_id'],)).fetchone()
                 if source and targets:
                     event = json.loads(source[0])
+                    if self.store.source_withdrawals.has_withdrawn(scope, [event]):
+                        continue
                     event['context']['scene_feedback'] = {**fact, 'targets': targets, 'verified': True}
                     delivered = self.store.db.execute("SELECT json_extract(body,'$.reply.text') FROM events WHERE scope=? AND persona=? AND json_extract(body,'$.turn_id')=? AND json_extract(body,'$.reply.message_id')=? AND json_extract(body,'$.reply.delivered')=1 ORDER BY created LIMIT 1", (scope, persona, fact['reply_turn'], row[1])).fetchone()
                     if delivered and isinstance(delivered[0], str):

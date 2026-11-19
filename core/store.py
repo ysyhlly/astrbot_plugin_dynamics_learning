@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -8,7 +9,15 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from .contract import MEMBER_PROFILES, digest, encode, entry_key, llm_approved, policy_allowed
+from .contract import (
+    MEMBER_PROFILES,
+    digest,
+    encode,
+    entry_key,
+    llm_approved,
+    policy_allowed,
+)
+from .review_evidence import DEFER_FINGERPRINT, pending_evidence_update
 
 
 class Conflict(ValueError):
@@ -41,6 +50,8 @@ class Store:
         CREATE INDEX IF NOT EXISTS proposals_entry ON proposals(json_extract(body,'$.entry_id'),created);
         CREATE INDEX IF NOT EXISTS proposals_queue ON proposals(state,scope,created,id);
         CREATE INDEX IF NOT EXISTS proposals_cat_key ON proposals(scope,persona,json_extract(body,'$.category'),created);
+        CREATE TABLE IF NOT EXISTS proposal_evidence_sources(proposal TEXT,message_id TEXT,event_id TEXT,
+          PRIMARY KEY(proposal,message_id));
         CREATE TABLE IF NOT EXISTS review_claims(proposal TEXT PRIMARY KEY,scope TEXT,job TEXT);
         CREATE INDEX IF NOT EXISTS review_claims_scope ON review_claims(scope);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, proposal TEXT, action TEXT, actor TEXT, created REAL, body TEXT);
@@ -64,9 +75,15 @@ class Store:
         from .scheduling import Scheduling
 
         self.scheduling = Scheduling(self)
+        from .source_withdrawals import SourceWithdrawals
+
+        self.source_withdrawals = SourceWithdrawals(self)
         from .console import Console
 
         self.console = Console(self)
+        from .automatic_review_store import AutomaticReviewStore
+
+        self.automatic_reviews = AutomaticReviewStore(self)
         from .scene_store import SceneStore
 
         self.scenes = SceneStore(self)
@@ -128,6 +145,8 @@ class Store:
             "INSERT OR IGNORE INTO events VALUES(?,?,?,?,?)",
             (event["id"], event["scope"], event["persona"], event["received_at"], encode(event)),
         )
+        if self.source_withdrawals.has_withdrawn(event["scope"], [event]):
+            return
         self.profiles.bind(event)
         self.native.register_scope(event)
         self.scheduling.ingest(event)
@@ -188,6 +207,21 @@ class Store:
         with self.lock:
             row = self.db.execute("SELECT job FROM review_claims WHERE proposal=?", (pid,)).fetchone()
             return row[0] if row else None
+
+    def review_material(self, proposal, target_category):
+        with self.lock:
+            base = self.db.execute(
+                "SELECT body FROM entries WHERE id=?", (proposal["entry_id"],)
+            ).fetchone()
+            target = None
+            if target_category:
+                target = self.db.execute(
+                    """SELECT body FROM entries WHERE json_extract(body,'$.proposal_id')=?
+                    AND json_extract(body,'$.scope')=? AND json_extract(body,'$.persona')=?
+                    AND json_extract(body,'$.category')=?""",
+                    (proposal["value"]["target_id"], proposal["scope"], proposal["persona"], target_category),
+                ).fetchone()
+            return (json.loads(base[0]) if base else None, json.loads(target[0]) if target else None)
 
     def latest_personas(self):
         with self.lock:
@@ -255,10 +289,40 @@ class Store:
         )
 
     def _save(self, p):
-        p["updated"] = time.time()
+        if p["state"] != "pending":
+            p.pop(DEFER_FINGERPRINT, None)
+        p["updated"] = max(time.time(), math.nextafter(p["updated"], math.inf))
         self.db.execute(
             "UPDATE proposals SET state=?,updated=?,body=? WHERE id=?", (p["state"], p["updated"], encode(p), p["id"])
         )
+
+    def _refresh_pending_evidence(self, old, data, before, source):
+        previous_sources = dict(self.db.execute(
+            """SELECT message_id,event_id FROM proposal_evidence_sources
+            WHERE proposal=? AND message_id IN (SELECT value FROM json_each(?))""",
+            (old["id"], encode([row["message_id"] for row in data["evidence"]])),
+        ))
+        updated = pending_evidence_update(old, data, before, source, previous_sources)
+        if updated is None:
+            return
+
+        previous = old["evidence"]
+        previous_reason = old["reason"]
+        retained = {row["message_id"] for row in updated["evidence"]}
+        self.db.executemany(
+            "INSERT OR REPLACE INTO proposal_evidence_sources VALUES(?,?,?)",
+            [(old["id"], row["message_id"], row["id"]) for row in previous if row["message_id"] not in retained],
+        )
+        old.update(updated)
+        old.pop(DEFER_FINGERPRINT, None)
+        self._save(old)
+        current = {row["id"]: row for row in old["evidence"]}
+        self._audit(old, "evidence_updated", source, {
+            "previous": [row["id"] for row in previous],
+            "current": list(current),
+            "previous_reason": previous_reason,
+            "superseded": [row for row in previous if current.get(row["id"]) != row],
+        })
 
     def propose(self, data, mode, source):
         if data.get("category") in {
@@ -273,6 +337,8 @@ class Store:
         if not policy_allowed(data):
             raise ValueError("fixed personality policy rejects proposal")
         with self.transaction():
+            if self.source_withdrawals.has_withdrawn(data["scope"], data["evidence"]):
+                raise Conflict("proposal cites a withdrawn source; regenerate from remaining evidence")
             key = entry_key(*(data[k] for k in ("scope", "persona", "member", "category", "key")))
             row = self.db.execute("SELECT body FROM entries WHERE id=?", (key,)).fetchone()
             before = json.loads(row[0]) if row else None
@@ -319,6 +385,8 @@ class Store:
                     and same_base
                     and (still_pending or still_active)
                 ):
+                    if old["state"] == "pending" and still_pending and not llm_approved(old) and mode != "auto":
+                        self._refresh_pending_evidence(old, data, before, source)
                     return old
             now = time.time()
             p = {
@@ -342,11 +410,14 @@ class Store:
             self._audit(p, "proposed", source)
             return p
 
-    def review(self, proposal_id, result, actor, expected_updated):
+    def review(self, proposal_id, result, actor, expected_updated, *, evidence_fingerprint=None, owner=None):
         with self.transaction():
             p = self.get(proposal_id)
             if p["state"] not in {"pending", "reviewed"} or p["updated"] != expected_updated:
                 raise Conflict("proposal changed while review was running")
+            is_llm = actor.startswith("llm:")
+            if is_llm and self.review_claim(proposal_id) not in (None, owner):
+                raise Conflict("proposal is reserved by a review batch")
             p["reviews"].append({**result, "actor": actor, "created": time.time()})
             p["state"] = (
                 "rejected"
@@ -357,9 +428,23 @@ class Store:
             )
             if p["state"] == "rejected":
                 self.db.execute("DELETE FROM review_claims WHERE proposal=?", (p["id"],))
+            p.pop(DEFER_FINGERPRINT, None)
+            if is_llm and result["verdict"] == "defer" and evidence_fingerprint:
+                p[DEFER_FINGERPRINT] = evidence_fingerprint
             self._save(p)
-            self._audit(p, "review", actor, result)
+            audit = {**result, "evidence_fingerprint": evidence_fingerprint} if p.get(DEFER_FINGERPRINT) else result
+            self._audit(p, "review", actor, audit)
             return p
+
+    def invalidate_review_defer(self, proposal_id, fingerprint):
+        if not fingerprint:
+            return
+        with self.transaction():
+            self.db.execute(
+                """UPDATE proposals SET body=json_remove(body,'$.review_defer_fingerprint')
+                WHERE id=? AND state='pending' AND json_extract(body,'$.review_defer_fingerprint')=?""",
+                (proposal_id, fingerprint),
+            )
 
     def pending_affection(self):
         with self.lock:
@@ -379,16 +464,22 @@ class Store:
                 AND json_extract(body,'$.category') IN ('style','typing_habit','preference','expression_example') ORDER BY created DESC,rowid DESC""")
             ]
 
-    def pending_catchup_proposals(self, limit=200):
+    def pending_catchup_proposals(self, limit=200, *, after=None):
+        cursor = ""
+        args = ()
+        if after is not None:
+            cursor = "AND (p.created,p.rowid)>(?,coalesce((SELECT rowid FROM proposals WHERE id=?),0))"
+            args = after
         with self.lock:
             return [
                 json.loads(r[0])
                 for r in self.db.execute(
-                    """SELECT p.body FROM proposals p
+                    f"""SELECT p.body FROM proposals p
                     WHERE (p.state='pending' OR (p.state='reviewed' AND json_extract(p.body,'$.mode')='llm'))
                     AND NOT EXISTS (SELECT 1 FROM review_claims WHERE proposal=p.id)
+                    {cursor}
                     ORDER BY p.created ASC, p.rowid ASC LIMIT ?""",
-                    (int(limit),),
+                    (*args, int(limit)),
                 )
             ]
 
@@ -424,6 +515,8 @@ class Store:
                 raise Conflict("fixed personality policy rejects proposal")
             if p["updated"] != expected_updated or p["state"] not in {"pending", "reviewed"}:
                 raise Conflict("proposal is no longer applicable")
+            if self.source_withdrawals.has_withdrawn(p["scope"], p["evidence"]):
+                raise Conflict("proposal cites a withdrawn source")
             approved = llm_approved(p)
             if not automatic_affection and p["mode"] in {"llm", "llm_then_human"} and not approved:
                 raise Conflict("LLM approval required")
@@ -515,18 +608,21 @@ class Store:
             return p
 
     def purge(self, scope):
-        with self.lock, self.db:
+        with self.transaction():
+            self.automatic_reviews.purge(scope)
             self.scenes.purge(scope)
             self.expressions.purge(scope)
             ids = [r[0] for r in self.db.execute("SELECT id FROM proposals WHERE scope=?", (scope,))]
             for pid in ids:
                 self.db.execute("DELETE FROM audit WHERE proposal=?", (pid,))
+                self.db.execute("DELETE FROM proposal_evidence_sources WHERE proposal=?", (pid,))
             for e in self.entries():
                 if e["scope"] == scope:
                     self.db.execute("DELETE FROM entries WHERE id=?", (e["id"],))
             for table in (
                 "events",
                 "proposals",
+                "withdrawn_review_sources",
                 "checkpoints",
                 "profile_raw",
                 "profile_targets",
@@ -546,6 +642,7 @@ class Store:
             self.db.execute("DELETE FROM review_claims WHERE scope=?", (scope,))
 
     def prune(self, days):
+        self.automatic_reviews.prune(days)
         self.console.prune(days)
         self.scenes.prune(days)
         self.expressions.prune(days)

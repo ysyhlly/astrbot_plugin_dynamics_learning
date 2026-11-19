@@ -106,7 +106,8 @@ class ExpressionLearning:
             async with e.lock:
                 if not self.enabled(scope, persona) or token != e.scope_token(scope):
                     return
-                if not await e.review_write(lambda: e.store.expressions.reserve(scope, persona, frontier, time.time())):
+                reserved_at = time.time()
+                if not await e.review_write(lambda: e.store.expressions.reserve(scope, persona, frontier, reserved_at)):
                     return
             evidence = sample + [p for p in parents if p['id'] not in {s['id'] for s in sample}]
             current = [r['value'] for r in e.cache if r['scope'] == scope and r['persona'] == persona
@@ -116,8 +117,17 @@ class ExpressionLearning:
                 return {k: row[k] for k in ('id', 'member', 'text', 'message_id', 'timestamp', 'context')}
             data = {'scope': scope, 'sample': [public_source(r) for r in sample], 'parents': [public_source(r) for r in parents],
                     'statistics': stats, 'current': current, 'feedback': [f['context']['scene_feedback']['kind'] for f in feedback[:10]]}
-            output = await e.invoke_model('analysis_provider', ANALYZE_STYLE, data,
-                lambda: self.enabled(scope, persona) and token == e.scope_token(scope))
+            submitted = [*evidence, *feedback[:10]]
+            try:
+                output = await e.invoke_model('analysis_provider', ANALYZE_STYLE, data,
+                    lambda: self.enabled(scope, persona) and token == e.scope_token(scope)
+                    and not e.store.source_withdrawals.has_withdrawn(scope, submitted))
+            finally:
+                withdrawn = e.store.source_withdrawals.has_withdrawn(scope, submitted)
+                if withdrawn:
+                    await e.review_write(lambda: e.store.expressions.release_reservation(scope, persona, frontier, reserved_at))
+            if withdrawn:
+                return
             if not isinstance(output, dict) or set(output) != {'style'}:
                 raise ValueError('invalid expression analysis response')
             if output['style'] is None:
@@ -164,7 +174,7 @@ class ExpressionLearning:
                     )
                 if p['state'] == 'pending':
                     try:
-                        p = await e.review(p['id'], defer_apply=True)
+                        p = await e.review(p['id'], expected_updated=p['updated'], defer_apply=True, automatic=True)
                     except Exception as exc:
                         e.last_error = type(exc).__name__
                 reviewed.append(p)
@@ -194,10 +204,11 @@ class ExpressionLearning:
             if p['state'] == 'reviewed':
                 if p['mode'] == 'llm' and e.mode(p['category']) == 'llm' and llm_approved(p):
                     await e.action(p['id'], 'approve', 'system:expression-review', p['updated'])
-            else:
+            elif not e.automatic_review_waiting(p, time.time()):
                 pending_ids.append(p['id'])
         if pending_ids and self.enabled(scope, persona) and token == e.scope_token(scope):
             await e.review_batch(
                 pending_ids,
                 valid=lambda: self.enabled(scope, persona) and token == e.scope_token(scope),
+                automatic=True,
             )
