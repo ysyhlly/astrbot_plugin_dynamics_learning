@@ -4,6 +4,7 @@ import time
 
 from .contract import candidate, digest, encode, llm_approved
 from .expressions import ANALYZE_STYLE, EXPRESSION_CATEGORIES, group_statistics, usage_mode, validate_style
+from .model_projection import project_event_for_model
 
 
 class ExpressionLearning:
@@ -114,7 +115,7 @@ class ExpressionLearning:
                        and r['category'] == 'expression_style' and r['active'] and r['expires'] > time.time()][:1]
             feedback = await asyncio.to_thread(e.store.scenes.adjustment_evidence, scope, persona)
             def public_source(row):
-                return {k: row[k] for k in ('id', 'member', 'text', 'message_id', 'timestamp', 'context')}
+                return project_event_for_model(row, include_scope=False)
             data = {'scope': scope, 'sample': [public_source(r) for r in sample], 'parents': [public_source(r) for r in parents],
                     'statistics': stats, 'current': current, 'feedback': [f['context']['scene_feedback']['kind'] for f in feedback[:10]]}
             submitted = [*evidence, *feedback[:10]]

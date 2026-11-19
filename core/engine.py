@@ -17,7 +17,6 @@ from .contract import (
     MODES,
     PERSONALITY_POLICY,
     candidate,
-    digest,
     encode,
     entry_key,
     event_record,
@@ -26,6 +25,17 @@ from .contract import (
     review_result,
 )
 from .expressions import REVIEW_STYLE
+from .model_projection import (
+    ANALYZE_PAYLOAD_BUDGET,
+    ANALYZE_SINGLE_EVENT_MAX,
+    REVIEW_BATCH_PAYLOAD_BUDGET,
+    build_analyze_payload,
+    build_batch_review_payload,
+    build_single_review_payload,
+    extract_character_context,
+    project_current_entry_for_model,
+    project_event_for_model,
+)
 from .review_batches import ReviewUnavailable
 from .review_evidence import DEFER_FINGERPRINT, ReviewContext, review_context, review_is_sleeping
 from .scenes import REVIEW_SCENES
@@ -91,7 +101,6 @@ DEDICATED_ANALYZE_CATEGORIES = frozenset(
     {"scene_pattern", "scene_adjustment", "expression_style", "expression_adjustment"}
 )
 REVIEW_BATCH_MAX = 8
-REVIEW_BATCH_PAYLOAD_BUDGET = 120_000
 
 
 class _FallbackToSingle(Exception):
@@ -143,10 +152,9 @@ class ReviewItem:
         return self.instruction
 
     def data(self):
-        data = {"proposal": {k: v for k, v in self.proposal.items() if k not in {DEFER_FINGERPRINT, "reviews"}}}
         if self.proposal["category"] in {"expression_adjustment", "scene_adjustment"}:
-            data["target_material"] = self.context.target_material
-        return data
+            return build_single_review_payload(self.proposal, target_material=self.context.target_material)
+        return build_single_review_payload(self.proposal)
 
     def group_key(self):
         p = self.proposal
@@ -753,35 +761,59 @@ class Engine:
                 native = await asyncio.to_thread(
                     self.store.profiles.sources_for_events, scope, persona, batch["events"]
                 )
-                base_payload_len = len(encode({"current": [], "events": [], "member_sources": []}))
+                char_context = extract_character_context(batch["events"], scope=scope, persona=persona)
+                base_payload_len = len(
+                    encode(
+                        build_analyze_payload(
+                            scope,
+                            persona,
+                            current=[],
+                            events=[],
+                            member_sources=[],
+                            character_context=char_context,
+                        )
+                    )
+                )
                 selected = []
+                projected_events = []
                 supplied = {}
+                projected_sources = {}
                 frontiers = []
                 events_len = 0
                 sources_len = 0
                 for event, frontier in zip(batch["events"], batch["frontiers"]):
                     ids = event.get("context", {}).get("message_ids") or [event["message_id"]]
-                    ev_len = len(encode(event))
+                    proj_ev = project_event_for_model(event, include_scope=True)
+                    ev_len = len(encode(proj_ev))
                     delta_events = ev_len + (1 if selected else 0)
                     new_sources = {}
+                    new_proj_sources = {}
                     delta_sources = 0
                     for mid in ids:
                         key_mid = str(mid)
                         if key_mid in native and key_mid not in supplied and key_mid not in new_sources:
                             src = native[key_mid]
+                            proj_src = project_event_for_model(src, include_scope=False)
                             new_sources[key_mid] = src
-                            delta_sources += len(encode(src)) + (1 if (supplied or len(new_sources) > 1) else 0)
-                    if base_payload_len + events_len + delta_events + sources_len + delta_sources > 112_000:
+                            new_proj_sources[key_mid] = proj_src
+                            delta_sources += len(encode(proj_src)) + (1 if (supplied or len(new_sources) > 1) else 0)
+                    next_total = base_payload_len + events_len + delta_events + sources_len + delta_sources
+                    budget = ANALYZE_SINGLE_EVENT_MAX if not selected else ANALYZE_PAYLOAD_BUDGET
+                    if next_total > budget:
                         break
                     selected.append(event)
+                    projected_events.append(proj_ev)
                     events_len += delta_events
                     supplied.update(new_sources)
+                    projected_sources.update(new_proj_sources)
                     sources_len += delta_sources
                     frontiers.append(frontier)
                 if not selected:
                     raise ValueError("evidence exceeds model input budget")
                 batch.update(events=selected, frontiers=frontiers)
                 supplied = list(supplied.values())
+                projected_source_list = list(projected_sources.values())
+                char_context = extract_character_context(selected, scope=scope, persona=persona)
                 token = self.scope_token(scope)
                 persona_at_start = self.current_personas.get(scope)
                 versions = self.entry_versions(scope, persona)
@@ -813,16 +845,25 @@ class Engine:
                 current = []
                 current_len = 2
                 for entry in relevant_active:
-                    next_len = current_len + len(encode(entry)) + (1 if current else 0)
+                    proj_entry = project_current_entry_for_model(entry)
+                    next_len = current_len + len(encode(proj_entry)) + (1 if current else 0)
                     if next_len > 16_000:
                         break
-                    current.append(entry)
+                    current.append(proj_entry)
                     current_len = next_len
+                analyze_payload = build_analyze_payload(
+                    scope,
+                    persona,
+                    current=current,
+                    events=projected_events,
+                    member_sources=projected_source_list,
+                    character_context=char_context,
+                )
             # Model work never owns the ingress/database lock.
             output = await self.invoke_model(
                 "analysis_provider",
                 ANALYZE,
-                {"current": current, "events": selected, "member_sources": supplied},
+                analyze_payload,
                 lambda: (
                     self.allowed(scope)
                     and token == self.scope_token(scope)
@@ -1231,51 +1272,32 @@ class Engine:
             return reviewed
 
     def _build_batch_review_payload(self, scope, persona, proposals_or_items):
-        evidence_pool = {}
-        compact_proposals = []
+        def resolve_target(p):
+            target = next(
+                (
+                    r
+                    for r in self.cache
+                    if r["scope"] == p["scope"]
+                    and r["persona"] == p["persona"]
+                    and r["proposal_id"] == p["value"]["target_id"]
+                    and r["revision"] == p["value"]["target_revision"]
+                ),
+                None,
+            )
+            return {k: target[k] for k in ("category", "value", "proposal_id", "revision")} if target else None
+
+        entries = []
         for entry in proposals_or_items:
             if isinstance(entry, ReviewItem):
-                data = entry.data()
-                p = data["proposal"]
-                target_material = data.get("target_material") if "target_material" in data else ...
+                target = (
+                    entry.context.target_material
+                    if entry.proposal["category"] in {"expression_adjustment", "scene_adjustment"}
+                    else ...
+                )
+                entries.append((entry.proposal, target))
             else:
-                p = {k: v for k, v in entry.items() if k not in {DEFER_FINGERPRINT, "reviews"}}
-                target_material = ...
-            ev_ids = []
-            for ev in p.get("evidence") or []:
-                ev_id = str(ev.get("id") or "") if isinstance(ev, dict) else ""
-                if not ev_id:
-                    ev_id = digest(ev)
-                if ev_id not in evidence_pool:
-                    evidence_pool[ev_id] = ev
-                ev_ids.append(ev_id)
-            compact = {k: v for k, v in p.items() if k != "evidence"}
-            compact["evidence_ids"] = ev_ids
-            if target_material is not ...:
-                compact["target_material"] = target_material
-            elif p["category"] in {"expression_adjustment", "scene_adjustment"}:
-                target = next(
-                    (
-                        r
-                        for r in self.cache
-                        if r["scope"] == p["scope"]
-                        and r["persona"] == p["persona"]
-                        and r["proposal_id"] == p["value"]["target_id"]
-                        and r["revision"] == p["value"]["target_revision"]
-                    ),
-                    None,
-                )
-                compact["target_material"] = (
-                    {k: target[k] for k in ("category", "value", "proposal_id", "revision")} if target else None
-                )
-            compact_proposals.append(compact)
-        ordered_pool = {k: evidence_pool[k] for k in sorted(evidence_pool)}
-        return {
-            "scope": scope,
-            "persona": persona,
-            "evidence_pool": ordered_pool,
-            "proposals": compact_proposals,
-        }
+                entries.append((entry, ...))
+        return build_batch_review_payload(scope, persona, entries, resolve_target=resolve_target)
 
     def _pack_review_chunks(
         self,

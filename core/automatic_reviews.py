@@ -8,7 +8,8 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 
-from .contract import MODEL_INPUT_LIMIT, MalformedModelResponse, digest, encode, review_result
+from .contract import MODEL_INPUT_LIMIT, MalformedModelResponse, encode, review_result
+from .model_projection import REVIEW_BATCH_PAYLOAD_BUDGET, build_batch_review_payload
 from .review_batches import ReviewUnavailable
 from .store import Conflict
 
@@ -87,31 +88,17 @@ def batch_verdicts(value, expected):
 
 
 def batch_payload(items):
-    evidence_pool = {}
-    compact_proposals = []
-    for item in items:
-        data = item.data()
-        p = data["proposal"]
-        ev_ids = []
-        for ev in p.get("evidence") or []:
-            ev_id = str(ev.get("id") or "") if isinstance(ev, dict) else ""
-            if not ev_id:
-                ev_id = digest(ev)
-            if ev_id not in evidence_pool:
-                evidence_pool[ev_id] = ev
-            ev_ids.append(ev_id)
-        compact = {k: v for k, v in p.items() if k != "evidence"}
-        compact["evidence_ids"] = ev_ids
-        if "target_material" in data:
-            compact["target_material"] = data["target_material"]
-        compact_proposals.append(compact)
     first = items[0].proposal
-    return {
-        "scope": first["scope"],
-        "persona": first["persona"],
-        "evidence_pool": {k: evidence_pool[k] for k in sorted(evidence_pool)},
-        "proposals": compact_proposals,
-    }
+    entries = [
+        (
+            item.proposal,
+            item.context.target_material
+            if item.proposal["category"] in {"expression_adjustment", "scene_adjustment"}
+            else ...,
+        )
+        for item in items
+    ]
+    return build_batch_review_payload(first["scope"], first["persona"], entries)
 
 
 class AutomaticReviews:
@@ -200,7 +187,9 @@ class AutomaticReviews:
                 entry = candidate[1].proposal["entry_id"]
                 if entry in entries:
                     continue
-                if len(encode(batch_payload([item for _, item in selected] + [candidate[1]]))) > MODEL_INPUT_LIMIT:
+                if len(encode(batch_payload([item for _, item in selected] + [candidate[1]]))) > min(
+                    MODEL_INPUT_LIMIT, REVIEW_BATCH_PAYLOAD_BUDGET
+                ):
                     full = True
                     break
                 selected.append(candidate)

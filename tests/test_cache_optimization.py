@@ -1096,3 +1096,310 @@ def test_preserved_automatic_reviews_queue_uses_unified_prompt_and_evidence_pool
         assert stats["logical_automatic_first_reviews"] == 2
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Lean model-facing projections (hoisted character_context + stripped bloat)
+# ---------------------------------------------------------------------------
+
+
+def _live_shaped_event(idx, *, member="alice", text="我不喜欢被剧透结局", persona_summary="人设摘要" * 450):
+    return event_record(
+        {
+            "schema_version": 1,
+            "kind": "outcome",
+            "scope": SCOPE,
+            "persona": PERSONA,
+            "member": member,
+            "turn_id": f"0:live-{idx}",
+            "message_id": f"live-{idx}",
+            "host_version": "host-v4.29.4",
+            "baseline": "b" * 64,
+            "baseline_threshold": 55.0,
+            "text": text,
+            "mandatory": False,
+            "backend": "jev",
+            "timestamp": 1795100000.0 + idx,
+            "policy": {
+                "context": "注入的社交上下文" * 350,
+                "threshold": 55.0,
+                "versions": ["v1", "v2"],
+            },
+            "decision": {
+                "action": "reply",
+                "length": "short",
+                "state": "engaged",
+                "reason": "直接互动",
+                "answers": {
+                    "join": {"noul": 0.85, "type": "prob"},
+                    "action": {"choice": "reply", "confidence": 0.9, "type": "cat"},
+                    "completion": {"choice": "complete", "confidence": 0.95, "type": "cat"},
+                    "length": {"choice": "short", "confidence": 0.8, "type": "cat"},
+                },
+            },
+            "outcome": {
+                "delivered": True,
+                "final_outcome": "sent",
+                "stage": "send",
+                "recorded_at": 1795100001.5 + idx,
+            },
+            "context": {
+                "persona_summary": persona_summary,
+                "character_scope": {
+                    "platform": "qq",
+                    "umo": SCOPE,
+                    "persona_id": "p1",
+                    "instance_id": "inst1",
+                },
+                "message_ids": [f"live-{idx}"],
+                "reply_to_ids": [""],
+                "wake_kind": "chat",
+                "interaction": {
+                    "basis": "detailed internal rationale text",
+                    "tentative_guidance": "long verbose tentative guidance string" * 3,
+                    "communication_intent": {"choice": "sharing", "confidence": 0.9},
+                    "expression_mode": {"choice": "literal", "confidence": 0.92},
+                    "turn_update": {"choice": "unclear", "confidence": 0.4},
+                    "reply_focus": ["剧情"],
+                },
+            },
+        }
+    )
+
+
+def test_analyze_lean_projection_hoists_persona_summary_strips_policy_context_and_preserves_quote_validation(store):
+    async def run():
+        _apply_entry(store, category="style", key="alice_tone", value="偏简短", member="alice")
+        raw_events = []
+        for i in range(16):
+            text = "我不喜欢被剧透结局" if i == 0 else f"日常聊天消息 {i}"
+            store.profiles.observe_batch(
+                [
+                    {
+                        "scope": SCOPE,
+                        "member": "alice",
+                        "source_id": f"live-{i}",
+                        "text": text,
+                        "created": 1795100000.0 + i,
+                        "reply_to": "",
+                        "eligible": True,
+                        "identity_tokens": ["小爱", "alice"],
+                    }
+                ]
+            )
+            ev = _live_shaped_event(i, member="alice", text=text)
+            store.ingest(ev)
+            # Also bind observed profile target so member_sources has verified native rows
+            obs = _make_event(member="alice", message_id=f"live-{i}", turn_id=f"0:obs-{i}", text=text, kind="observed")
+            store.profiles.bind(obs)
+            raw_events.append(ev)
+
+        raw_unprojected_bytes = len(encode({"current": store.entries(), "events": raw_events, "member_sources": store.profiles.sources(SCOPE, PERSONA)}).encode("utf-8"))
+
+        captured = []
+
+        async def model(role, instruction, data):
+            captured.append((role, data))
+            if role == "analysis_provider":
+                src = next(s for s in data["member_sources"] if s["text"] == "我不喜欢被剧透结局")
+                return {
+                    "proposals": [
+                        {
+                            "category": "preference",
+                            "key": "spoilers",
+                            "member": "alice",
+                            "days": 30,
+                            "reason": "成员明确自述不喜欢剧透",
+                            "evidence_ids": [src["id"]],
+                            "value": {
+                                "topic": "剧透",
+                                "stance": "dislike",
+                                "condition": "",
+                                "quote": "我不喜欢被剧透结局",
+                                "source_id": src["id"],
+                            },
+                        }
+                    ]
+                }
+            if "proposals" in data:
+                return {
+                    "verdicts": [
+                        {"proposal_id": p["id"], "verdict": "approve", "reason": "ok", "risks": []}
+                        for p in data["proposals"]
+                    ]
+                }
+            return {"verdict": "approve", "reason": "ok", "risks": []}
+
+        engine = Engine(
+            store,
+            {"sessions": [SCOPE], "analysis_provider": "ap", "review_provider": "rp", "preference_review": "llm_then_human"},
+            model,
+        )
+        engine.current_personas[SCOPE] = PERSONA
+        await engine.refresh()
+        res = await engine.analyze(SCOPE, PERSONA)
+
+        assert res["proposals"] >= 1
+        analyze_data = next(d for r, d in captured if r == "analysis_provider")
+        serialized = encode(analyze_data)
+        projected_bytes = len(serialized.encode("utf-8"))
+
+        # Static character_context hoisted ONCE at prefix, before current -> events -> member_sources
+        assert list(analyze_data.keys()) == ["character_context", "current", "events", "member_sources"]
+        assert serialized.startswith('{"character_context":{')
+        assert (
+            serialized.index('"character_context":')
+            < serialized.index('"current":')
+            < serialized.index('"events":')
+            < serialized.index('"member_sources":')
+        )
+        assert analyze_data["character_context"]["persona_summary"] == "人设摘要" * 450
+        assert analyze_data["character_context"]["baseline_threshold"] == 55.0
+
+        # Bloated per-event fields stripped while signal fields remain intact
+        for ev in analyze_data["events"]:
+            assert "persona_summary" not in (ev.get("context") or {})
+            assert "character_scope" not in (ev.get("context") or {})
+            assert "context" not in (ev.get("policy") or {})
+            assert ev["policy"]["versions"] == ["v1", "v2"]
+            assert ev["decision"]["action"] == "reply" and ev["decision"]["join"] == 0.85
+            assert "answers" not in ev["decision"]
+            assert "recorded_at" not in ev["outcome"]
+            assert ev["context"]["interaction"] == {
+                "communication_intent": "sharing",
+                "expression_mode": "literal",
+                "reply_focus": ["剧情"],
+            }
+            assert "received_at" not in ev and "baseline" not in ev
+
+        # member_sources preserve verbatim text & source_verified while dropping character_scope/identity_tokens
+        for src in analyze_data["member_sources"]:
+            assert "character_scope" not in (src.get("context") or {})
+            assert "identity_tokens" not in (src.get("context") or {})
+            assert src["context"]["source_verified"] is True
+
+        # current entries omit volatile timestamps
+        for entry in analyze_data["current"]:
+            assert "state_updated_at" not in entry and "expires" not in entry
+            assert {"id", "category", "key", "member", "value", "revision"} <= set(entry)
+
+        # Dramatic byte reduction (>80%) on realistic 16-turn live-shaped payload
+        assert projected_bytes < raw_unprojected_bytes * 0.20
+
+        # Persisted preference proposal passed strict verbatim quote check & kept full raw evidence in SQLite
+        pref = next(p for p in store.proposals() if p["category"] == "preference")
+        assert pref["value"]["quote"] == "我不喜欢被剧透结局"
+        assert pref["evidence"][0]["context"]["character_scope"] is not None
+
+    asyncio.run(run())
+
+
+def test_review_single_and_batch_lean_projection_reduces_payload_and_hoists_character_context(store):
+    async def run():
+        evs = [_live_shaped_event(i, member="alice", text=f"群内黑话例句 {i}") for i in range(4)]
+        props = []
+        for idx in range(4):
+            p = store.propose(
+                candidate(
+                    {
+                        "category": "jargon",
+                        "key": f"梗词{idx}",
+                        "value": f"群内特殊含义 {idx}",
+                        "member": "",
+                        "reason": "多次出现",
+                        "evidence_ids": [evs[idx]["id"], evs[(idx + 1) % 4]["id"]],
+                        "days": 30,
+                    },
+                    evs,
+                    None,
+                ),
+                "llm_then_human",
+                "llm:analysis",
+            )
+            props.append(p)
+
+        raw_single_bytes = len(encode({"proposal": props[0]}).encode("utf-8"))
+        raw_batch_bytes = len(encode({"proposals": props}).encode("utf-8"))
+
+        seen = []
+
+        async def model(role, instruction, data):
+            seen.append(data)
+            if "proposals" in data:
+                return {
+                    "verdicts": [
+                        {"proposal_id": p["id"], "verdict": "approve", "reason": "verified", "risks": []}
+                        for p in data["proposals"]
+                    ]
+                }
+            return {"verdict": "approve", "reason": "verified", "risks": []}
+
+        engine = Engine(store, {"sessions": [SCOPE], "review_provider": "rp"}, model)
+        engine.current_personas[SCOPE] = PERSONA
+
+        # 1) Single review
+        await engine.review(props[0]["id"])
+        single_data = seen[-1]
+        single_bytes = len(encode(single_data).encode("utf-8"))
+        assert "character_context" in single_data
+        assert single_data["character_context"]["persona_summary"] == "人设摘要" * 450
+        assert "evaluation" not in single_data["proposal"]
+        for ev in single_data["proposal"]["evidence"]:
+            assert "persona_summary" not in (ev.get("context") or {})
+            assert "context" not in (ev.get("policy") or {})
+            assert "character_scope" not in (ev.get("context") or {})
+        assert single_bytes < raw_single_bytes * 0.45
+        # Persisted SQLite evidence remains 100% untouched
+        persisted = store.get(props[0]["id"])
+        assert persisted["state"] == "reviewed"
+        assert persisted["evidence"][0]["context"]["persona_summary"] == "人设摘要" * 450
+
+        # 2) Batched review for remaining 3 proposals sharing overlapping evidence
+        await engine.review_batch([p["id"] for p in props[1:]])
+        batch_data = seen[-1]
+        batch_bytes = len(encode(batch_data).encode("utf-8"))
+        assert "character_context" in batch_data
+        assert encode(batch_data).startswith('{"character_context":{')
+        assert len(batch_data["evidence_pool"]) == 4
+        for ev in batch_data["evidence_pool"].values():
+            assert "persona_summary" not in (ev.get("context") or {})
+            assert "context" not in (ev.get("policy") or {})
+        for item in batch_data["proposals"]:
+            assert "evidence" not in item and "evaluation" not in item and "scope" not in item
+            assert item["evidence_ids"]
+        assert batch_bytes < raw_batch_bytes * 0.20
+        assert all(store.get(p["id"])["state"] == "reviewed" for p in props[1:])
+
+    asyncio.run(run())
+
+
+def test_analyze_budget_splits_large_text_events_without_dropping_frontiers(store):
+    async def run():
+        # 14 events each with 3,800 chars of real text (> 53K total) must split cleanly under 36K ANALYZE_PAYLOAD_BUDGET
+        for i in range(14):
+            ev = _make_event(
+                member="alice",
+                message_id=f"big-{i}",
+                turn_id=f"big-turn-{i}",
+                text=f"T{i:02d}-" + ("长消息内容" * 700),
+            )
+            store.ingest(ev)
+
+        batch_turn_counts = []
+        seen_turns = []
+
+        async def model(role, instruction, data):
+            batch_turn_counts.append(len(data["events"]))
+            seen_turns.extend(e["turn_id"] for e in data["events"])
+            return {"proposals": []}
+
+        engine = Engine(store, {"sessions": [SCOPE], "analysis_provider": "ap"}, model)
+        engine.current_personas[SCOPE] = PERSONA
+        await engine.analyze(SCOPE, PERSONA)
+        await engine.analyze(SCOPE, PERSONA)
+        assert len(batch_turn_counts) == 2
+        assert all(c < 14 for c in batch_turn_counts)
+        assert seen_turns == [f"big-turn-{i}" for i in range(14)]
+        assert not store.batches(1)
+
+    asyncio.run(run())
