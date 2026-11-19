@@ -10,12 +10,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from astrbot_plugin_dynamics_learning.core.contract import candidate, encode, event_record
 from astrbot_plugin_dynamics_learning.core.engine import (
+    ANALYZE,
     REVIEW,
     UNIFIED_REVIEW,
     Engine,
     parse_batch_review_verdicts,
 )
 from astrbot_plugin_dynamics_learning.core.expressions import REVIEW_STYLE
+from astrbot_plugin_dynamics_learning.core.model_projection import format_system_prompt
 from astrbot_plugin_dynamics_learning.core.scenes import REVIEW_SCENES
 from astrbot_plugin_dynamics_learning.core.store import Store
 from test_expression_style import raw_style, samples
@@ -1199,7 +1201,7 @@ def test_analyze_lean_projection_hoists_persona_summary_strips_policy_context_an
         captured = []
 
         async def model(role, instruction, data):
-            captured.append((role, data))
+            captured.append((role, instruction, data))
             if role == "analysis_provider":
                 src = next(s for s in data["member_sources"] if s["text"] == "我不喜欢被剧透结局")
                 return {
@@ -1240,21 +1242,26 @@ def test_analyze_lean_projection_hoists_persona_summary_strips_policy_context_an
         res = await engine.analyze(SCOPE, PERSONA)
 
         assert res["proposals"] >= 1
-        analyze_data = next(d for r, d in captured if r == "analysis_provider")
+        analyze_instruction, analyze_data = next((ins, d) for r, ins, d in captured if r == "analysis_provider")
         serialized = encode(analyze_data)
         projected_bytes = len(serialized.encode("utf-8"))
 
-        # Static character_context hoisted ONCE at prefix, before current -> events -> member_sources
-        assert list(analyze_data.keys()) == ["character_context", "current", "events", "member_sources"]
-        assert serialized.startswith('{"character_context":{')
+        # Static character_context hoisted into system_prompt (after ANALYZE), omitted from user JSON
+        expected_char_ctx = {
+            "persona_summary": "人设摘要" * 450,
+            "scope": SCOPE,
+            "persona": PERSONA,
+            "baseline_threshold": 55.0,
+        }
+        assert analyze_instruction == format_system_prompt(ANALYZE, expected_char_ctx)
+        assert list(analyze_data.keys()) == ["current", "events", "member_sources"]
+        assert "character_context" not in analyze_data
+        assert serialized.startswith('{"current":[')
         assert (
-            serialized.index('"character_context":')
-            < serialized.index('"current":')
+            serialized.index('"current":')
             < serialized.index('"events":')
             < serialized.index('"member_sources":')
         )
-        assert analyze_data["character_context"]["persona_summary"] == "人设摘要" * 450
-        assert analyze_data["character_context"]["baseline_threshold"] == 55.0
 
         # Bloated per-event fields stripped while signal fields remain intact
         for ev in analyze_data["events"]:
@@ -1324,7 +1331,7 @@ def test_review_single_and_batch_lean_projection_reduces_payload_and_hoists_char
         seen = []
 
         async def model(role, instruction, data):
-            seen.append(data)
+            seen.append((instruction, data))
             if "proposals" in data:
                 return {
                     "verdicts": [
@@ -1336,13 +1343,22 @@ def test_review_single_and_batch_lean_projection_reduces_payload_and_hoists_char
 
         engine = Engine(store, {"sessions": [SCOPE], "review_provider": "rp"}, model)
         engine.current_personas[SCOPE] = PERSONA
+        expected_review_instruction = format_system_prompt(
+            UNIFIED_REVIEW,
+            {
+                "persona_summary": "人设摘要" * 450,
+                "scope": SCOPE,
+                "persona": PERSONA,
+                "baseline_threshold": 55.0,
+            },
+        )
 
         # 1) Single review
         await engine.review(props[0]["id"])
-        single_data = seen[-1]
+        single_instruction, single_data = seen[-1]
         single_bytes = len(encode(single_data).encode("utf-8"))
-        assert "character_context" in single_data
-        assert single_data["character_context"]["persona_summary"] == "人设摘要" * 450
+        assert single_instruction == expected_review_instruction
+        assert "character_context" not in single_data
         assert "evaluation" not in single_data["proposal"]
         for ev in single_data["proposal"]["evidence"]:
             assert "persona_summary" not in (ev.get("context") or {})
@@ -1356,10 +1372,10 @@ def test_review_single_and_batch_lean_projection_reduces_payload_and_hoists_char
 
         # 2) Batched review for remaining 3 proposals sharing overlapping evidence
         await engine.review_batch([p["id"] for p in props[1:]])
-        batch_data = seen[-1]
+        batch_instruction, batch_data = seen[-1]
         batch_bytes = len(encode(batch_data).encode("utf-8"))
-        assert "character_context" in batch_data
-        assert encode(batch_data).startswith('{"character_context":{')
+        assert batch_instruction == single_instruction == expected_review_instruction
+        assert "character_context" not in batch_data
         assert len(batch_data["evidence_pool"]) == 4
         for ev in batch_data["evidence_pool"].values():
             assert "persona_summary" not in (ev.get("context") or {})
@@ -1401,5 +1417,303 @@ def test_analyze_budget_splits_large_text_events_without_dropping_frontiers(stor
         assert all(c < 14 for c in batch_turn_counts)
         assert seen_turns == [f"big-turn-{i}" for i in range(14)]
         assert not store.batches(1)
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (Cache Hit >= 70%): Uniform character_context in system_prompt,
+# bursty automatic-review coalescing, and configurable analysis rounds.
+# ---------------------------------------------------------------------------
+
+
+def test_events_and_profile_messages_reviews_share_identical_system_prompt_with_character_context(store):
+    async def run():
+        # Seed SQLite with an events row carrying persona_summary + baseline_threshold
+        live_ev = _live_shaped_event(0, member="alice", text="群里经常用这个梗", persona_summary="稳定角色人设" * 300)
+        store.ingest(live_ev)
+
+        # 1) events-backed proposal (jargon)
+        p_events = store.propose(
+            candidate(
+                {
+                    "category": "jargon",
+                    "key": "测试梗",
+                    "value": "群内调侃用语",
+                    "member": "",
+                    "reason": "多次出现",
+                    "evidence_ids": [live_ev["id"]],
+                    "days": 30,
+                },
+                [live_ev],
+                None,
+            ),
+            "llm_then_human",
+            "llm:analysis",
+        )
+
+        # 2) profile_messages-backed proposals (expression_style + style with profile evidence lacking persona_summary)
+        profile_rows = []
+        for member in ("alice", "bob", "carol"):
+            for i in range(10):
+                content = ["笑死 这也太离谱了吧", "嗯", "好了 收工", "哈哈哈哈", "就这啊"][i % 5]
+                profile_rows.append(
+                    event_record(
+                        {
+                            "schema_version": 1,
+                            "kind": "observed",
+                            "scope": SCOPE,
+                            "persona": PERSONA,
+                            "member": member,
+                            "message_id": f"prof-{member}-{i}",
+                            "turn_id": f"0:prof-{member}-{i}",
+                            "baseline": "baseline",
+                            "host_version": "host",
+                            "baseline_threshold": 50,
+                            "mandatory": False,
+                            "text": content,
+                            "timestamp": time.time() - (i % 3) * 86400 - 100,
+                            "context": {"source_verified": True, "reply_to": "", "reply_to_ids": []},
+                        }
+                    )
+                )
+        # Verify profile_messages evidence genuinely has NO persona_summary
+        assert all("persona_summary" not in (r.get("context") or {}) for r in profile_rows)
+
+        p_expr = store.propose(
+            candidate(raw_style(profile_rows), profile_rows, None),
+            "llm_then_human",
+            "llm:expression",
+        )
+        p_member_style = store.propose(
+            candidate(
+                {
+                    "category": "style",
+                    "key": "alice_typing",
+                    "value": "喜欢短句收尾",
+                    "member": "alice",
+                    "reason": "来自 profile_messages 样本",
+                    "evidence_ids": [profile_rows[0]["id"], profile_rows[1]["id"]],
+                    "days": 30,
+                },
+                profile_rows[:2],
+                None,
+            ),
+            "llm_then_human",
+            "llm:analysis",
+        )
+
+        seen = []
+
+        async def model(role, instruction, data):
+            seen.append((role, instruction, data))
+            if role == "analysis_provider":
+                return {"proposals": []}
+            if "proposals" in data:
+                return {
+                    "verdicts": [
+                        {"proposal_id": item["id"], "verdict": "approve", "reason": "ok", "risks": []}
+                        for item in data["proposals"]
+                    ]
+                }
+            return {"verdict": "approve", "reason": "ok", "risks": []}
+
+        # Brand-new Engine instance: _character_context_cache starts empty -> proves lazy SQLite hydration
+        engine = Engine(
+            store,
+            {"sessions": [SCOPE], "analysis_provider": "ap", "review_provider": "rp"},
+            model,
+        )
+        engine.current_personas[SCOPE] = PERSONA
+        assert engine._character_context_cache == {}
+
+        # Review profile_messages-backed expression_style FIRST (before any events-backed call!)
+        await engine.review(p_expr["id"])
+        # Review events-backed jargon singly
+        await engine.review(p_events["id"])
+        # Batch review a fresh events-backed + profile_messages-backed pair together
+        p_events_2 = store.propose(
+            candidate(
+                {
+                    "category": "jargon",
+                    "key": "测试梗2",
+                    "value": "另一个调侃用语",
+                    "member": "",
+                    "reason": "再次出现",
+                    "evidence_ids": [live_ev["id"]],
+                    "days": 30,
+                },
+                [live_ev],
+                None,
+            ),
+            "llm_then_human",
+            "llm:analysis",
+        )
+        await engine.review_batch([p_member_style["id"], p_events_2["id"]])
+        # Also trigger analyze to check ANALYZE system_prompt carries identical character_context tail
+        await engine.analyze(SCOPE, PERSONA)
+
+        expected_char_ctx = {
+            "persona_summary": "稳定角色人设" * 300,
+            "scope": SCOPE,
+            "persona": PERSONA,
+            "baseline_threshold": 55.0,
+        }
+        expected_review_prompt = format_system_prompt(UNIFIED_REVIEW, expected_char_ctx)
+        expected_analyze_prompt = format_system_prompt(ANALYZE, expected_char_ctx)
+
+        review_calls = [(ins, d) for role, ins, d in seen if role == "review_provider"]
+        analyze_calls = [(ins, d) for role, ins, d in seen if role == "analysis_provider"]
+        assert len(review_calls) == 3
+        assert len(analyze_calls) == 1
+
+        # 100% byte-identical review system_prompt across profile_messages, events, and mixed batch
+        for ins, data in review_calls:
+            assert ins == expected_review_prompt
+            assert "character_context" not in data
+
+        # Analyze system_prompt carries the exact same serialized character_context block
+        assert analyze_calls[0][0] == expected_analyze_prompt
+        assert "character_context" not in analyze_calls[0][1]
+
+    asyncio.run(run())
+
+
+def test_automatic_reviews_coalescing_window_batches_bursts_and_bypasses_on_max_or_urgent(store):
+    async def run():
+        ev1 = _live_shaped_event(1, member="alice", text="消息1")
+        ev2 = _live_shaped_event(2, member="bob", text="消息2")
+        store.ingest(ev1)
+        store.ingest(ev2)
+
+        def _make_prop(category, key, member, ev):
+            return store.propose(
+                candidate(
+                    {
+                        "category": category,
+                        "key": key,
+                        "value": f"值-{key}",
+                        "member": member,
+                        "reason": "依据明确",
+                        "evidence_ids": [ev["id"]],
+                        "days": 30,
+                    },
+                    [ev],
+                    None,
+                ),
+                "llm",
+                "llm:analysis",
+            )
+
+        p1 = _make_prop("jargon", "梗1", "", ev1)
+        p2 = _make_prop("style", "alice_style", "alice", ev1)
+        p3 = _make_prop("style", "bob_style", "bob", ev2)
+        p4 = _make_prop("jargon", "梗2", "", ev2)
+
+        # Urgent proposal (human source) must never wait in automatic coalescing queue
+        p_urgent = store.propose(
+            candidate(
+                {
+                    "category": "jargon",
+                    "key": "人工纠正",
+                    "value": "立即生效",
+                    "member": "",
+                    "reason": "管理员提交",
+                    "evidence_ids": [ev1["id"]],
+                    "days": 30,
+                },
+                [ev1],
+                None,
+            ),
+            "llm",
+            "human:admin",
+        )
+
+        seen = []
+
+        async def model(role, instruction, data):
+            seen.append((role, instruction, data))
+            if "proposals" in data:
+                return {
+                    "verdicts": [
+                        {"proposal_id": item["id"], "verdict": "approve", "reason": "ok", "risks": []}
+                        for item in data["proposals"]
+                    ]
+                }
+            return {"verdict": "approve", "reason": "ok", "risks": []}
+
+        engine = Engine(
+            store,
+            {"sessions": [SCOPE], "review_provider": "rp", "jargon_review": "llm", "style_review": "llm"},
+            model,
+        )
+        engine.current_personas[SCOPE] = PERSONA
+        engine.automatic_reviews.running = True
+        assert engine.automatic_reviews.coalesce_seconds() == 15.0
+        assert engine.automatic_reviews.candidate(p_urgent) is False
+
+        # Enqueue 3 bursty proposals across different members & categories at t0, t0+5, t0+10
+        t0 = time.time()
+        assert engine.automatic_reviews.enqueue_candidates([p1], t0) == {p1["id"]}
+        assert engine.automatic_reviews.enqueue_candidates([p2], t0 + 5.0) == {p2["id"]}
+        assert engine.automatic_reviews.enqueue_candidates([p3], t0 + 10.0) == {p3["id"]}
+
+        # At t0+12 (< newest_ready + 15 = t0+25): coalescing holds all 3 together
+        groups, next_at = engine.automatic_reviews.ready(t0 + 12.0, set(), discover=False)
+        assert groups == []
+        assert next_at == pytest.approx(t0 + 25.0)
+
+        # At t0+25: coalescing window elapses and emits 1 combined batch of all 3
+        groups, _ = engine.automatic_reviews.ready(t0 + 25.0, set(), discover=False)
+        assert len(groups) == 1
+        assert [item.proposal["id"] for _, item in groups[0]] == [p1["id"], p2["id"], p3["id"]]
+
+        # When 4th item arrives at t0+12 (reaching MAX_ITEMS=4), bypass coalescing immediately
+        assert engine.automatic_reviews.enqueue_candidates([p4], t0 + 12.0) == {p4["id"]}
+        groups, _ = engine.automatic_reviews.ready(t0 + 12.0, set(), discover=False)
+        assert len(groups) == 1
+        assert len(groups[0]) == 4
+
+        # Dispatch executes 1 batched provider call for all 4 proposals across members/categories
+        await engine.automatic_reviews.dispatch(groups[0])
+        assert len(seen) == 1
+        assert len(seen[0][2]["proposals"]) == 4
+        assert all(store.get(p["id"])["state"] == "applied" for p in (p1, p2, p3, p4))
+
+        # When automatic_review_coalesce_seconds=0, a single item fires immediately at t0
+        p5 = _make_prop("jargon", "立即触发", "", ev1)
+        engine.config["automatic_review_coalesce_seconds"] = 0
+        assert engine.automatic_reviews.coalesce_seconds() == 0.0
+        t1 = time.time()
+        assert engine.automatic_reviews.enqueue_candidates([p5], t1) == {p5["id"]}
+        groups, _ = engine.automatic_reviews.ready(t1, set(), discover=False)
+        assert len(groups) == 1 and len(groups[0]) == 1
+
+    asyncio.run(run())
+
+
+def test_analysis_max_rounds_per_cycle_default_two_and_configurable(store):
+    schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert schema["analysis_max_rounds_per_cycle"]["default"] == 2
+    assert schema["automatic_review_coalesce_seconds"]["default"] == 15.0
+
+    async def _run_with_config(cfg):
+        engine = Engine(store, {"sessions": [SCOPE], "batch_events": 1, **cfg}, None)
+        engine.current_personas[SCOPE] = PERSONA
+        store.batches = lambda minimum: [{"scope": SCOPE, "persona": PERSONA, "count": 50, "oldest": 1}]
+        calls = []
+
+        async def analyze(scope, persona):
+            calls.append((scope, persona))
+
+        engine.analyze = analyze
+        await engine.analysis_cycle()
+        return len(calls)
+
+    async def run():
+        assert await _run_with_config({}) == 2
+        assert await _run_with_config({"analysis_max_rounds_per_cycle": 1}) == 1
+        assert await _run_with_config({"analysis_max_rounds_per_cycle": 3}) == 3
 
     asyncio.run(run())

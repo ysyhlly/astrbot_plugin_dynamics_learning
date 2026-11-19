@@ -30,6 +30,12 @@
     "default": true,
     "hint": "同一会话、角色、成员和审查策略下，最多合并四条；最早待审提案最多等待五分钟。人工发起的审查和纠正立即处理。"
   },
+  "automatic_review_coalesce_seconds": {
+    "description": "自动审查短合批窗口（秒）",
+    "type": "float",
+    "default": 15.0,
+    "hint": "短时间连续到达的非紧急待审提案等待此窗口合批发送；达到单批上限或紧急提案立即处理，设为 0 关闭短窗等待。"
+  },
   "auto_analyze": {
     "description": "自动生成提案",
     "type": "bool",
@@ -39,6 +45,12 @@
     "description": "分析检查间隔（秒）",
     "type": "int",
     "default": 600
+  },
+  "analysis_max_rounds_per_cycle": {
+    "description": "单周期最大分析轮数",
+    "type": "int",
+    "default": 2,
+    "hint": "每个维护周期最多连续执行的分析轮数；精简输入后单轮可处理约 40+ 回合，默认 2 轮兼顾吞吐与缓存效率。"
   },
   "batch_events": {
     "description": "新增回合达到多少条后分析",

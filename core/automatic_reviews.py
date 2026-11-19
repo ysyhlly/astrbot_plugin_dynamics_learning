@@ -15,6 +15,7 @@ from .store import Conflict
 
 MAX_ITEMS = 4
 WAIT_SECONDS = 300
+DEFAULT_COALESCE_SECONDS = 15.0
 BATCH_OUTPUT = """
 逐项独立审查 proposals 数组。每项只能使用自己 proposal 的信息、引用证据、before
 及自己的 target_material，禁止以其它提案的内容、结论或证据互相佐证。
@@ -158,6 +159,14 @@ class AutomaticReviews:
             return None
         return item if item.context.automatic_allowed else None
 
+    def coalesce_seconds(self):
+        raw = self.engine.config.get("automatic_review_coalesce_seconds", DEFAULT_COALESCE_SECONDS)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = DEFAULT_COALESCE_SECONDS
+        return max(0.0, value)
+
     def ready(self, now, busy, *, discover=True):
         if discover:
             self.enqueue_candidates(self.queue.undiscovered(self.engine.effective_sessions(), now), now)
@@ -176,13 +185,14 @@ class AutomaticReviews:
                 key = (item.group_key(), p["id"] if row["singleton"] else "")
                 groups[key].append((row, item))
 
+        coalesce = self.coalesce_seconds()
+        batch_enabled = bool(self.engine.config.get("automatic_review_batch_enabled", True))
         ready = []
         for items in groups.values():
             row, oldest = items[0]
-            deadline = row["ready"] + self.wait_seconds
             selected = [(row, oldest)]
             entries = {oldest.proposal["entry_id"]}
-            full = bool(row["singleton"])
+            full = bool(row["singleton"]) or not batch_enabled
             for candidate in items[1:]:
                 entry = candidate[1].proposal["entry_id"]
                 if entry in entries:
@@ -197,7 +207,11 @@ class AutomaticReviews:
                 if len(selected) == MAX_ITEMS:
                     full = True
                     break
-            if full or deadline <= now:
+            has_urgent = any(urgent_review(item.proposal) for _, item in selected)
+            max_wait_deadline = row["ready"] + self.wait_seconds
+            newest_ready = max(r["ready"] for r, _ in selected)
+            deadline = min(max_wait_deadline, newest_ready + coalesce)
+            if full or has_urgent or deadline <= now:
                 ready.append((deadline, selected))
             else:
                 next_at = min(next_at, deadline)

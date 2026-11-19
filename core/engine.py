@@ -33,6 +33,7 @@ from .model_projection import (
     build_batch_review_payload,
     build_single_review_payload,
     extract_character_context,
+    format_system_prompt,
     project_current_entry_for_model,
     project_event_for_model,
 )
@@ -161,13 +162,6 @@ class ReviewItem:
         return (
             p["scope"],
             p["persona"],
-            p["member"],
-            p["category"],
-            p["mode"],
-            self.mode,
-            p.get("profile_policy"),
-            p.get("scene_policy"),
-            p.get("expression_policy"),
             self.context.provider_id,
             self.context.model,
             id(self.context.provider_instance),
@@ -207,6 +201,7 @@ class Engine:
         self.current_personas = {}
         self.analysis_last_served = {}
         self.character_scopes = {}
+        self._character_context_cache = {}
         self.projection_generation = 0
         self.scope_projection_generations = {}
         self.review_retry_at = {}
@@ -293,6 +288,9 @@ class Engine:
             if self.latest.get(pair) != version:
                 self.latest[pair] = version
                 self.automatic_reviews.notify_context_change()
+            ingested_char_ctx = extract_character_context([row], scope=row["scope"], persona=row["persona"])
+            if ingested_char_ctx is not None:
+                self._character_context_cache[pair] = ingested_char_ctx
             if row["kind"] == "observed":
                 if self.current_personas.get(row["scope"]) != row["persona"]:
                     self.bump_projection_generation(row["scope"])
@@ -761,7 +759,6 @@ class Engine:
                 native = await asyncio.to_thread(
                     self.store.profiles.sources_for_events, scope, persona, batch["events"]
                 )
-                char_context = extract_character_context(batch["events"], scope=scope, persona=persona)
                 base_payload_len = len(
                     encode(
                         build_analyze_payload(
@@ -770,7 +767,6 @@ class Engine:
                             current=[],
                             events=[],
                             member_sources=[],
-                            character_context=char_context,
                         )
                     )
                 )
@@ -813,7 +809,8 @@ class Engine:
                 batch.update(events=selected, frontiers=frontiers)
                 supplied = list(supplied.values())
                 projected_source_list = list(projected_sources.values())
-                char_context = extract_character_context(selected, scope=scope, persona=persona)
+                char_context = await asyncio.to_thread(self.character_context_for, scope, persona, selected)
+                analyze_instruction = format_system_prompt(ANALYZE, char_context)
                 token = self.scope_token(scope)
                 persona_at_start = self.current_personas.get(scope)
                 versions = self.entry_versions(scope, persona)
@@ -857,12 +854,11 @@ class Engine:
                     current=current,
                     events=projected_events,
                     member_sources=projected_source_list,
-                    character_context=char_context,
                 )
             # Model work never owns the ingress/database lock.
             output = await self.invoke_model(
                 "analysis_provider",
-                ANALYZE,
+                analyze_instruction,
                 analyze_payload,
                 lambda: (
                     self.allowed(scope)
@@ -1056,9 +1052,30 @@ class Engine:
                 work.exception()
             raise
 
+    def character_context_for(self, scope, persona, events=()):
+        """Return consistent per-(scope, persona) character_context, hydrating lazily from SQLite."""
+        key = (scope, persona)
+        cached = self._character_context_cache.get(key)
+        extracted = extract_character_context(events, scope=scope, persona=persona)
+        if extracted is not None:
+            if cached is None or cached.get("persona_summary") != extracted.get("persona_summary"):
+                self._character_context_cache[key] = extracted
+                return extracted
+            return cached
+        if cached is not None:
+            return cached
+        latest = self.store.latest_character_context(scope, persona)
+        if latest is not None:
+            extracted = extract_character_context([latest], scope=scope, persona=persona)
+            if extracted is not None:
+                self._character_context_cache[key] = extracted
+                return extracted
+        return None
+
     def review_item(self, p):
         category = p["category"]
-        instruction = UNIFIED_REVIEW
+        char_ctx = self.character_context_for(p["scope"], p["persona"], p.get("evidence") or ())
+        instruction = format_system_prompt(UNIFIED_REVIEW, char_ctx)
         return ReviewItem(
             p,
             instruction,
@@ -1486,7 +1503,7 @@ class Engine:
                     raise _FallbackToSingle()
                 sent_items[:] = ready_items
                 kind = "automatic_batch" if automatic else "manual_batch"
-                return UNIFIED_REVIEW, payload, ReviewDispatch.for_items(ready_items, kind)
+                return ready_items[0].single_instruction(), payload, ReviewDispatch.for_items(ready_items, kind)
 
             async def prepare():
                 async with self.lock:
@@ -1976,6 +1993,7 @@ class Engine:
         self.bump_projection_generation(scope)
         self.latest = {k: v for k, v in self.latest.items() if k[0] != scope}
         self.character_scopes = {k: v for k, v in self.character_scopes.items() if k[0] != scope}
+        self._character_context_cache = {k: v for k, v in self._character_context_cache.items() if k[0] != scope}
         self.current_personas.pop(scope, None)
         if self.social:
             await self.social.purge(scope)
@@ -1986,9 +2004,10 @@ class Engine:
     async def analysis_cycle(self):
         threshold = max(1, int(self.config.get("batch_events", 20)))
         interval = max(60, int(self.config.get("analysis_interval", 600)))
+        max_rounds = max(1, min(20, int(self.config.get("analysis_max_rounds_per_cycle", 2))))
         failed = set()
         visited = set()
-        for round_number in range(4):
+        for round_number in range(max_rounds):
             batches = await asyncio.to_thread(self.store.batches, 1)
             now = time.time()
             pending = {(b["scope"], b["persona"]) for b in batches}

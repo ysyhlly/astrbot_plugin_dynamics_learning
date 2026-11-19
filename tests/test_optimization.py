@@ -464,7 +464,7 @@ def test_scene_summary_cache_invalidates_on_write(store):
 
 def test_same_session_rotates_personas_even_if_one_fails(store):
     async def run():
-        engine = Engine(store, {"sessions": [SCOPE], "batch_events": 1}, None)
+        engine = Engine(store, {"sessions": [SCOPE], "batch_events": 1, "analysis_max_rounds_per_cycle": 4}, None)
         engine.current_personas[SCOPE] = "current"
         batches = [{"scope": SCOPE, "persona": name, "count": 50, "oldest": i}
                    for i, name in enumerate(("old", "older", "current"))]

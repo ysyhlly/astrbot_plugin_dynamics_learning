@@ -230,6 +230,18 @@ class Store:
                 ON e.scope=q.scope AND e.created=q.stamp WHERE json_extract(e.body,'$.kind')='observed'""").fetchall()
             return dict(rows)
 
+    def latest_character_context(self, scope, persona):
+        with self.lock:
+            row = self.db.execute(
+                """SELECT body FROM events
+                WHERE scope=? AND persona=?
+                AND json_extract(body,'$.context.persona_summary') IS NOT NULL
+                AND length(trim(json_extract(body,'$.context.persona_summary')))>0
+                ORDER BY created DESC LIMIT 1""",
+                (scope, persona),
+            ).fetchone()
+            return json.loads(row[0]) if row else None
+
     def get(self, proposal_id):
         with self.lock:
             row = self.db.execute("SELECT body FROM proposals WHERE id=?", (proposal_id,)).fetchone()

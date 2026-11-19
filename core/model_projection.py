@@ -9,7 +9,7 @@ context needed by the model.
 
 from __future__ import annotations
 
-from .contract import digest
+from .contract import digest, encode
 
 DEFER_FINGERPRINT = "review_defer_fingerprint"
 ANALYZE_PAYLOAD_BUDGET = 36_000
@@ -60,8 +60,15 @@ def extract_character_context(events, *, scope="", persona=""):
     if persona:
         out["persona"] = persona
     if threshold is not None:
-        out["baseline_threshold"] = threshold
+        out["baseline_threshold"] = float(threshold)
     return out
+
+
+def format_system_prompt(base_prompt, character_context=None):
+    """Append deterministic static character_context to system_prompt tail."""
+    if not character_context:
+        return base_prompt
+    return base_prompt + "\n\n[character_context]\n" + encode(character_context)
 
 
 def project_event_for_model(event, *, include_scope=True):
@@ -208,15 +215,20 @@ def build_analyze_payload(scope, persona, *, current, events, member_sources, ch
     return payload
 
 
-def build_single_review_payload(proposal, *, target_material=...):
-    """Assemble lean single-proposal REVIEW payload with hoisted character_context."""
-    raw_evidence = proposal.get("evidence") or ()
-    char_ctx = extract_character_context(
-        raw_evidence, scope=proposal.get("scope", ""), persona=proposal.get("persona", "")
-    )
+def build_single_review_payload(proposal, *, target_material=..., include_character_context=False):
+    """Assemble lean single-proposal REVIEW payload.
+
+    By default `character_context` is placed in `system_prompt` by the caller so
+    it is not duplicated in user JSON.
+    """
     payload = {}
-    if char_ctx:
-        payload["character_context"] = char_ctx
+    if include_character_context:
+        raw_evidence = proposal.get("evidence") or ()
+        char_ctx = extract_character_context(
+            raw_evidence, scope=proposal.get("scope", ""), persona=proposal.get("persona", "")
+        )
+        if char_ctx:
+            payload["character_context"] = char_ctx
     payload["proposal"] = project_proposal_for_review(
         proposal, include_scope_persona=True, include_evidence=True
     )
@@ -225,11 +237,11 @@ def build_single_review_payload(proposal, *, target_material=...):
     return payload
 
 
-def build_batch_review_payload(scope, persona, entries, *, resolve_target=None):
-    """Assemble lean batched REVIEW payload with hoisted character_context & deduplicated evidence_pool.
+def build_batch_review_payload(scope, persona, entries, *, resolve_target=None, include_character_context=False):
+    """Assemble lean batched REVIEW payload with deduplicated evidence_pool.
 
     Each entry in `entries` may be a `(proposal, target_material_or_ellipsis)` tuple
-    or a bare proposal dict.
+    or a bare proposal dict. By default `character_context` lives in `system_prompt`.
     """
     evidence_pool = {}
     all_raw_evidence = []
@@ -262,10 +274,11 @@ def build_batch_review_payload(scope, persona, entries, *, resolve_target=None):
                 target_material=target_material,
             )
         )
-    char_ctx = extract_character_context(all_raw_evidence, scope=scope, persona=persona)
     payload = {}
-    if char_ctx:
-        payload["character_context"] = char_ctx
+    if include_character_context:
+        char_ctx = extract_character_context(all_raw_evidence, scope=scope, persona=persona)
+        if char_ctx:
+            payload["character_context"] = char_ctx
     payload["evidence_pool"] = {k: evidence_pool[k] for k in sorted(evidence_pool)}
     payload["persona"] = persona
     payload["proposals"] = compact_proposals
