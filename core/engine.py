@@ -83,7 +83,8 @@ expression_example 原话样例与 typing_habit 数值统计由程序自动产�
 preference 的 value 必须为 {"topic":"具体对象","stance":"like|dislike|boundary","condition":"适用条件，没有则空串",
 "quote":"member_sources 中该成员明确表达喜恶的连续原话","source_id":"该原话的实际事件id"}。
 evidence_ids 必须包含这条 source_id。只描述群友自己的喜恶，不把提及频率、第三人话语、玩笑或引用当自述。
-同一个对象和条件的变更应使用相同 topic 和 condition，解释新旧证据冲突；不能为了重复提案随意换名称。"""
+同一个对象和条件的变更应使用相同 topic 和 condition，解释新旧证据冲突；不能为了重复提案随意换名称。
+精简输出：避免冗长推演或复述聊天原文，直接输出紧凑单行 JSON。无明确新增证据时立即输出 {"proposals":[]}；每条 reason 简明扼要（不超过 40 字）。"""
 REVIEW += """\nexpression_example 是程序提取的真人原话对，adjacent 仅说明相邻，不保证在回应对方；审查真实语境、归属、隐私和角色兼容性。
 typing_habit 的 observed_typing 是可复算统计，检查样本是否有代表性，不把数字当成固定性格。
 preference 检查 quote 是否为该成员本人认真表达的自述，condition 是否准确；特别拒绝他人引语、讽刺、玩笑和假设句。"""
@@ -95,13 +96,18 @@ BATCH_REVIEW_RULE = (
     '{"verdicts":[{"proposal_id":"实际 proposal.id","verdict":"approve|reject|defer","reason":"审查理由","risks":["风险或待观察项"]}]}。'
     "若输入为单条 proposal，仍输出单个 verdict JSON 对象。"
 )
-UNIFIED_REVIEW = REVIEW + REVIEW_SCENES + REVIEW_STYLE + REVIEW_OUTPUT + BATCH_REVIEW_RULE
+REVIEW_CONCISE_RULE = (
+    "\n精简输出：避免冗长内部推演或复述提案与证据原文，直接输出紧凑单行 JSON。"
+    "每条 reason 仅一句话（不超过 35 字），直接给出判定依据且不复述提案；"
+    "无明确风险时 risks 必须为 []，否则最多 2 条简短项（每条不超过 15 字）。"
+)
+UNIFIED_REVIEW = REVIEW + REVIEW_SCENES + REVIEW_STYLE + REVIEW_OUTPUT + BATCH_REVIEW_RULE + REVIEW_CONCISE_RULE
 
 GROUP_ANALYZE_CATEGORIES = frozenset({"jargon", "participation", "decision_guidance"})
 DEDICATED_ANALYZE_CATEGORIES = frozenset(
     {"scene_pattern", "scene_adjustment", "expression_style", "expression_adjustment"}
 )
-REVIEW_BATCH_MAX = 8
+REVIEW_BATCH_MAX = 4
 
 
 class _FallbackToSingle(Exception):

@@ -16,6 +16,7 @@ ensure_current(
 )
 
 import asyncio
+import inspect
 import json
 from contextlib import nullcontext
 
@@ -43,6 +44,42 @@ from .core.store import Store
 from .series_panels import get_series_defaults, inherit_provider, inherit_umos
 
 PLUGIN = "astrbot_plugin_dynamics_learning"
+MIN_SAFE_MODEL_MAX_TOKENS = 1536
+REASONING_EFFORT_OPTIONS = frozenset({"none", "minimal", "low", "medium", "high"})
+
+
+def _text_chat_extra_kwargs(provider, config):
+    """Build optional max_tokens / reasoning_effort kwargs accepted by provider.text_chat."""
+    if not isinstance(config, dict) and not hasattr(config, "get"):
+        return {}
+    candidates = {}
+    raw_max = config.get("model_max_tokens", 0)
+    if not isinstance(raw_max, bool):
+        try:
+            parsed_max = int(raw_max or 0)
+        except (TypeError, ValueError):
+            parsed_max = 0
+        if parsed_max > 0:
+            candidates["max_tokens"] = max(MIN_SAFE_MODEL_MAX_TOKENS, parsed_max)
+    raw_effort = str(config.get("model_reasoning_effort", "") or "").strip().lower()
+    if raw_effort in REASONING_EFFORT_OPTIONS:
+        candidates["reasoning_effort"] = raw_effort
+    if not candidates:
+        return {}
+    text_chat = getattr(provider, "text_chat", None)
+    if not callable(text_chat):
+        return {}
+    try:
+        params = inspect.signature(text_chat).parameters
+    except (TypeError, ValueError):
+        return {}
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    allowed_kinds = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    return {
+        key: val
+        for key, val in candidates.items()
+        if has_varkw or (key in params and params[key].kind in allowed_kinds)
+    }
 
 
 class DynamicsLearning(Star):
@@ -616,11 +653,14 @@ class DynamicsLearning(Star):
             if callable(attributed_call)
             else nullcontext()
         )
+        extra_kwargs = _text_chat_extra_kwargs(provider, self.config)
         async with asyncio.timeout(timeout):
             with attribution:
                 if review_dispatch:
                     self.engine.store.automatic_reviews.record_dispatch(review_dispatch)
-                response = await provider.text_chat(prompt=payload, system_prompt=instruction, contexts=[])
+                response = await provider.text_chat(
+                    prompt=payload, system_prompt=instruction, contexts=[], **extra_kwargs
+                )
         if (
             self.closed
             or self.context.get_provider_by_id(provider_id) is not provider

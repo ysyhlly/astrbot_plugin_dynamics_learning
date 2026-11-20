@@ -12,12 +12,14 @@ from astrbot_plugin_dynamics_learning.core.contract import candidate, encode, ev
 from astrbot_plugin_dynamics_learning.core.engine import (
     ANALYZE,
     REVIEW,
+    REVIEW_BATCH_MAX,
+    REVIEW_CONCISE_RULE,
     UNIFIED_REVIEW,
     Engine,
     parse_batch_review_verdicts,
 )
 from astrbot_plugin_dynamics_learning.core.expressions import REVIEW_STYLE
-from astrbot_plugin_dynamics_learning.core.model_projection import format_system_prompt
+from astrbot_plugin_dynamics_learning.core.model_projection import REVIEW_BATCH_PAYLOAD_BUDGET, format_system_prompt
 from astrbot_plugin_dynamics_learning.core.scenes import REVIEW_SCENES
 from astrbot_plugin_dynamics_learning.core.store import Store
 from test_expression_style import raw_style, samples
@@ -1715,5 +1717,175 @@ def test_analysis_max_rounds_per_cycle_default_two_and_configurable(store):
         assert await _run_with_config({}) == 2
         assert await _run_with_config({"analysis_max_rounds_per_cycle": 1}) == 1
         assert await _run_with_config({"analysis_max_rounds_per_cycle": 3}) == 3
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Output-token & thinking-token reduction (concise static prompts,
+# max_batch_size=4, REVIEW_BATCH_PAYLOAD_BUDGET=28_000, optional kwargs).
+# ---------------------------------------------------------------------------
+
+
+def test_phase3_concise_prompt_constraints_remain_static_and_preserve_prefix_cache():
+    assert REVIEW_CONCISE_RULE in UNIFIED_REVIEW
+    assert "35" in UNIFIED_REVIEW and "15" in UNIFIED_REVIEW and "[]" in UNIFIED_REVIEW
+    assert "紧凑单行 JSON" in UNIFIED_REVIEW
+    assert "40" in ANALYZE and '{"proposals":[]}' in ANALYZE and "紧凑单行 JSON" in ANALYZE
+
+    # Strictly static prompts preserve prefix caching across calls
+    char_ctx = {"persona_summary": "静态角色摘要", "scope": SCOPE, "persona": PERSONA, "baseline_threshold": 55.0}
+    assert format_system_prompt(UNIFIED_REVIEW, char_ctx) == format_system_prompt(UNIFIED_REVIEW, char_ctx)
+    assert format_system_prompt(ANALYZE, char_ctx) == format_system_prompt(ANALYZE, char_ctx)
+
+
+def test_phase3_review_batch_size_cap_4_and_payload_budget_28k(store):
+    assert REVIEW_BATCH_MAX == 4
+    assert REVIEW_BATCH_PAYLOAD_BUDGET == 28_000
+
+    async def run():
+        # 1) 6 pending proposals must split into batches of [4, 2] (never > 4)
+        props = [make(store, f"cap-{i}", member=f"m{i}", approved=False, category="relationship") for i in range(6)]
+        chunk_sizes = []
+
+        async def model(role, instruction, data):
+            if "proposals" in data:
+                chunk_sizes.append(len(data["proposals"]))
+                return {
+                    "verdicts": [
+                        {"proposal_id": item["id"], "verdict": "approve", "reason": "依据充分", "risks": []}
+                        for item in data["proposals"]
+                    ]
+                }
+            chunk_sizes.append(1)
+            return {"verdict": "approve", "reason": "依据充分", "risks": []}
+
+        engine = Engine(store, {"sessions": [SCOPE], "review_provider": "rp"}, model)
+        engine.current_personas[SCOPE] = PERSONA
+        await engine.review_batch([p["id"] for p in props])
+        assert chunk_sizes == [4, 2]
+        assert all(store.get(p["id"])["state"] == "reviewed" for p in props)
+
+        # 2) Large evidence proposals exceeding 28_000 char budget split below 28_000 even with <= 4 proposals
+        heavy_props = []
+        for idx in range(3):
+            # 3 events x ~3,520 chars each -> ~11K chars per proposal; 2 fit <=28K, 3 exceed 28K
+            evs = [
+                _make_event(
+                    member=f"heavy{idx}",
+                    message_id=f"heavy-msg-{idx}-{j}",
+                    turn_id=f"0:heavy-{idx}-{j}",
+                    text=f"H{idx}-{j}-" + ("超长真实群聊内容" * 440),
+                )
+                for j in range(3)
+            ]
+            p = store.propose(
+                candidate(
+                    {
+                        "category": "jargon",
+                        "key": f"长证据梗{idx}",
+                        "value": f"含义{idx}",
+                        "member": "",
+                        "reason": "多次出现",
+                        "evidence_ids": [ev["id"] for ev in evs],
+                        "days": 30,
+                    },
+                    evs,
+                    None,
+                ),
+                "llm_then_human",
+                "llm:analysis",
+            )
+            heavy_props.append(p)
+
+        chunks = engine._pack_review_chunks(SCOPE, PERSONA, heavy_props)
+        assert [len(ch) for ch in chunks] == [2, 1]
+        for ch in chunks:
+            assert len(ch) <= REVIEW_BATCH_MAX
+            if len(ch) > 1:
+                assert len(encode(engine._build_batch_review_payload(SCOPE, PERSONA, ch))) <= REVIEW_BATCH_PAYLOAD_BUDGET
+
+    asyncio.run(run())
+
+
+def test_phase3_model_optional_max_tokens_and_reasoning_effort_passthrough():
+    from astrbot_plugin_dynamics_learning.main import DynamicsLearning, MIN_SAFE_MODEL_MAX_TOKENS
+
+    schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert schema["model_max_tokens"]["default"] == 0
+    assert schema["model_reasoning_effort"]["default"] == ""
+
+    async def run():
+        async def _call_with(provider, config):
+            plugin = DynamicsLearning.__new__(DynamicsLearning)
+            plugin.closed = False
+            plugin.config = {"review_provider": "rp", **config}
+            plugin.context = SimpleNamespace(get_provider_by_id=lambda pid: provider if pid == "rp" else None)
+            plugin.engine = None
+            return await plugin._model("review_provider", UNIFIED_REVIEW, {"proposal": {"id": "p1"}})
+
+        # 1) Provider accepting **kwargs: default config passes NO extra kwargs
+        kw_calls = []
+
+        class KwargsProvider:
+            def meta(self):
+                return SimpleNamespace(model="deepseek-flash")
+
+            async def text_chat(self, prompt=None, system_prompt=None, contexts=None, **kwargs):
+                kw_calls.append(kwargs)
+                return SimpleNamespace(completion_text='{"verdict":"approve","reason":"ok","risks":[]}')
+
+        await _call_with(KwargsProvider(), {})
+        assert kw_calls[-1] == {}
+
+        # Configured values passed through to **kwargs provider
+        await _call_with(KwargsProvider(), {"model_max_tokens": 2048, "model_reasoning_effort": "minimal"})
+        assert kw_calls[-1] == {"max_tokens": 2048, "reasoning_effort": "minimal"}
+
+        # 2) Explicit signature provider: max_tokens below 1536 clamped safely to >= 1536
+        explicit_calls = []
+
+        class ExplicitProvider:
+            def meta(self):
+                return SimpleNamespace(model="deepseek-flash")
+
+            async def text_chat(
+                self, prompt=None, system_prompt=None, contexts=None, max_tokens=None, reasoning_effort=None
+            ):
+                explicit_calls.append((max_tokens, reasoning_effort))
+                return SimpleNamespace(completion_text='{"verdict":"approve","reason":"ok","risks":[]}')
+
+        await _call_with(ExplicitProvider(), {"model_max_tokens": 512, "model_reasoning_effort": "low"})
+        assert explicit_calls[-1] == (MIN_SAFE_MODEL_MAX_TOKENS, "low")
+
+        # 3) Strict provider accepting neither kwarg: safe no-op without TypeError
+        strict_calls = []
+
+        class StrictProvider:
+            def meta(self):
+                return SimpleNamespace(model="strict-model")
+
+            async def text_chat(self, prompt=None, system_prompt=None, contexts=None):
+                strict_calls.append((prompt, system_prompt))
+                return SimpleNamespace(completion_text='{"verdict":"approve","reason":"ok","risks":[]}')
+
+        res = await _call_with(StrictProvider(), {"model_max_tokens": 2048, "model_reasoning_effort": "low"})
+        assert res["verdict"] == "approve"
+        assert len(strict_calls) == 1
+
+        # 4) Provider accepting ONLY max_tokens: omits reasoning_effort cleanly
+        partial_calls = []
+
+        class MaxOnlyProvider:
+            def meta(self):
+                return SimpleNamespace(model="max-only")
+
+            async def text_chat(self, prompt=None, system_prompt=None, contexts=None, max_tokens=None):
+                partial_calls.append(max_tokens)
+                return SimpleNamespace(completion_text='{"verdict":"approve","reason":"ok","risks":[]}')
+
+        await _call_with(MaxOnlyProvider(), {"model_max_tokens": 2048, "model_reasoning_effort": "low"})
+        assert partial_calls == [2048]
 
     asyncio.run(run())

@@ -69,6 +69,26 @@
     "type": "int",
     "default": 60
   },
+  "model_max_tokens": {
+    "description": "可选输出 Token 上限",
+    "type": "int",
+    "default": 0,
+    "hint": "0 表示沿用模型默认配置；非零时最低按 1536 保护，避免截断 JSON，仅在提供方支持该参数时透传。"
+  },
+  "model_reasoning_effort": {
+    "description": "可选思考强度透传",
+    "type": "string",
+    "default": "",
+    "options": [
+      "",
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high"
+    ],
+    "hint": "留空表示沿用模型默认配置；仅在提供方支持 reasoning_effort 参数时透传。"
+  },
   "style_review": {
     "description": "群友表达方式审查方式",
     "type": "string",
