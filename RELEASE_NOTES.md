@@ -1,4 +1,10 @@
-# astrbot_plugin_dynamics_learning v2.0.0-rc.2
+# astrbot_plugin_dynamics_learning v2.0.0-rc.4
+
+## v2.0.0-rc.4 — 2026-11-20
+
+- 优化分析与审查链路的前缀缓存与批量评审成本（DL-1..DL-3），并保留生产环境成本优化改进。
+- 为 ANALYZE 与 REVIEW 引入精简的模型载荷投影，将统一的 `character_context` 上提至 `system_prompt`。
+- 合并自动审查请求、限制默认分析轮数与单批审查上限（4 条 / 28KB），收紧输出篇幅并支持可选模型 Token/推理参数。
 
 ## v2.0.0-rc.3
 

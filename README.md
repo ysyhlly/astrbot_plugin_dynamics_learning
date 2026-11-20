@@ -1,6 +1,6 @@
 # v0.14.0-beta.2 本群表达习惯候选
 
-> 发布候选：`v2.0.0-rc.3`。升级说明与验证边界见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
+> 发布候选：`v2.0.0-rc.4`。升级说明与验证边界见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
 
 在场景学习之外，学习有证据的短句、碎句、标点、语气词与口吻。成员均衡、独立审查、普通闲聊应用，保留当前成员偏好和自身人设。新开关默认关闭，本轮未部署。详见 [表达习惯说明](docs/expression-style-beta2.md)。
 

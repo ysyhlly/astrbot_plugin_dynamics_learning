@@ -1,7 +1,7 @@
 name: astrbot_plugin_dynamics_learning
 display_name: 群间学习 · Dynamics Learning
 desc: 为 Chat Dynamics 学习群友表达、打字习惯、喜恶、黑话与社交状态，保持自身性格固定，依据回合反馈提出调整，经 LLM 或人工审查后应用，并支持版本回滚。
-version: v2.0.0-rc.3
+version: v2.0.0-rc.4
 author: ysyhlly
 astrbot_version: ">=4.29.4,<5"
 tags:

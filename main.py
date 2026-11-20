@@ -8,7 +8,7 @@ ensure_current(
     __package__,
     __name__,
     __file__,
-    version="2.0.0-rc.3+cost.1",
+    version="2.0.0-rc.4+cost.1",
     checks=[
         ("core.engine", "Engine", "_review_contract_v1"),
         ("core.engine", "Engine", "_automatic_review_contract_v1"),
