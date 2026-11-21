@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections import defaultdict
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -26,6 +27,7 @@ from .contract import (
 )
 from .expressions import REVIEW_STYLE
 from .model_projection import (
+    ANALYZE_CURRENT_BUDGET,
     ANALYZE_PAYLOAD_BUDGET,
     ANALYZE_SINGLE_EVENT_MAX,
     REVIEW_BATCH_PAYLOAD_BUDGET,
@@ -36,6 +38,7 @@ from .model_projection import (
     format_system_prompt,
     project_current_entry_for_model,
     project_event_for_model,
+    utf8_len,
 )
 from .review_batches import ReviewUnavailable
 from .review_evidence import DEFER_FINGERPRINT, ReviewContext, review_context, review_is_sleeping
@@ -108,6 +111,126 @@ DEDICATED_ANALYZE_CATEGORIES = frozenset(
     {"scene_pattern", "scene_adjustment", "expression_style", "expression_adjustment"}
 )
 REVIEW_BATCH_MAX = 4
+
+_PLACEHOLDER_RE = re.compile(
+    r"\[(?:图片|表情|动画表情|语音|视频|文件|转发聊天记录|合并转发|分享|红包|定位|At:[^\]]*|CQ:[^\]]*)\]|@\S+|https?://\S+",
+    re.IGNORECASE,
+)
+_MEANINGFUL_RE = re.compile(r"[^\w\u4e00-\u9fff]+")
+_REPEAT_FILLER_RE = re.compile(r"^(?:[哈呵嘻嘿嗯哦啊噢唔哇呀诶欸额]+|[h6w]+|23+)$", re.IGNORECASE)
+_LOW_SIGNAL_FILLERS = frozenset(
+    {
+        "嗯",
+        "嗯嗯",
+        "哦",
+        "哦哦",
+        "啊",
+        "啊啊",
+        "好",
+        "好的",
+        "好吧",
+        "行",
+        "行的",
+        "可以",
+        "收到",
+        "明白",
+        "哈哈",
+        "哈哈哈",
+        "哈哈哈哈",
+        "笑死",
+        "草",
+        "确实",
+        "是吧",
+        "对",
+        "对对",
+        "ok",
+        "okay",
+        "lol",
+        "lmao",
+        "xd",
+        "hh",
+        "hhh",
+        "hhhh",
+        "666",
+        "233",
+        "2333",
+        "1",
+        "2",
+    }
+)
+_HIGH_SIGNAL_CUES = (
+    "喜欢",
+    "讨厌",
+    "偏好",
+    "习惯",
+    "剧透",
+    "简短",
+    "太长",
+    "太短",
+    "啰嗦",
+    "黑话",
+    "不要",
+    "别",
+    "谢谢",
+    "感谢",
+    "prefer",
+    "dislike",
+    "hate",
+    "thanks",
+)
+
+
+def _meaningful_text(raw: str) -> str:
+    cleaned = _PLACEHOLDER_RE.sub("", str(raw or ""))
+    return _MEANINGFUL_RE.sub("", cleaned).strip()
+
+
+def has_substantive_analysis_signal(events, supplied=()) -> bool:
+    """Conservative low-signal filter for ANALYZE batches.
+
+    Returns False ONLY when the entire batch is trivial 1-char/emoji/placeholder/filler
+    noise with zero bot replies/outcomes, zero explicit feedback/preference cues, and
+    fewer than 2 non-trivial user messages (>= 4 meaningful chars).
+    """
+    non_trivial_msgs = 0
+    seen_ids = set()
+    for ev in (*events, *supplied):
+        if not isinstance(ev, dict):
+            continue
+        ev_id = ev.get("id")
+        if ev_id is not None:
+            if ev_id in seen_ids:
+                continue
+            seen_ids.add(ev_id)
+        if ev.get("kind") == "operator_correction" or ev.get("mandatory") is True:
+            return True
+        reply = ev.get("reply")
+        if isinstance(reply, dict) and (reply.get("delivered") or str(reply.get("text") or "").strip()):
+            return True
+        outcome = ev.get("outcome")
+        if isinstance(outcome, dict) and (outcome.get("delivered") or outcome.get("final_outcome") == "sent"):
+            return True
+        decision = ev.get("decision")
+        if isinstance(decision, dict) and decision.get("action") == "reply":
+            return True
+        ctx = ev.get("context")
+        if isinstance(ctx, dict) and ctx.get("scene_feedback"):
+            return True
+        meaningful = _meaningful_text(ev.get("text", ""))
+        if not meaningful:
+            continue
+        lowered = meaningful.lower()
+        if lowered in _LOW_SIGNAL_FILLERS or _REPEAT_FILLER_RE.match(lowered):
+            continue
+        if any(cue in lowered for cue in _HIGH_SIGNAL_CUES):
+            return True
+        if len(meaningful) >= 8:
+            return True
+        if len(meaningful) >= 4:
+            non_trivial_msgs += 1
+            if non_trivial_msgs >= 2:
+                return True
+    return False
 
 
 class _FallbackToSingle(Exception):
@@ -765,15 +888,13 @@ class Engine:
                 native = await asyncio.to_thread(
                     self.store.profiles.sources_for_events, scope, persona, batch["events"]
                 )
-                base_payload_len = len(
-                    encode(
-                        build_analyze_payload(
-                            scope,
-                            persona,
-                            current=[],
-                            events=[],
-                            member_sources=[],
-                        )
+                base_payload_bytes = utf8_len(
+                    build_analyze_payload(
+                        scope,
+                        persona,
+                        current=[],
+                        events=[],
+                        member_sources=[],
                     )
                 )
                 selected = []
@@ -781,13 +902,13 @@ class Engine:
                 supplied = {}
                 projected_sources = {}
                 frontiers = []
-                events_len = 0
-                sources_len = 0
+                events_bytes = 0
+                sources_bytes = 0
                 for event, frontier in zip(batch["events"], batch["frontiers"]):
                     ids = event.get("context", {}).get("message_ids") or [event["message_id"]]
                     proj_ev = project_event_for_model(event, include_scope=True)
-                    ev_len = len(encode(proj_ev))
-                    delta_events = ev_len + (1 if selected else 0)
+                    ev_bytes = utf8_len(proj_ev)
+                    delta_events = ev_bytes + (1 if selected else 0)
                     new_sources = {}
                     new_proj_sources = {}
                     delta_sources = 0
@@ -798,29 +919,62 @@ class Engine:
                             proj_src = project_event_for_model(src, include_scope=False)
                             new_sources[key_mid] = src
                             new_proj_sources[key_mid] = proj_src
-                            delta_sources += len(encode(proj_src)) + (1 if (supplied or len(new_sources) > 1) else 0)
-                    next_total = base_payload_len + events_len + delta_events + sources_len + delta_sources
+                            delta_sources += utf8_len(proj_src) + (1 if (supplied or len(new_sources) > 1) else 0)
+                    next_total = base_payload_bytes + events_bytes + delta_events + sources_bytes + delta_sources
                     budget = ANALYZE_SINGLE_EVENT_MAX if not selected else ANALYZE_PAYLOAD_BUDGET
                     if next_total > budget:
                         break
                     selected.append(event)
                     projected_events.append(proj_ev)
-                    events_len += delta_events
+                    events_bytes += delta_events
                     supplied.update(new_sources)
                     projected_sources.update(new_proj_sources)
-                    sources_len += delta_sources
+                    sources_bytes += delta_sources
                     frontiers.append(frontier)
                 if not selected:
                     raise ValueError("evidence exceeds model input budget")
-                batch.update(events=selected, frontiers=frontiers)
-                supplied = list(supplied.values())
-                projected_source_list = list(projected_sources.values())
-                char_context = await asyncio.to_thread(self.character_context_for, scope, persona, selected)
-                analyze_instruction = format_system_prompt(ANALYZE, char_context)
-                token = self.scope_token(scope)
-                persona_at_start = self.current_personas.get(scope)
-                versions = self.entry_versions(scope, persona)
-                provider_id = self.provider_for("analysis_provider")
+
+                def _assemble_payload(sel_events, sel_proj_events):
+                    sel_supplied = {}
+                    sel_proj_sources = {}
+                    for ev in sel_events:
+                        for mid in ev.get("context", {}).get("message_ids") or [ev["message_id"]]:
+                            k = str(mid)
+                            if k in native and k not in sel_supplied:
+                                sel_supplied[k] = native[k]
+                                sel_proj_sources[k] = project_event_for_model(native[k], include_scope=False)
+                    sup_list = list(sel_supplied.values())
+                    proj_src_list = list(sel_proj_sources.values())
+                    members = {str(e.get("member") or "") for e in (*sel_events, *sup_list) if e.get("member")}
+                    relevant = [
+                        e
+                        for e in active
+                        if e.get("category") not in DEDICATED_ANALYZE_CATEGORIES
+                        and (
+                            (e.get("member") or "") in members
+                            or not (e.get("member") or "")
+                            or e.get("category") in GROUP_ANALYZE_CATEGORIES
+                        )
+                    ]
+                    relevant.sort(key=lambda e: (e.get("created_at", 0), e["id"]))
+                    cur = []
+                    cur_bytes = 2
+                    for entry in relevant:
+                        proj_entry = project_current_entry_for_model(entry)
+                        next_bytes = cur_bytes + utf8_len(proj_entry) + (1 if cur else 0)
+                        if next_bytes > ANALYZE_CURRENT_BUDGET:
+                            break
+                        cur.append(proj_entry)
+                        cur_bytes = next_bytes
+                    payload = build_analyze_payload(
+                        scope,
+                        persona,
+                        current=cur,
+                        events=sel_proj_events,
+                        member_sources=proj_src_list,
+                    )
+                    return payload, sup_list
+
                 now = time.time()
                 active = [
                     e
@@ -829,50 +983,36 @@ class Engine:
                     and (e["category"] == "affection" or e["expires"] > now)
                     and policy_allowed(e)
                 ]
-                batch_members = {
-                    str(e.get("member") or "")
-                    for e in (*selected, *supplied)
-                    if e.get("member")
-                }
-                relevant_active = [
-                    e
-                    for e in active
-                    if e.get("category") not in DEDICATED_ANALYZE_CATEGORIES
-                    and (
-                        (e.get("member") or "") in batch_members
-                        or not (e.get("member") or "")
-                        or e.get("category") in GROUP_ANALYZE_CATEGORIES
-                    )
-                ]
-                relevant_active.sort(key=lambda e: (e.get("created_at", 0), e["id"]))
-                current = []
-                current_len = 2
-                for entry in relevant_active:
-                    proj_entry = project_current_entry_for_model(entry)
-                    next_len = current_len + len(encode(proj_entry)) + (1 if current else 0)
-                    if next_len > 16_000:
-                        break
-                    current.append(proj_entry)
-                    current_len = next_len
-                analyze_payload = build_analyze_payload(
-                    scope,
-                    persona,
-                    current=current,
-                    events=projected_events,
-                    member_sources=projected_source_list,
-                )
+                analyze_payload, supplied = _assemble_payload(selected, projected_events)
+                while len(selected) > 1 and utf8_len(analyze_payload) > ANALYZE_PAYLOAD_BUDGET:
+                    selected.pop()
+                    projected_events.pop()
+                    frontiers.pop()
+                    analyze_payload, supplied = _assemble_payload(selected, projected_events)
+
+                batch.update(events=selected, frontiers=frontiers)
+                char_context = await asyncio.to_thread(self.character_context_for, scope, persona, selected)
+                analyze_instruction = format_system_prompt(ANALYZE, char_context)
+                token = self.scope_token(scope)
+                persona_at_start = self.current_personas.get(scope)
+                versions = self.entry_versions(scope, persona)
+                provider_id = self.provider_for("analysis_provider")
+                should_invoke_llm = has_substantive_analysis_signal(selected, supplied)
             # Model work never owns the ingress/database lock.
-            output = await self.invoke_model(
-                "analysis_provider",
-                analyze_instruction,
-                analyze_payload,
-                lambda: (
-                    self.allowed(scope)
-                    and token == self.scope_token(scope)
-                    and self.provider_for("analysis_provider") == provider_id
-                    and not self.store.source_withdrawals.has_withdrawn(scope, [*selected, *supplied])
-                ),
-            )
+            if should_invoke_llm:
+                output = await self.invoke_model(
+                    "analysis_provider",
+                    analyze_instruction,
+                    analyze_payload,
+                    lambda: (
+                        self.allowed(scope)
+                        and token == self.scope_token(scope)
+                        and self.provider_for("analysis_provider") == provider_id
+                        and not self.store.source_withdrawals.has_withdrawn(scope, [*selected, *supplied])
+                    ),
+                )
+            else:
+                output = {"proposals": []}
             async with self.lock:
                 if (
                     self.closed
@@ -1337,14 +1477,14 @@ class Engine:
         for p in proposals:
             candidate_chunk = current + [p]
             payload = self._build_batch_review_payload(scope, persona, candidate_chunk)
-            if len(candidate_chunk) <= limit and len(encode(payload)) <= max_payload_bytes:
+            if len(candidate_chunk) <= limit and utf8_len(payload) <= max_payload_bytes:
                 current = candidate_chunk
                 continue
             if current:
                 chunks.append(current)
                 current = []
             single_payload = self._build_batch_review_payload(scope, persona, [p])
-            if limit >= 2 and len(encode(single_payload)) <= max_payload_bytes:
+            if limit >= 2 and utf8_len(single_payload) <= max_payload_bytes:
                 current = [p]
             else:
                 chunks.append([p])
@@ -1478,7 +1618,7 @@ class Engine:
                 token = self.scope_token(scope)
                 provider_id = self.provider_for("review_provider")
                 initial_payload = self._build_batch_review_payload(scope, persona, prepared_items)
-                if len(encode(initial_payload)) > max_payload_bytes:
+                if utf8_len(initial_payload) > max_payload_bytes:
                     fallback.extend(i.proposal["id"] for i in prepared_items)
                     return {
                         "committed": committed,
@@ -1504,7 +1644,7 @@ class Engine:
                     sent_items[:] = ready_items
                     raise _FallbackToSingle()
                 payload = self._build_batch_review_payload(scope, persona, ready_items)
-                if len(encode(payload)) > max_payload_bytes:
+                if utf8_len(payload) > max_payload_bytes:
                     sent_items[:] = ready_items
                     raise _FallbackToSingle()
                 sent_items[:] = ready_items

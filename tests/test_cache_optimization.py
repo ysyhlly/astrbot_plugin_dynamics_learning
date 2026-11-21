@@ -19,7 +19,12 @@ from astrbot_plugin_dynamics_learning.core.engine import (
     parse_batch_review_verdicts,
 )
 from astrbot_plugin_dynamics_learning.core.expressions import REVIEW_STYLE
-from astrbot_plugin_dynamics_learning.core.model_projection import REVIEW_BATCH_PAYLOAD_BUDGET, format_system_prompt
+from astrbot_plugin_dynamics_learning.core.model_projection import (
+    ANALYZE_PAYLOAD_BUDGET,
+    REVIEW_BATCH_PAYLOAD_BUDGET,
+    format_system_prompt,
+    utf8_len,
+)
 from astrbot_plugin_dynamics_learning.core.scenes import REVIEW_SCENES
 from astrbot_plugin_dynamics_learning.core.store import Store
 from test_expression_style import raw_style, samples
@@ -304,7 +309,7 @@ def test_analyze_current_stable_ascending_order_and_current_first_compact_json(s
         ]
         seeded.append(_apply_entry(store, category="jargon", key="摸鱼", value="划水休息", member=""))
 
-        ev1 = _make_event(member="alice", message_id="b1", turn_id="0:b1", text="第一批消息")
+        ev1 = _make_event(member="alice", message_id="b1", turn_id="0:b1", text="第一批群聊讨论消息内容")
         store.ingest(ev1)
 
         payloads = []
@@ -341,7 +346,7 @@ def test_analyze_current_stable_ascending_order_and_current_first_compact_json(s
         with store.transaction():
             store.db.execute("UPDATE entries SET body=? WHERE id=?", (encode(updated_entry), last_id))
 
-        ev2 = _make_event(member="alice", message_id="b2", turn_id="0:b2", text="第二批消息")
+        ev2 = _make_event(member="alice", message_id="b2", turn_id="0:b2", text="第二批群聊讨论消息内容")
         store.ingest(ev2)
         await engine.refresh()
         await engine.analyze(SCOPE, PERSONA)
@@ -1248,10 +1253,9 @@ def test_analyze_lean_projection_hoists_persona_summary_strips_policy_context_an
         serialized = encode(analyze_data)
         projected_bytes = len(serialized.encode("utf-8"))
 
-        # Static character_context hoisted into system_prompt (after ANALYZE), omitted from user JSON
+        # Static persona-level character_context hoisted into system_prompt (omitting scope), omitted from user JSON
         expected_char_ctx = {
             "persona_summary": "人设摘要" * 450,
-            "scope": SCOPE,
             "persona": PERSONA,
             "baseline_threshold": 55.0,
         }
@@ -1349,7 +1353,6 @@ def test_review_single_and_batch_lean_projection_reduces_payload_and_hoists_char
             UNIFIED_REVIEW,
             {
                 "persona_summary": "人设摘要" * 450,
-                "scope": SCOPE,
                 "persona": PERSONA,
                 "baseline_threshold": 55.0,
             },
@@ -1413,9 +1416,9 @@ def test_analyze_budget_splits_large_text_events_without_dropping_frontiers(stor
 
         engine = Engine(store, {"sessions": [SCOPE], "analysis_provider": "ap"}, model)
         engine.current_personas[SCOPE] = PERSONA
-        await engine.analyze(SCOPE, PERSONA)
-        await engine.analyze(SCOPE, PERSONA)
-        assert len(batch_turn_counts) == 2
+        while store.batches(1):
+            await engine.analyze(SCOPE, PERSONA)
+        assert len(batch_turn_counts) >= 2
         assert all(c < 14 for c in batch_turn_counts)
         assert seen_turns == [f"big-turn-{i}" for i in range(14)]
         assert not store.batches(1)
@@ -1557,7 +1560,6 @@ def test_events_and_profile_messages_reviews_share_identical_system_prompt_with_
 
         expected_char_ctx = {
             "persona_summary": "稳定角色人设" * 300,
-            "scope": SCOPE,
             "persona": PERSONA,
             "baseline_threshold": 55.0,
         }
@@ -1739,9 +1741,9 @@ def test_phase3_concise_prompt_constraints_remain_static_and_preserve_prefix_cac
     assert format_system_prompt(ANALYZE, char_ctx) == format_system_prompt(ANALYZE, char_ctx)
 
 
-def test_phase3_review_batch_size_cap_4_and_payload_budget_28k(store):
+def test_phase3_review_batch_size_cap_4_and_payload_budget_24k(store):
     assert REVIEW_BATCH_MAX == 4
-    assert REVIEW_BATCH_PAYLOAD_BUDGET == 28_000
+    assert REVIEW_BATCH_PAYLOAD_BUDGET == 24_000
 
     async def run():
         # 1) 6 pending proposals must split into batches of [4, 2] (never > 4)
@@ -1766,18 +1768,18 @@ def test_phase3_review_batch_size_cap_4_and_payload_budget_28k(store):
         assert chunk_sizes == [4, 2]
         assert all(store.get(p["id"])["state"] == "reviewed" for p in props)
 
-        # 2) Large evidence proposals exceeding 28_000 char budget split below 28_000 even with <= 4 proposals
+        # 2) Large Chinese evidence proposals exceeding 24_000 UTF-8 byte budget split below 24_000 even with <= 4 proposals
         heavy_props = []
         for idx in range(3):
-            # 3 events x ~3,520 chars each -> ~11K chars per proposal; 2 fit <=28K, 3 exceed 28K
+            # 2 events x ~1,600 Chinese chars (~4,800 UTF-8 bytes each) -> ~10KB UTF-8 per proposal; 2 fit <=24KB, 3 exceed 24KB
             evs = [
                 _make_event(
                     member=f"heavy{idx}",
                     message_id=f"heavy-msg-{idx}-{j}",
                     turn_id=f"0:heavy-{idx}-{j}",
-                    text=f"H{idx}-{j}-" + ("超长真实群聊内容" * 440),
+                    text=f"H{idx}-{j}-" + ("超长真实群聊内容" * 200),
                 )
-                for j in range(3)
+                for j in range(2)
             ]
             p = store.propose(
                 candidate(
@@ -1803,7 +1805,7 @@ def test_phase3_review_batch_size_cap_4_and_payload_budget_28k(store):
         for ch in chunks:
             assert len(ch) <= REVIEW_BATCH_MAX
             if len(ch) > 1:
-                assert len(encode(engine._build_batch_review_payload(SCOPE, PERSONA, ch))) <= REVIEW_BATCH_PAYLOAD_BUDGET
+                assert utf8_len(engine._build_batch_review_payload(SCOPE, PERSONA, ch)) <= REVIEW_BATCH_PAYLOAD_BUDGET
 
     asyncio.run(run())
 
@@ -1887,5 +1889,423 @@ def test_phase3_model_optional_max_tokens_and_reasoning_effort_passthrough():
 
         await _call_with(MaxOnlyProvider(), {"model_max_tokens": 2048, "model_reasoning_effort": "low"})
         assert partial_calls == [2048]
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Gemini/Responses implicit-cache static 2-message contexts anchor
+# & character_context wrapping on ANALYZE_SCENES / ANALYZE_STYLE.
+# ---------------------------------------------------------------------------
+
+
+def test_phase4_model_passes_deterministic_static_contexts_anchor():
+    import hashlib
+
+    from astrbot_plugin_dynamics_learning.main import DynamicsLearning
+
+    async def run():
+        async def _call_with(provider, instruction, data):
+            plugin = DynamicsLearning.__new__(DynamicsLearning)
+            plugin.closed = False
+            plugin.config = {"review_provider": "rp"}
+            plugin.context = SimpleNamespace(get_provider_by_id=lambda pid: provider if pid == "rp" else None)
+            plugin.engine = None
+            return await plugin._model("review_provider", instruction, data)
+
+        recorded = []
+
+        class RecordingProvider:
+            def meta(self):
+                return SimpleNamespace(model="gemini-3.8-flash-high")
+
+            async def text_chat(self, prompt=None, system_prompt=None, contexts=None, **kwargs):
+                recorded.append((prompt, system_prompt, contexts))
+                return SimpleNamespace(completion_text='{"verdict":"approve","reason":"ok","risks":[]}')
+
+        provider = RecordingProvider()
+        instr_a = UNIFIED_REVIEW
+        instr_b = ANALYZE
+
+        # Two calls with same instruction and different payloads -> byte-identical 2-message anchor
+        await _call_with(provider, instr_a, {"proposal": {"id": "p-1", "value": "alpha"}})
+        await _call_with(provider, instr_a, {"proposal": {"id": "p-2", "value": "beta"}})
+        expected_sha = hashlib.sha256(instr_a.encode("utf-8")).hexdigest()[:12]
+        expected_contexts = [
+            {"role": "user", "content": f"[cache_anchor task=dynamics_learning prefix={expected_sha}]"},
+            {"role": "assistant", "content": "OK"},
+        ]
+        assert recorded[0][0] != recorded[1][0]
+        assert recorded[0][2] == expected_contexts
+        assert recorded[1][2] == expected_contexts
+
+        # Different instruction -> different deterministic prefix hash
+        await _call_with(provider, instr_b, {"events": []})
+        expected_sha_b = hashlib.sha256(instr_b.encode("utf-8")).hexdigest()[:12]
+        assert expected_sha_b != expected_sha
+        assert recorded[2][2] == [
+            {"role": "user", "content": f"[cache_anchor task=dynamics_learning prefix={expected_sha_b}]"},
+            {"role": "assistant", "content": "OK"},
+        ]
+
+        # Empty instruction -> empty contexts list
+        await _call_with(provider, "", {"events": []})
+        assert recorded[3][2] == []
+
+        # Strict stub provider without `contexts` parameter -> safe no-op without TypeError
+        no_ctx_calls = []
+
+        class NoContextsProvider:
+            def meta(self):
+                return SimpleNamespace(model="stub-no-contexts")
+
+            async def text_chat(self, prompt=None, system_prompt=None):
+                no_ctx_calls.append((prompt, system_prompt))
+                return SimpleNamespace(completion_text='{"verdict":"approve","reason":"ok","risks":[]}')
+
+        res = await _call_with(NoContextsProvider(), instr_a, {"proposal": {"id": "p-3"}})
+        assert res["verdict"] == "approve"
+        assert len(no_ctx_calls) == 1
+
+    asyncio.run(run())
+
+
+def test_phase4_scene_and_expression_learning_include_character_context_in_system_prompt(store):
+    from astrbot_plugin_dynamics_learning.core.expressions import ANALYZE_STYLE
+    from astrbot_plugin_dynamics_learning.core.scenes import ANALYZE_SCENES
+    from test_scene_learning import SCOPE as SCENE_SCOPE
+
+    async def run():
+        persona = "persona"
+        persona_summary = "角色核心设定与语气约束" * 300
+        # Seed SQLite events row with persona_summary for lazy hydration
+        ev = event_record(
+            {
+                "schema_version": 1,
+                "kind": "outcome",
+                "scope": SCENE_SCOPE,
+                "persona": persona,
+                "member": "alice",
+                "turn_id": "0:char-seed",
+                "message_id": "char-seed",
+                "host_version": "host-v4.29.4",
+                "baseline": "b" * 64,
+                "baseline_threshold": 55.0,
+                "text": "种子消息",
+                "mandatory": False,
+                "timestamp": time.time(),
+                "context": {"persona_summary": persona_summary},
+            }
+        )
+        store.ingest(ev)
+
+        # Seed profile_messages for both scene learning (>=3 episodes) and expression learning (>=30 msgs, 3 members, 2 days)
+        for row in [*scene_evidence(), *samples()]:
+            store.db.execute(
+                "INSERT OR REPLACE INTO profile_messages VALUES(?,?,?,?,?,?)",
+                (SCENE_SCOPE, persona, row["message_id"], row["member"], row["timestamp"], encode(row)),
+            )
+        store.db.commit()
+
+        seen = []
+
+        async def model(role, instruction, data):
+            seen.append((role, instruction, data))
+            if "episodes" in data:
+                return {"patterns": []}
+            if "sample" in data:
+                return {"style": None}
+            return {"verdict": "approve", "reason": "ok", "risks": []}
+
+        engine = Engine(
+            store,
+            {
+                "sessions": [SCENE_SCOPE],
+                "analysis_provider": "ap",
+                "review_provider": "rp",
+                "scene_learning_enabled": True,
+                "expression_style_enabled": True,
+            },
+            model,
+        )
+        engine.current_personas[SCENE_SCOPE] = persona
+        # Empty in-memory cache proves lazy SQLite hydration works for scene & expression analyzers too
+        assert engine._character_context_cache == {}
+
+        await engine.scenes.analyze(SCENE_SCOPE, persona)
+        await engine.expressions.analyze(SCENE_SCOPE, persona)
+
+        expected_char_ctx = {
+            "persona_summary": persona_summary,
+            "persona": persona,
+            "baseline_threshold": 55.0,
+        }
+        scene_calls = [ins for r, ins, d in seen if r == "analysis_provider" and "episodes" in d]
+        expr_calls = [ins for r, ins, d in seen if r == "analysis_provider" and "sample" in d]
+        assert len(scene_calls) == 1
+        assert len(expr_calls) == 1
+        assert scene_calls[0] == format_system_prompt(ANALYZE_SCENES, expected_char_ctx)
+        assert expr_calls[0] == format_system_prompt(ANALYZE_STYLE, expected_char_ctx)
+        assert "[character_context]" in scene_calls[0] and persona_summary in scene_calls[0]
+        assert "[character_context]" in expr_calls[0] and persona_summary in expr_calls[0]
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Cross-group persona-unified system_prompt & contexts[0] anchor,
+# UTF-8 byte-bounded ANALYZE (22KB) & REVIEW (24KB) budgets, and conservative
+# low-signal ANALYZE pre-filter.
+# ---------------------------------------------------------------------------
+
+
+def test_phase5_cross_group_same_persona_produces_identical_system_prompt_and_contexts_anchor(store):
+    from astrbot_plugin_dynamics_learning.core.expressions import ANALYZE_STYLE
+    from astrbot_plugin_dynamics_learning.core.scenes import ANALYZE_SCENES
+    from astrbot_plugin_dynamics_learning.main import _cache_anchor_contexts
+
+    async def run():
+        scope_a = "qq:GroupMessage:10001"
+        scope_b = "qq:GroupMessage:20002"
+        shared_persona = "wb_natsuume_anan"
+        persona_summary = "共享角色夏梅安安人设摘要" * 200
+
+        def _ev(scope, idx, text, *, with_summary=True):
+            ctx = {"persona_summary": persona_summary} if with_summary else {}
+            return event_record(
+                {
+                    "schema_version": 1,
+                    "kind": "outcome",
+                    "scope": scope,
+                    "persona": shared_persona,
+                    "member": f"user{idx}",
+                    "turn_id": f"0:{scope}-{idx}",
+                    "message_id": f"m-{scope}-{idx}",
+                    "host_version": "host-v4.29.4",
+                    "baseline": "b" * 64,
+                    "baseline_threshold": 55.0,
+                    "text": text,
+                    "mandatory": False,
+                    "timestamp": time.time() + idx,
+                    "outcome": {"delivered": True, "final_outcome": "sent"},
+                    "context": ctx,
+                }
+            )
+
+        ev_a = _ev(scope_a, 1, "大家晚上八点一起打副本吧", with_summary=True)
+        # scope_b even omits persona_summary on its event -> proves cross-scope persona hydration too!
+        ev_b = _ev(scope_b, 2, "这个新版本的活动机制挺有趣的", with_summary=False)
+        store.ingest(ev_a)
+        store.ingest(ev_b)
+
+        p_a = store.propose(
+            candidate(
+                {
+                    "category": "jargon",
+                    "key": "群A词",
+                    "value": "群A含义",
+                    "member": "",
+                    "reason": "多次出现",
+                    "evidence_ids": [ev_a["id"]],
+                    "days": 30,
+                },
+                [ev_a],
+                None,
+            ),
+            "llm_then_human",
+            "llm:analysis",
+        )
+        p_b = store.propose(
+            candidate(
+                {
+                    "category": "jargon",
+                    "key": "群B词",
+                    "value": "群B含义",
+                    "member": "",
+                    "reason": "多次出现",
+                    "evidence_ids": [ev_b["id"]],
+                    "days": 30,
+                },
+                [ev_b],
+                None,
+            ),
+            "llm_then_human",
+            "llm:analysis",
+        )
+
+        captured = {}
+
+        async def model(role, instruction, data):
+            if role == "analysis_provider":
+                ev_scope = data["events"][0]["scope"]
+                captured[("analyze", ev_scope)] = instruction
+                return {"proposals": []}
+            prop_scope = data["proposal"]["scope"]
+            captured[("review", prop_scope)] = instruction
+            return {"verdict": "approve", "reason": "依据明确", "risks": []}
+
+        engine = Engine(
+            store,
+            {"sessions": [scope_a, scope_b], "analysis_provider": "ap", "review_provider": "rp"},
+            model,
+        )
+        engine.current_personas[scope_a] = shared_persona
+        engine.current_personas[scope_b] = shared_persona
+
+        await engine.analyze(scope_a, shared_persona)
+        await engine.analyze(scope_b, shared_persona)
+        await engine.review(p_a["id"])
+        await engine.review(p_b["id"])
+
+        analyze_a = captured[("analyze", scope_a)]
+        analyze_b = captured[("analyze", scope_b)]
+        review_a = captured[("review", scope_a)]
+        review_b = captured[("review", scope_b)]
+
+        # 1) Cross-group 100% byte-identical system_prompt AND contexts[0] anchor
+        assert analyze_a == analyze_b
+        assert review_a == review_b
+        assert _cache_anchor_contexts(analyze_a) == _cache_anchor_contexts(analyze_b)
+        assert _cache_anchor_contexts(review_a) == _cache_anchor_contexts(review_b)
+        assert scope_a not in analyze_a and scope_b not in analyze_b
+        assert scope_a not in review_a and scope_b not in review_b
+
+        # 2) Leading shared prefix ([character_context] + [personality_policy]) precedes task-specific rules
+        assert analyze_a.startswith("[character_context]\n")
+        assert review_a.startswith("[character_context]\n")
+        shared_prefix_end = analyze_a.index("\n\n" + ANALYZE)
+        assert review_a[:shared_prefix_end] == analyze_a[:shared_prefix_end]
+        char_ctx = engine.character_context_for(scope_a, shared_persona)
+        assert format_system_prompt(ANALYZE_SCENES, char_ctx)[:shared_prefix_end] == analyze_a[:shared_prefix_end]
+        assert format_system_prompt(ANALYZE_STYLE, char_ctx)[:shared_prefix_end] == analyze_a[:shared_prefix_end]
+
+    asyncio.run(run())
+
+
+def test_phase5_utf8_byte_budget_enforced_for_analyze_22k_and_review_24k(store):
+    assert ANALYZE_PAYLOAD_BUDGET == 22_000
+    assert REVIEW_BATCH_PAYLOAD_BUDGET == 24_000
+
+    async def run():
+        # Seed active current entries so `current` + `events` combined must obey <= 22_000 UTF-8 bytes
+        for i in range(6):
+            _apply_entry(
+                store,
+                category="jargon",
+                key=f"常用黑话{i}",
+                value="群聊中经常用来调侃和表达共识的固定词组解释说明" * 12,
+                member="",
+            )
+        # Seed 10 Chinese events (~3,600 UTF-8 bytes each, total ~36KB UTF-8 < 18,000 Python chars!)
+        for i in range(10):
+            ev = _make_event(
+                member="alice",
+                message_id=f"utf8-ev-{i}",
+                turn_id=f"0:utf8-ev-{i}",
+                text=f"U{i:02d}-" + ("中文聊天消息内容测试" * 115),
+            )
+            store.ingest(ev)
+
+        payload_byte_sizes = []
+        batch_event_counts = []
+        seen_turns = []
+
+        async def model(role, instruction, data):
+            byte_size = len(encode(data).encode("utf-8"))
+            payload_byte_sizes.append(byte_size)
+            batch_event_counts.append(len(data["events"]))
+            seen_turns.extend(e["turn_id"] for e in data["events"])
+            return {"proposals": []}
+
+        engine = Engine(store, {"sessions": [SCOPE], "analysis_provider": "ap"}, model)
+        engine.current_personas[SCOPE] = PERSONA
+        await engine.refresh()
+
+        while store.batches(1):
+            await engine.analyze(SCOPE, PERSONA)
+
+        assert len(batch_event_counts) >= 2
+        assert seen_turns == [f"0:utf8-ev-{i}" for i in range(10)]
+        assert not store.batches(1)
+        for count, size in zip(batch_event_counts, payload_byte_sizes):
+            if count > 1:
+                assert size <= ANALYZE_PAYLOAD_BUDGET
+
+    asyncio.run(run())
+
+
+def test_phase5_low_signal_analyze_prefilter_skips_noise_but_keeps_real_conversations(store):
+    from astrbot_plugin_dynamics_learning.core.engine import has_substantive_analysis_signal
+
+    async def run():
+        # 1) Pure noise / filler / placeholder / emoji batch -> 0 LLM calls, frontiers cleanly marked processed
+        noise_texts = ["[图片]", "哈哈哈哈", "嗯", "👍", "[表情]", "ok", "666", "@bot 1"]
+        for i, txt in enumerate(noise_texts):
+            store.ingest(
+                _make_event(
+                    member=f"m{i % 3}",
+                    message_id=f"noise-{i}",
+                    turn_id=f"0:noise-{i}",
+                    text=txt,
+                    kind="observed",
+                )
+            )
+
+        calls = []
+
+        async def model(role, instruction, data):
+            calls.append((role, [e["turn_id"] for e in data["events"]]))
+            return {"proposals": []}
+
+        engine = Engine(store, {"sessions": [SCOPE], "analysis_provider": "ap"}, model)
+        engine.current_personas[SCOPE] = PERSONA
+
+        res_noise = await engine.analyze(SCOPE, PERSONA)
+        assert calls == []
+        assert res_noise["turns"] == len(noise_texts)
+        assert res_noise["proposals"] == 0
+        assert not store.batches(1)
+
+        # 2) Two short non-trivial user messages (>= 4 meaningful chars each) -> MUST invoke LLM
+        store.ingest(_make_event(member="alice", message_id="real-1", turn_id="0:real-1", text="晚上刷副本"))
+        store.ingest(_make_event(member="bob", message_id="real-2", turn_id="0:real-2", text="八点半开组"))
+        await engine.analyze(SCOPE, PERSONA)
+        assert len(calls) == 1
+        assert calls[-1][1] == ["0:real-1", "0:real-2"]
+
+        # 3) Single short self-stated preference cue -> MUST invoke LLM
+        store.ingest(_make_event(member="alice", message_id="pref-1", turn_id="0:pref-1", text="别剧透"))
+        await engine.analyze(SCOPE, PERSONA)
+        assert len(calls) == 2
+        assert calls[-1][1] == ["0:pref-1"]
+
+        # 4) Single short filler WITH delivered bot reply/outcome -> MUST invoke LLM
+        store.ingest(
+            event_record(
+                {
+                    "schema_version": 1,
+                    "kind": "outcome",
+                    "scope": SCOPE,
+                    "persona": PERSONA,
+                    "member": "alice",
+                    "turn_id": "0:reply-1",
+                    "message_id": "reply-1",
+                    "host_version": "host1",
+                    "baseline": "config1",
+                    "baseline_threshold": 70,
+                    "text": "嗯",
+                    "mandatory": False,
+                    "timestamp": time.time(),
+                    "outcome": {"delivered": True, "final_outcome": "sent"},
+                }
+            )
+        )
+        await engine.analyze(SCOPE, PERSONA)
+        assert len(calls) == 3
+        assert calls[-1][1] == ["0:reply-1"]
+
+        # Direct helper sanity check
+        assert has_substantive_analysis_signal([{"kind": "observed", "text": "[动画表情] 哈哈哈"}]) is False
+        assert has_substantive_analysis_signal([{"kind": "observed", "text": "我不喜欢被剧透"}]) is True
 
     asyncio.run(run())

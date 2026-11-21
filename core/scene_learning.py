@@ -6,6 +6,7 @@ import time
 from collections import defaultdict
 
 from .contract import candidate, digest, encode
+from .model_projection import format_system_prompt
 from .scenes import ANALYZE_SCENES, DISAMBIGUATE, SCENE_CATEGORIES, episodes, scene_labels, select_patterns
 
 
@@ -113,7 +114,9 @@ class SceneLearning:
             if len(pairs) >= 3 and fingerprint != await asyncio.to_thread(previous):
                 ids = {identity for pair in pairs for identity in pair['source_ids']}
                 submitted = [row for row in sources if row['id'] in ids]
-                result = await e.invoke_model('analysis_provider', ANALYZE_SCENES, {'scope': scope, 'episodes': pairs},
+                char_ctx = await asyncio.to_thread(e.character_context_for, scope, persona)
+                instruction = format_system_prompt(ANALYZE_SCENES, char_ctx)
+                result = await e.invoke_model('analysis_provider', instruction, {'scope': scope, 'episodes': pairs},
                     lambda: self.enabled(scope, persona) and token == e.scope_token(scope)
                     and not e.store.source_withdrawals.has_withdrawn(scope, submitted))
                 if not isinstance(result, dict) or set(result) != {'patterns'} or not isinstance(result['patterns'], list) or len(result['patterns']) > 2:

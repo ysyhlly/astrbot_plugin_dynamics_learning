@@ -9,7 +9,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from .contract import MODEL_INPUT_LIMIT, MalformedModelResponse, encode, review_result
-from .model_projection import REVIEW_BATCH_PAYLOAD_BUDGET, build_batch_review_payload
+from .model_projection import REVIEW_BATCH_PAYLOAD_BUDGET, build_batch_review_payload, utf8_len
 from .review_batches import ReviewUnavailable
 from .store import Conflict
 
@@ -197,8 +197,10 @@ class AutomaticReviews:
                 entry = candidate[1].proposal["entry_id"]
                 if entry in entries:
                     continue
-                if len(encode(batch_payload([item for _, item in selected] + [candidate[1]]))) > min(
-                    MODEL_INPUT_LIMIT, REVIEW_BATCH_PAYLOAD_BUDGET
+                candidate_payload = batch_payload([item for _, item in selected] + [candidate[1]])
+                if (
+                    len(encode(candidate_payload)) > MODEL_INPUT_LIMIT
+                    or utf8_len(candidate_payload) > REVIEW_BATCH_PAYLOAD_BUDGET
                 ):
                     full = True
                     break

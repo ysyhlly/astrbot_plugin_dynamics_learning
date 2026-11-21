@@ -1,36 +1,513 @@
 <!doctype html>
-<html lang="zh-CN"><head>
-<script src="/api/plugin/page/bridge-sdk.js"></script>
-<script src="series-workspace.js" data-plugin="astrbot_plugin_dynamics_learning" data-view="review"></script><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark"><script src="theme.js?v=0.12.1"></script><title data-series-text="群间学习">群间学习</title><link rel="stylesheet" href="style.css?v=0.13.1"><link rel="stylesheet" href="./series-ui.css?v=round2.1"><script type="module" src="./series-panels.js?v=round2.1"></script></head>
-<body><a class="skip-link" href="#workspace" data-series-text="跳到工作区">跳到工作区</a>
-<div class="app-shell series-workspace"><header class="series-nav">
-      <a class="series-brand" href="#workspace"><span class="series-mark" aria-hidden="true">DL</span><span data-series-text="群间学习">群间学习</span></a>
-      <nav class="side-nav series-tabs" aria-label="内容分类" data-series-aria-label="内容分类"><button type="button" aria-current="page" data-tab="home" class="selected"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span><span data-series-text="运行总览">运行总览</span></button><button data-tab="proposals"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></span><span data-series-text="调整审查">调整审查</span></button><button data-tab="entries"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span><span data-series-text="已学内容">已学内容</span></button><button data-tab="social"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M8.7 7.5 10.8 15.3M15.3 7.5l-2.1 7.8M9 6h6"/></svg></span><span data-series-text="群友关系">群友关系</span></button><button data-tab="profiles"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 20c1.6-3.8 4.4-6 8-6s6.4 2.2 8 6"/></svg></span><span data-series-text="群友学习">群友学习</span></button><button data-tab="preview"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg></span><span data-series-text="回复材料预览">回复材料预览</span></button><button data-tab="library"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2 8l10 5 10-5-10-5Z"/><path d="m2 13 10 5 10-5"/><path d="m2 18 10 5 10-5"/></svg></span><span data-series-text="资料版本中心">资料版本中心</span></button><button data-tab="usage"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 6-6"/></svg></span><span data-series-text="资料使用">资料使用</span></button><button data-tab="history"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span><span data-series-text="历史资料">历史资料</span></button><button data-tab="scopes"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.08a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg></span><span data-series-text="会话与设置">会话与设置</span></button></nav>
-      <div class="series-nav-tools"><button id="theme-toggle" aria-pressed="false"><span id="theme-label" data-series-text="日间模式">日间模式</span><span class="theme-switch" aria-hidden="true"></span></button>
+<html lang="zh-CN">
+<head>
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <script src="series-workspace.js" data-plugin="astrbot_plugin_dynamics_learning" data-view="review"></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <script src="theme.js?v=0.12.1"></script>
+  <title data-series-text="群间学习">群间学习</title>
+  <link rel="stylesheet" href="style.css?v=0.14.0">
+  <link rel="stylesheet" href="./series-ui.css?v=round2.1">
+  <script type="module" src="./series-panels.js?v=round2.1"></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace" data-series-text="跳到工作区">跳到工作区</a>
+  <div class="app-shell series-workspace">
+    <header class="series-nav">
+      <a class="series-brand" href="#workspace">
+        <span class="series-mark" aria-hidden="true">DL</span>
+        <span data-series-text="群间学习">群间学习</span>
+      </a>
+      <nav class="side-nav series-tabs" aria-label="内容分类" data-series-aria-label="内容分类">
+        <button type="button" aria-current="page" data-tab="home" class="selected">
+          <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span>
+          <span data-series-text="运行总览">运行总览</span>
+        </button>
+        <button type="button" data-tab="proposals">
+          <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></span>
+          <span data-series-text="调整审查">调整审查</span>
+          <span id="tab-pending-badge" class="tab-badge" aria-hidden="true" hidden>0</span>
+        </button>
+        <button type="button" data-tab="entries">
+          <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
+          <span data-series-text="已学内容">已学内容</span>
+        </button>
+        <button type="button" data-tab="social">
+          <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M8.7 7.5 10.8 15.3M15.3 7.5l-2.1 7.8M9 6h6"/></svg></span>
+          <span data-series-text="群友关系">群友关系</span>
+        </button>
+        <button type="button" data-tab="profiles">
+          <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 20c1.6-3.8 4.4-6 8-6s6.4 2.2 8 6"/></svg></span>
+          <span data-series-text="群友学习">群友学习</span>
+        </button>
+        <details class="nav-more-menu" id="nav-more-menu">
+          <summary class="nav-more-trigger" aria-haspopup="true">
+            <span data-series-text="更多与运维">更多与运维</span>
+            <span class="nav-more-caret" aria-hidden="true">▾</span>
+          </summary>
+          <div class="nav-more-popover">
+            <button type="button" data-tab="preview">
+              <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg></span>
+              <span data-series-text="回复材料预览">回复材料预览</span>
+            </button>
+            <button type="button" data-tab="library">
+              <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2 8l10 5 10-5-10-5Z"/><path d="m2 13 10 5 10-5"/><path d="m2 18 10 5 10-5"/></svg></span>
+              <span data-series-text="资料版本中心">资料版本中心</span>
+            </button>
+            <button type="button" data-tab="usage">
+              <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 6-6"/></svg></span>
+              <span data-series-text="资料使用">资料使用</span>
+            </button>
+            <button type="button" data-tab="history">
+              <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+              <span data-series-text="历史资料">历史资料</span>
+            </button>
+            <button type="button" data-tab="scopes">
+              <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.08a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg></span>
+              <span data-series-text="会话与设置">会话与设置</span>
+            </button>
+          </div>
+        </details>
+      </nav>
+      <div class="series-nav-tools">
+        <button id="theme-toggle" type="button" aria-pressed="false">
+          <span id="theme-label" data-series-text="日间模式">日间模式</span>
+          <span class="theme-switch" aria-hidden="true"></span>
+        </button>
       </div>
-    </header><div class="workspace-shell"><main id="workspace" tabindex="-1">
-<header class="topbar series-heading"><div><span class="eyebrow">CHAT DYNAMICS / LEARNING</span><h1 data-series-text="群间学习">群间学习</h1><p data-series-text="了解群友的习惯与喜恶，保持自己的性格。">了解群友的习惯与喜恶，保持自己的性格。</p></div><div class="topbar-tools"><select id="global-scope" aria-label="审查与资料的群聊筛选" data-series-aria-label="审查与资料的群聊筛选"><option value="" data-series-text="全部群聊范围">全部群聊范围</option></select><button id="refresh" data-series-text="刷新数据">刷新数据</button></div></header><section id="dynamics-series-panel" aria-label="互通插件状态" data-series-aria-label="互通插件状态"><p class="sp-feedback" role="status" data-series-text="正在读取互通插件…">正在读取互通插件…</p></section>
-<div id="notice" role="status" aria-live="polite" data-series-text="正在连接学习控制台…">正在连接学习控制台…</div>
-<section class="stats" id="stats" aria-label="学习概览" data-series-aria-label="学习概览"></section>
-<section id="home"><h2 data-series-text="运行总览">运行总览</h2><p class="muted" data-series-text="总览统计覆盖所有已授权群聊。群聊筛选用于审查、资料等工作区。">总览统计覆盖所有已授权群聊。群聊筛选用于审查、资料等工作区。</p><p class="muted" data-series-text="自动学习的进度、最近成果和需要关注的任务。资料送入模型不代表回复一定采用了它。">自动学习的进度、最近成果和需要关注的任务。资料送入模型不代表回复一定采用了它。</p><div id="home-summary" class="stats"></div><div class="card"><h3 data-series-text="学习积压">学习积压</h3><div id="backlog-list"></div></div><div class="card"><h3 data-series-text="任务诊断">任务诊断</h3><p class="muted" data-series-text="显示分析与审查的排队、耗时、失败及恢复状态；不记录模型提示词。">显示分析与审查的排队、耗时、失败及恢复状态；不记录模型提示词。</p><div id="task-list"></div></div></section><section id="proposals" hidden>
-<div class="review-heading"><div><h2 data-series-text="调整审查">调整审查</h2><p class="muted" data-series-text="同群成员集中审查；搜索与筛选覆盖全部待审内容，再分页显示。">同群成员集中审查；搜索与筛选覆盖全部待审内容，再分页显示。</p></div></div>
-<div class="review-context"><label for="review-group" data-series-text="选择群聊">选择群聊</label><select id="review-group" aria-label="审查分组" data-series-aria-label="审查分组"></select><button id="review-next-group" data-series-text="下一群">下一群</button></div>
-<div class="review-controls"><div class="review-switch" aria-label="审查内容" data-series-aria-label="审查内容"><button id="review-ready" data-review-view="ready" aria-pressed="true" data-series-text="本页可批准">本页可批准</button><button id="review-stale" data-review-view="stale" aria-pressed="false" data-series-text="失效治理">失效治理</button><button id="review-held" data-review-view="held" aria-pressed="false" data-series-text="人工保留">人工保留</button><button id="review-all" data-review-view="all" aria-pressed="false" data-series-text="本页全部">本页全部</button></div><input id="review-query" type="search" aria-label="搜索全部待审内容" data-series-aria-label="搜索全部待审内容" placeholder="搜索全部待审：内容、昵称或账号" data-series-placeholder="搜索全部待审：内容、昵称或账号" maxlength="160"><details class="review-filter-menu"><summary data-series-text="筛选">筛选</summary><div><label><span data-series-text="状态">状态</span><select id="state" aria-label="提案状态" data-series-aria-label="提案状态"><option value="" data-series-text="全部状态">全部状态</option><option value="pending" data-series-text="待审查">待审查</option><option value="reviewed" data-series-text="初审通过">初审通过</option></select></label><label><span data-series-text="类别">类别</span><select id="review-category" aria-label="审查类别" data-series-aria-label="审查类别"><option value="" data-series-text="全部类别">全部类别</option></select></label><label><span data-series-text="原因">原因</span><select id="review-reason" aria-label="待审原因" data-series-aria-label="待审原因"><option value="" data-series-text="全部原因">全部原因</option><option value="persona_changed" data-series-text="角色变化">角色变化</option><option value="revision_changed" data-series-text="学习项版本变化">学习项版本变化</option><option value="expired" data-series-text="过期">过期</option><option value="baseline_changed" data-series-text="决策基线变化">决策基线变化</option><option value="policy_invalid" data-series-text="规则不兼容">规则不兼容</option><option value="held" data-series-text="批次保留">批次保留</option><option value="llm_required" data-series-text="等待 LLM">等待 LLM</option></select></label><button id="review-reset" data-series-text="清空筛选">清空筛选</button></div></details></div>
-<div class="review-list-meta"><p id="review-summary" class="muted"></p><span class="review-kbd-hint muted" aria-label="键盘快捷键提示" data-series-aria-label="键盘快捷键提示" data-series-text="J/K 切换 · 空格 勾选 · A 批准 · R 拒绝 · H 依据">J/K 切换 · 空格 勾选 · A 批准 · R 拒绝 · H 依据</span><button id="select-review-page" data-series-text="选择本页可批准项">选择本页可批准项</button></div>
-<div id="batch-jobs" hidden></div><div id="cards"></div>
-<div class="review-bottom"><span id="selection-note" class="muted"></span><button id="clear-review-selection" hidden data-series-text="清空选择">清空选择</button><button id="preview-batch-review" hidden data-series-text="LLM 审查本页">LLM 审查本页</button><button id="preview-batch-reject" class="danger" hidden data-series-text="拒绝本页">拒绝本页</button><button id="preview-batch-archive" hidden data-series-text="归档失效项">归档失效项</button><button id="preview-batch-release" hidden data-series-text="交回自动审查">交回自动审查</button><button id="preview-batch" class="primary" disabled data-series-text="批准本页（0）">批准本页（0）</button></div>
-<div class="review-pagination"><button id="review-prev" data-series-text="上一页">上一页</button><button id="review-next" data-series-text="下一页">下一页</button></div></section>
-<section id="entries" hidden><h2 data-series-text="已学内容">已学内容</h2><p class="muted" data-series-text="按会话、人格和成员生效；过期内容不再注入。表达、打字和喜恶资料属于对应群友。Bot 原始性格固定，不继承群友的性格或喜恶。">按会话、人格和成员生效；过期内容不再注入。表达、打字和喜恶资料属于对应群友。Bot 原始性格固定，不继承群友的性格或喜恶。</p><div class="console-controls"><select id="entries-scope" aria-label="已学内容群聊" data-series-aria-label="已学内容群聊"></select><select id="entries-state" aria-label="已学内容状态" data-series-aria-label="已学内容状态"><option value="active" data-series-text="当前有效">当前有效</option><option value="expired" data-series-text="已过期">已过期</option><option value="inactive" data-series-text="已撤回">已撤回</option><option value="all" data-series-text="全部">全部</option></select><input id="entries-query" placeholder="搜索内容或成员账号" aria-label="搜索已学内容" data-series-aria-label="搜索已学内容" data-series-placeholder="搜索内容或成员账号"><button id="entries-load" data-series-text="查询">查询</button></div><p id="entries-summary" class="muted"></p><div id="entry-list"></div><div class="actions"><button id="entries-prev" data-series-text="上一页">上一页</button><button id="entries-next" data-series-text="下一页">下一页</button></div></section>
-<section id="social" hidden><div class="toolbar"><h2 data-series-text="群友关系">群友关系</h2><select id="social-scope" aria-label="选择群聊" data-series-aria-label="选择群聊"></select></div><p class="muted" data-series-text="查看已观察的互动分布、常互动伙伴、群内用语，以及角色对成员的好感。">查看已观察的互动分布、常互动伙伴、群内用语，以及角色对成员的好感。</p><div id="social-stats" class="stats"></div><div class="card network-card"><div class="network-heading"><div><h3 data-series-text="群友互动关系图">群友互动关系图</h3><p class="muted" data-series-text="活跃成员更靠近中心，常互动伙伴稍靠近；位置不代表现实关系。">活跃成员更靠近中心，常互动伙伴稍靠近；位置不代表现实关系。</p></div><button id="network-reset" data-series-text="恢复全图">恢复全图</button></div>
-<div class="network-controls"><input id="network-search" list="network-members" aria-label="查找群友" placeholder="按昵称或账号查找" maxlength="128" data-series-aria-label="查找群友" data-series-placeholder="按昵称或账号查找"><datalist id="network-members"></datalist><button id="network-find" data-series-text="定位成员">定位成员</button><label><span data-series-text="显示成员">显示成员</span> <select id="network-limit" aria-label="图中成员数量" data-series-aria-label="图中成员数量"><option value="20" data-series-text="20 位">20 位</option><option value="40" data-series-text="40 位">40 位</option><option value="60" data-series-text="60 位">60 位</option></select></label></div>
-<div class="network-layout"><div class="network-stage"><svg id="network" role="img" aria-label="群友互动关系图" data-series-aria-label="群友互动关系图"></svg><p id="network-summary" class="muted" role="status"></p><p class="muted" data-series-text="拖动节点调整位置；点击成员突出其连线，悬停查看完整昵称。">拖动节点调整位置；点击成员突出其连线，悬停查看完整昵称。</p></div><aside class="network-sidebar"><div class="network-legend"><h3 data-series-text="如何读图">如何读图</h3><p><span data-series-text="节点大小：近期活跃程度">节点大小：近期活跃程度</span><br><span data-series-text="连线粗细：两人的互动强度">连线粗细：两人的互动强度</span></p><div><i style="--swatch:#4c9983"></i><span data-series-text="偏正向">偏正向</span> <i style="--swatch:#be5e76"></i><span data-series-text="偏负向">偏负向</span></div><div><i style="--swatch:#bb914e"></i><span data-series-text="正负并存">正负并存</span> <i style="--swatch:#89939c"></i><span data-series-text="中性">中性</span></div><div><i class="unknown" style="--swatch:#aaa0bd"></i><span data-series-text="语气证据待观察">语气证据待观察</span></div></div><div id="member-detail"></div></aside></div></div><div id="social-explanations"></div><div class="card"><h3 data-series-text="数值好感度">数值好感度</h3><p class="muted" data-series-text="好感度增减默认自动生效，无需审查，变化记录支持回滚。100 是参照；短期语气与长期关系分别保存。">好感度增减默认自动生效，无需审查，变化记录支持回滚。100 是参照；短期语气与长期关系分别保存。</p><div class="toolbar"><label for="affection-view" data-series-text="好感度视图">好感度视图</label><select id="affection-view"><option value="current" data-series-text="当前好感度">当前好感度</option><option value="history" data-series-text="历史版本">历史版本</option><option value="all" data-series-text="全部版本">全部版本</option></select><span class="muted" data-series-text="同一角色、群和成员只显示一份当前记录；历史分数不相加。">同一角色、群和成员只显示一份当前记录；历史分数不相加。</span></div><div id="affection-table"></div><div class="actions"><button id="affection-prev" data-series-text="上一页">上一页</button><span id="affection-page" class="muted"></span><button id="affection-next" data-series-text="下一页">下一页</button></div></div><div class="card"><div class="toolbar"><h3 data-series-text="本群黑话">本群黑话</h3><input id="jargon-search" type="search" placeholder="搜索词语或含义" aria-label="搜索黑话" data-series-aria-label="搜索黑话" data-series-placeholder="搜索词语或含义"></div><div id="jargon-table"></div><div class="actions"><button id="jargon-prev" data-series-text="上一页">上一页</button><span id="jargon-page" class="muted"></span><button id="jargon-next" data-series-text="下一页">下一页</button></div></div></section>
-<section id="profiles" hidden><h2 data-series-text="群友学习">群友学习</h2><p class="muted" data-series-text="原话样例、习惯统计、喜恶摘要分开查看。Bot 保持自己的性格；成员资料默认由 LLM 审查，通过后自动用于回复。">原话样例、习惯统计、喜恶摘要分开查看。Bot 保持自己的性格；成员资料默认由 LLM 审查，通过后自动用于回复。</p><div class="toolbar"><select id="profile-scope" aria-label="学习资料群聊" data-series-aria-label="学习资料群聊"></select><input id="profile-member" aria-label="群友账号" placeholder="群友账号或昵称" maxlength="128" data-series-aria-label="群友账号" data-series-placeholder="群友账号或昵称"><button id="profile-search" data-series-text="查找群友">查找群友</button><button id="profile-load" data-series-text="查看三层资料">查看三层资料</button></div><div id="member-results"></div><div class="actions"><button id="members-prev" data-series-text="上一页">上一页</button><span id="members-summary" class="muted"></span><button id="members-next" data-series-text="下一页">下一页</button></div><div id="profile-content"></div></section>
-<section id="usage" hidden><h2 data-series-text="资料使用追踪">资料使用追踪</h2><p class="muted" data-series-text="仅记录经过权限过滤、实际出现在最终模型参数中的资料ID和计数，不保存提示词原文。它证明“送入模型”，不把它等同于“回复采用”或“发送成功”。追踪从本版启用后开始。">仅记录经过权限过滤、实际出现在最终模型参数中的资料ID和计数，不保存提示词原文。它证明“送入模型”，不把它等同于“回复采用”或“发送成功”。追踪从本版启用后开始。</p><div class="console-controls"><select id="usage-scope" aria-label="资料使用群聊" data-series-aria-label="资料使用群聊"></select><button id="usage-load" data-series-text="刷新记录">刷新记录</button></div><div id="usage-records"></div><div class="actions"><button id="usage-prev" data-series-text="上一页">上一页</button><span id="usage-summary" class="muted"></span><button id="usage-next" data-series-text="下一页">下一页</button></div></section><section id="preview" hidden><h2 data-series-text="回复材料预览">回复材料预览</h2><p class="muted" data-series-text="使用真实学习材料构造与 Chat Dynamics 成员边界过滤。只预览，不调用模型或发送消息。">使用真实学习材料构造与 Chat Dynamics 成员边界过滤。只预览，不调用模型或发送消息。</p><div class="console-controls"><select id="preview-scope" aria-label="预览群聊" data-series-aria-label="预览群聊"></select><input id="preview-member" aria-label="预览成员账号" placeholder="成员账号" maxlength="128" data-series-aria-label="预览成员账号" data-series-placeholder="成员账号"></div><label><span data-series-text="本轮输入">本轮输入</span><textarea id="preview-query" rows="3" maxlength="2000" placeholder="输入一句话，查看哪些资料会被选入" data-series-placeholder="输入一句话，查看哪些资料会被选入"></textarea></label><button id="preview-run" class="primary" data-series-text="预览材料">预览材料</button><div id="preview-output"></div></section>
-<section id="library" hidden><h2 data-series-text="资料版本中心">资料版本中心</h2><p class="muted" data-series-text="检索本插件全部提案和变更记录。旧 SelfLearning 原始档案仍可在历史资料查阅。">检索本插件全部提案和变更记录。旧 SelfLearning 原始档案仍可在历史资料查阅。</p><div class="console-controls"><select id="library-scope" aria-label="版本中心群聊" data-series-aria-label="版本中心群聊"></select><select id="library-state" aria-label="版本状态" data-series-aria-label="版本状态"><option value="" data-series-text="全部状态">全部状态</option><option value="applied" data-series-text="已应用">已应用</option><option value="pending" data-series-text="待审查">待审查</option><option value="reviewed" data-series-text="初审通过">初审通过</option><option value="rejected" data-series-text="已拒绝">已拒绝</option><option value="rolled_back" data-series-text="已回滚">已回滚</option><option value="archived" data-series-text="已归档">已归档</option></select><select id="library-category" aria-label="版本类别" data-series-aria-label="版本类别"><option value="" data-series-text="全部类别">全部类别</option></select><input id="library-query" aria-label="搜索版本" data-series-aria-label="搜索版本" placeholder="内容、关键词或成员账号" data-series-placeholder="内容、关键词或成员账号" maxlength="160"><button id="library-load" data-series-text="查询版本">查询版本</button></div><p id="library-summary" class="muted"></p><div id="library-records"></div><div class="actions"><button id="library-prev" data-series-text="上一页">上一页</button><button id="library-next" data-series-text="下一页">下一页</button></div></section><section id="history" hidden><h2 data-series-text="历史资料">历史资料</h2><p class="muted" data-series-text="保留从 SelfLearning 迁入的原文和旧审查状态。无法确认成员或来源的资料仅供查阅，不自动作为当前事实或角色设定。完整原库另有备份。">保留从 SelfLearning 迁入的原文和旧审查状态。无法确认成员或来源的资料仅供查阅，不自动作为当前事实或角色设定。完整原库另有备份。</p><div class="toolbar"><select id="history-scope" aria-label="历史资料群聊" data-series-aria-label="历史资料群聊"></select><select id="history-category" aria-label="历史资料类别" data-series-aria-label="历史资料类别"><option value="" data-series-text="全部类别">全部类别</option><option value="expression" data-series-text="表达样例">表达样例</option><option value="style_review" data-series-text="表达审查">表达审查</option><option value="affection" data-series-text="好感度">好感度</option><option value="jargon" data-series-text="黑话">黑话</option><option value="profile" data-series-text="成员画像">成员画像</option><option value="example" data-series-text="参考对话">参考对话</option><option value="legacy_goal" data-series-text="旧会话目标">旧会话目标</option><option value="legacy_mood" data-series-text="旧心情">旧心情</option><option value="legacy_persona_review" data-series-text="旧人格审查">旧人格审查</option></select><button id="history-load" data-series-text="查看历史">查看历史</button></div><p id="history-summary" class="muted"></p><div id="history-records"></div><div class="actions"><button id="history-prev" data-series-text="上一页">上一页</button><button id="history-next" data-series-text="下一页">下一页</button></div></section>
-<section id="scopes" hidden><h2 data-series-text="会话与设置">会话与设置</h2><p class="muted" data-series-text="在插件原生配置中选择分析模型、审查模型、生效会话和各类别的审查方式。会话使用完整 UMO，空列表不采集。">在插件原生配置中选择分析模型、审查模型、生效会话和各类别的审查方式。会话使用完整 UMO，空列表不采集。</p><div id="scope-list"></div><h3 data-series-text="审查方式">审查方式</h3><div id="modes"></div><p class="muted" data-series-text="事件默认保留 30 天；提案引用的证据保留用于审查与回滚。删除会话学习数据会同时删除这些证据。">事件默认保留 30 天；提案引用的证据保留用于审查与回滚。删除会话学习数据会同时删除这些证据。</p></section>
-</main></div></div><dialog id="material-detail"><div id="material-body"></div><footer><button id="material-close" data-series-text="关闭详情">关闭详情</button></footer></dialog><dialog id="edit"><form method="dialog"><h2 data-series-text="修改并重新提案">修改并重新提案</h2><p data-series-text="修改后的提案重新进入审查，旧的审查意见不会自动沿用。">修改后的提案重新进入审查，旧的审查意见不会自动沿用。</p><label><span data-series-text="调整内容">调整内容</span><textarea id="edit-value" rows="6" required></textarea></label><label><span data-series-text="修改理由">修改理由</span><textarea id="edit-reason" rows="3" maxlength="1500" required></textarea></label><footer><button value="cancel" formnovalidate data-series-text="取消">取消</button><button id="save-edit" type="button" class="primary" data-series-text="保存新提案">保存新提案</button></footer></form></dialog>
-<dialog id="batch-confirm" aria-labelledby="batch-title" aria-describedby="batch-summary batch-help"><h2 id="batch-title" data-series-text="核对本次批量调整">核对本次批量调整</h2><p id="batch-summary"></p><p id="batch-help" class="muted" data-series-text="逐项核对下面的调整前后内容。提交时会检查审查结果和记录版本；任一项已变化，整批都不会应用。">逐项核对下面的调整前后内容。提交时会检查审查结果和记录版本；任一项已变化，整批都不会应用。</p><p id="batch-excluded" class="muted" hidden></p><label id="batch-reason-label" hidden><span data-series-text="拒绝理由（可选，记录在每项审查历史中）">拒绝理由（可选，记录在每项审查历史中）</span><textarea id="batch-reason" rows="2" maxlength="1000"></textarea></label><div id="batch-values"></div><p id="batch-message" role="status"></p><footer><button id="cancel-batch" data-series-text="取消">取消</button><button id="commit-batch" class="primary" data-series-text="确认批准并应用">确认批准并应用</button></footer></dialog><script type="module" src="app.js?v=round2.1"></script></body></html>
+    </header>
 
+    <div class="workspace-shell">
+      <main id="workspace" tabindex="-1">
+        <header class="topbar series-heading">
+          <div class="heading-copy">
+            <span class="eyebrow">CHAT DYNAMICS / LEARNING</span>
+            <div class="heading-title-row">
+              <h1 data-series-text="群间学习">群间学习</h1>
+              <details class="info-popover">
+                <summary aria-label="学习边界说明" data-series-aria-label="学习边界说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="边界说明">边界说明</span></summary>
+                <div class="info-popover-body">
+                  <p class="muted" data-series-text="了解群友的习惯与喜恶，保持自己的性格。">了解群友的习惯与喜恶，保持自己的性格。</p>
+                </div>
+              </details>
+            </div>
+          </div>
+          <div class="topbar-tools">
+            <select id="global-scope" aria-label="审查与资料的群聊筛选" data-series-aria-label="审查与资料的群聊筛选">
+              <option value="" data-series-text="全部群聊范围">全部群聊范围</option>
+            </select>
+            <button id="refresh" type="button" data-series-text="刷新数据">刷新数据</button>
+          </div>
+        </header>
 
+        <section id="dynamics-series-panel" aria-label="互通插件状态" data-series-aria-label="互通插件状态">
+          <p class="sp-feedback" role="status" data-series-text="正在读取互通插件…">正在读取互通插件…</p>
+        </section>
 
+        <div id="notice" role="status" aria-live="polite" data-series-text="正在连接学习控制台…">正在连接学习控制台…</div>
+        <section class="stats" id="stats" aria-label="学习概览" data-series-aria-label="学习概览"></section>
+
+        <section id="home">
+          <div class="section-head">
+            <h2 data-series-text="运行总览">运行总览</h2>
+            <details class="info-popover">
+              <summary aria-label="运行总览说明" data-series-aria-label="运行总览说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="说明">说明</span></summary>
+              <div class="info-popover-body">
+                <p class="muted" data-series-text="总览统计覆盖所有已授权群聊。群聊筛选用于审查、资料等工作区。">总览统计覆盖所有已授权群聊。群聊筛选用于审查、资料等工作区。</p>
+                <p class="muted" data-series-text="自动学习的进度、最近成果和需要关注的任务。资料送入模型不代表回复一定采用了它。">自动学习的进度、最近成果和需要关注的任务。资料送入模型不代表回复一定采用了它。</p>
+              </div>
+            </details>
+          </div>
+          <div id="home-summary" class="stats stats-compact"></div>
+          <div class="card">
+            <h3 data-series-text="学习积压">学习积压</h3>
+            <div id="backlog-list"></div>
+          </div>
+          <div class="card">
+            <div class="section-head section-head-sub">
+              <h3 data-series-text="任务诊断">任务诊断</h3>
+              <details class="info-popover">
+                <summary aria-label="任务诊断说明" data-series-aria-label="任务诊断说明"><span class="info-icon" aria-hidden="true">i</span></summary>
+                <div class="info-popover-body">
+                  <p class="muted" data-series-text="显示分析与审查的排队、耗时、失败及恢复状态；不记录模型提示词。">显示分析与审查的排队、耗时、失败及恢复状态；不记录模型提示词。</p>
+                </div>
+              </details>
+            </div>
+            <div id="task-list"></div>
+          </div>
+        </section>
+
+        <section id="proposals" hidden>
+          <div class="review-heading">
+            <div class="section-head">
+              <h2 data-series-text="调整审查">调整审查</h2>
+              <details class="info-popover">
+                <summary aria-label="调整审查说明" data-series-aria-label="调整审查说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="说明">说明</span></summary>
+                <div class="info-popover-body">
+                  <p class="muted" data-series-text="同群成员集中审查；搜索与筛选覆盖全部待审内容，再分页显示。">同群成员集中审查；搜索与筛选覆盖全部待审内容，再分页显示。</p>
+                </div>
+              </details>
+            </div>
+          </div>
+          <div class="review-context">
+            <label for="review-group" data-series-text="选择群聊">选择群聊</label>
+            <select id="review-group" aria-label="审查分组" data-series-aria-label="审查分组"></select>
+            <button id="review-next-group" type="button" data-series-text="下一群">下一群</button>
+          </div>
+          <div class="review-controls">
+            <div class="review-switch" aria-label="审查内容" data-series-aria-label="审查内容">
+              <button id="review-ready" type="button" data-review-view="ready" aria-pressed="true" data-series-text="本页可批准">本页可批准</button>
+              <button id="review-stale" type="button" data-review-view="stale" aria-pressed="false" data-series-text="失效治理">失效治理</button>
+              <button id="review-held" type="button" data-review-view="held" aria-pressed="false" data-series-text="人工保留">人工保留</button>
+              <button id="review-all" type="button" data-review-view="all" aria-pressed="false" data-series-text="本页全部">本页全部</button>
+            </div>
+            <input id="review-query" type="search" aria-label="搜索全部待审内容" data-series-aria-label="搜索全部待审内容" placeholder="搜索全部待审：内容、昵称或账号" data-series-placeholder="搜索全部待审：内容、昵称或账号" maxlength="160">
+            <details class="review-filter-menu">
+              <summary data-series-text="筛选">筛选</summary>
+              <div>
+                <label><span data-series-text="状态">状态</span><select id="state" aria-label="提案状态" data-series-aria-label="提案状态"><option value="" data-series-text="全部状态">全部状态</option><option value="pending" data-series-text="待审查">待审查</option><option value="reviewed" data-series-text="初审通过">初审通过</option></select></label>
+                <label><span data-series-text="类别">类别</span><select id="review-category" aria-label="审查类别" data-series-aria-label="审查类别"><option value="" data-series-text="全部类别">全部类别</option></select></label>
+                <label><span data-series-text="原因">原因</span><select id="review-reason" aria-label="待审原因" data-series-aria-label="待审原因"><option value="" data-series-text="全部原因">全部原因</option><option value="persona_changed" data-series-text="角色变化">角色变化</option><option value="revision_changed" data-series-text="学习项版本变化">学习项版本变化</option><option value="expired" data-series-text="过期">过期</option><option value="baseline_changed" data-series-text="决策基线变化">决策基线变化</option><option value="policy_invalid" data-series-text="规则不兼容">规则不兼容</option><option value="held" data-series-text="批次保留">批次保留</option><option value="llm_required" data-series-text="等待 LLM">等待 LLM</option></select></label>
+                <button id="review-reset" type="button" data-series-text="清空筛选">清空筛选</button>
+              </div>
+            </details>
+          </div>
+          <div class="review-list-meta">
+            <p id="review-summary" class="muted"></p>
+            <span class="review-kbd-hint muted" aria-label="键盘快捷键提示" data-series-aria-label="键盘快捷键提示" data-series-text="J/K 切换 · 空格 勾选 · A 批准 · R 拒绝 · H 依据">J/K 切换 · 空格 勾选 · A 批准 · R 拒绝 · H 依据</span>
+            <button id="select-review-page" type="button" data-series-text="选择本页可批准项">选择本页可批准项</button>
+          </div>
+          <div id="batch-jobs" hidden></div>
+          <div id="cards"></div>
+          <div class="review-bottom">
+            <span id="selection-note" class="muted"></span>
+            <button id="clear-review-selection" type="button" hidden data-series-text="清空选择">清空选择</button>
+            <button id="preview-batch-review" type="button" hidden data-series-text="LLM 审查本页">LLM 审查本页</button>
+            <button id="preview-batch-reject" type="button" class="danger" hidden data-series-text="拒绝本页">拒绝本页</button>
+            <button id="preview-batch-archive" type="button" hidden data-series-text="归档失效项">归档失效项</button>
+            <button id="preview-batch-release" type="button" hidden data-series-text="交回自动审查">交回自动审查</button>
+            <button id="preview-batch" type="button" class="primary" disabled data-series-text="批准本页（0）">批准本页（0）</button>
+          </div>
+          <div class="review-pagination">
+            <button id="review-prev" type="button" data-series-text="上一页">上一页</button>
+            <button id="review-next" type="button" data-series-text="下一页">下一页</button>
+          </div>
+        </section>
+
+        <section id="entries" hidden>
+          <div class="section-head">
+            <h2 data-series-text="已学内容">已学内容</h2>
+            <details class="info-popover">
+              <summary aria-label="已学内容说明" data-series-aria-label="已学内容说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="说明">说明</span></summary>
+              <div class="info-popover-body">
+                <p class="muted" data-series-text="按会话、人格和成员生效；过期内容不再注入。表达、打字和喜恶资料属于对应群友。Bot 原始性格固定，不继承群友的性格或喜恶。">按会话、人格和成员生效；过期内容不再注入。表达、打字和喜恶资料属于对应群友。Bot 原始性格固定，不继承群友的性格或喜恶。</p>
+              </div>
+            </details>
+          </div>
+          <div class="console-controls">
+            <select id="entries-scope" aria-label="已学内容群聊" data-series-aria-label="已学内容群聊"></select>
+            <select id="entries-state" aria-label="已学内容状态" data-series-aria-label="已学内容状态">
+              <option value="active" data-series-text="当前有效">当前有效</option>
+              <option value="expired" data-series-text="已过期">已过期</option>
+              <option value="inactive" data-series-text="已撤回">已撤回</option>
+              <option value="all" data-series-text="全部">全部</option>
+            </select>
+            <input id="entries-query" placeholder="搜索内容或成员账号" aria-label="搜索已学内容" data-series-aria-label="搜索已学内容" data-series-placeholder="搜索内容或成员账号">
+            <button id="entries-load" type="button" data-series-text="查询">查询</button>
+          </div>
+          <p id="entries-summary" class="muted"></p>
+          <div id="entry-list"></div>
+          <div class="actions">
+            <button id="entries-prev" type="button" data-series-text="上一页">上一页</button>
+            <button id="entries-next" type="button" data-series-text="下一页">下一页</button>
+          </div>
+        </section>
+
+        <section id="social" hidden>
+          <div class="toolbar">
+            <div class="section-head">
+              <h2 data-series-text="群友关系">群友关系</h2>
+              <details class="info-popover">
+                <summary aria-label="群友关系说明" data-series-aria-label="群友关系说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="说明">说明</span></summary>
+                <div class="info-popover-body">
+                  <p class="muted" data-series-text="查看已观察的互动分布、常互动伙伴、群内用语，以及角色对成员的好感。">查看已观察的互动分布、常互动伙伴、群内用语，以及角色对成员的好感。</p>
+                </div>
+              </details>
+            </div>
+            <select id="social-scope" aria-label="选择群聊" data-series-aria-label="选择群聊"></select>
+          </div>
+          <div id="social-stats" class="stats"></div>
+          <div class="card network-card">
+            <div class="network-heading">
+              <div class="section-head section-head-sub">
+                <h3 data-series-text="群友互动关系图">群友互动关系图</h3>
+                <details class="info-popover">
+                  <summary aria-label="关系图说明" data-series-aria-label="关系图说明"><span class="info-icon" aria-hidden="true">i</span></summary>
+                  <div class="info-popover-body">
+                    <p class="muted" data-series-text="活跃成员更靠近中心，常互动伙伴稍靠近；位置不代表现实关系。">活跃成员更靠近中心，常互动伙伴稍靠近；位置不代表现实关系。</p>
+                    <p class="muted" data-series-text="拖动节点调整位置；点击成员突出其连线，悬停查看完整昵称。">拖动节点调整位置；点击成员突出其连线，悬停查看完整昵称。</p>
+                  </div>
+                </details>
+              </div>
+              <button id="network-reset" type="button" data-series-text="恢复全图">恢复全图</button>
+            </div>
+            <div class="network-controls">
+              <input id="network-search" list="network-members" aria-label="查找群友" placeholder="按昵称或账号查找" maxlength="128" data-series-aria-label="查找群友" data-series-placeholder="按昵称或账号查找">
+              <datalist id="network-members"></datalist>
+              <button id="network-find" type="button" data-series-text="定位成员">定位成员</button>
+              <label><span data-series-text="显示成员">显示成员</span> <select id="network-limit" aria-label="图中成员数量" data-series-aria-label="图中成员数量"><option value="20" data-series-text="20 位">20 位</option><option value="40" data-series-text="40 位">40 位</option><option value="60" data-series-text="60 位">60 位</option></select></label>
+            </div>
+            <div class="network-layout">
+              <div class="network-stage">
+                <svg id="network" role="img" aria-label="群友互动关系图" data-series-aria-label="群友互动关系图"></svg>
+                <p id="network-summary" class="muted" role="status"></p>
+              </div>
+              <aside class="network-sidebar">
+                <div class="network-legend">
+                  <h3 data-series-text="如何读图">如何读图</h3>
+                  <p><span data-series-text="节点大小：近期活跃程度">节点大小：近期活跃程度</span><br><span data-series-text="连线粗细：两人的互动强度">连线粗细：两人的互动强度</span></p>
+                  <div><i style="--swatch:#4c9983"></i><span data-series-text="偏正向">偏正向</span> <i style="--swatch:#be5e76"></i><span data-series-text="偏负向">偏负向</span></div>
+                  <div><i style="--swatch:#bb914e"></i><span data-series-text="正负并存">正负并存</span> <i style="--swatch:#89939c"></i><span data-series-text="中性">中性</span></div>
+                  <div><i class="unknown" style="--swatch:#aaa0bd"></i><span data-series-text="语气证据待观察">语气证据待观察</span></div>
+                </div>
+                <div id="member-detail"></div>
+              </aside>
+            </div>
+          </div>
+          <div id="social-explanations"></div>
+          <div class="card">
+            <div class="toolbar">
+              <div class="section-head section-head-sub">
+                <h3 data-series-text="数值好感度">数值好感度</h3>
+                <details class="info-popover">
+                  <summary aria-label="数值好感度说明" data-series-aria-label="数值好感度说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="双轨说明">双轨说明</span></summary>
+                  <div class="info-popover-body">
+                    <p class="muted" data-series-text="好感度增减默认自动生效，无需审查，变化记录支持回滚。100 是参照；短期语气与长期关系分别保存。">好感度增减默认自动生效，无需审查，变化记录支持回滚。100 是参照；短期语气与长期关系分别保存。</p>
+                    <p class="muted" data-series-text="同一角色、群和成员只显示一份当前记录；历史分数不相加。">同一角色、群和成员只显示一份当前记录；历史分数不相加。</p>
+                  </div>
+                </details>
+              </div>
+              <div class="affection-toolbar-right">
+                <label for="affection-view" data-series-text="好感度视图">好感度视图</label>
+                <select id="affection-view">
+                  <option value="current" data-series-text="当前好感度">当前好感度</option>
+                  <option value="history" data-series-text="历史版本">历史版本</option>
+                  <option value="all" data-series-text="全部版本">全部版本</option>
+                </select>
+              </div>
+            </div>
+            <div id="affection-table"></div>
+            <div class="actions">
+              <button id="affection-prev" type="button" data-series-text="上一页">上一页</button>
+              <span id="affection-page" class="muted"></span>
+              <button id="affection-next" type="button" data-series-text="下一页">下一页</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="toolbar">
+              <h3 data-series-text="本群黑话">本群黑话</h3>
+              <input id="jargon-search" type="search" placeholder="搜索词语或含义" aria-label="搜索黑话" data-series-aria-label="搜索黑话" data-series-placeholder="搜索词语或含义">
+            </div>
+            <div id="jargon-table"></div>
+            <div class="actions">
+              <button id="jargon-prev" type="button" data-series-text="上一页">上一页</button>
+              <span id="jargon-page" class="muted"></span>
+              <button id="jargon-next" type="button" data-series-text="下一页">下一页</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="profiles" hidden>
+          <div class="section-head">
+            <h2 data-series-text="群友学习">群友学习</h2>
+            <details class="info-popover">
+              <summary aria-label="群友学习说明" data-series-aria-label="群友学习说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="说明">说明</span></summary>
+              <div class="info-popover-body">
+                <p class="muted" data-series-text="原话样例、习惯统计、喜恶摘要分开查看。Bot 保持自己的性格；成员资料默认由 LLM 审查，通过后自动用于回复。">原话样例、习惯统计、喜恶摘要分开查看。Bot 保持自己的性格；成员资料默认由 LLM 审查，通过后自动用于回复。</p>
+              </div>
+            </details>
+          </div>
+          <div class="toolbar">
+            <select id="profile-scope" aria-label="学习资料群聊" data-series-aria-label="学习资料群聊"></select>
+            <input id="profile-member" aria-label="群友账号" placeholder="群友账号或昵称" maxlength="128" data-series-aria-label="群友账号" data-series-placeholder="群友账号或昵称">
+            <button id="profile-search" type="button" data-series-text="查找群友">查找群友</button>
+            <button id="profile-load" type="button" data-series-text="查看三层资料">查看三层资料</button>
+          </div>
+          <div id="member-results"></div>
+          <div class="actions">
+            <button id="members-prev" type="button" data-series-text="上一页">上一页</button>
+            <span id="members-summary" class="muted"></span>
+            <button id="members-next" type="button" data-series-text="下一页">下一页</button>
+          </div>
+          <div id="profile-content"></div>
+        </section>
+
+        <section id="usage" hidden>
+          <div class="section-head">
+            <h2 data-series-text="资料使用追踪">资料使用追踪</h2>
+            <details class="info-popover">
+              <summary aria-label="资料使用追踪说明" data-series-aria-label="资料使用追踪说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="说明">说明</span></summary>
+              <div class="info-popover-body">
+                <p class="muted" data-series-text="仅记录经过权限过滤、实际出现在最终模型参数中的资料ID和计数，不保存提示词原文。它证明“送入模型”，不把它等同于“回复采用”或“发送成功”。追踪从本版启用后开始。">仅记录经过权限过滤、实际出现在最终模型参数中的资料ID和计数，不保存提示词原文。它证明“送入模型”，不把它等同于“回复采用”或“发送成功”。追踪从本版启用后开始。</p>
+              </div>
+            </details>
+          </div>
+          <div class="console-controls">
+            <select id="usage-scope" aria-label="资料使用群聊" data-series-aria-label="资料使用群聊"></select>
+            <button id="usage-load" type="button" data-series-text="刷新记录">刷新记录</button>
+          </div>
+          <div id="usage-records"></div>
+          <div class="actions">
+            <button id="usage-prev" type="button" data-series-text="上一页">上一页</button>
+            <span id="usage-summary" class="muted"></span>
+            <button id="usage-next" type="button" data-series-text="下一页">下一页</button>
+          </div>
+        </section>
+
+        <section id="preview" hidden>
+          <div class="section-head">
+            <h2 data-series-text="回复材料预览">回复材料预览</h2>
+            <details class="info-popover">
+              <summary aria-label="回复材料预览说明" data-series-aria-label="回复材料预览说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="说明">说明</span></summary>
+              <div class="info-popover-body">
+                <p class="muted" data-series-text="使用真实学习材料构造与 Chat Dynamics 成员边界过滤。只预览，不调用模型或发送消息。">使用真实学习材料构造与 Chat Dynamics 成员边界过滤。只预览，不调用模型或发送消息。</p>
+              </div>
+            </details>
+          </div>
+          <div class="console-controls">
+            <select id="preview-scope" aria-label="预览群聊" data-series-aria-label="预览群聊"></select>
+            <input id="preview-member" aria-label="预览成员账号" placeholder="成员账号" maxlength="128" data-series-aria-label="预览成员账号" data-series-placeholder="成员账号">
+          </div>
+          <label><span data-series-text="本轮输入">本轮输入</span><textarea id="preview-query" rows="3" maxlength="2000" placeholder="输入一句话，查看哪些资料会被选入" data-series-placeholder="输入一句话，查看哪些资料会被选入"></textarea></label>
+          <button id="preview-run" type="button" class="primary" data-series-text="预览材料">预览材料</button>
+          <div id="preview-output"></div>
+        </section>
+
+        <section id="library" hidden>
+          <div class="section-head">
+            <h2 data-series-text="资料版本中心">资料版本中心</h2>
+            <details class="info-popover">
+              <summary aria-label="资料版本中心说明" data-series-aria-label="资料版本中心说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="说明">说明</span></summary>
+              <div class="info-popover-body">
+                <p class="muted" data-series-text="检索本插件全部提案和变更记录。旧 SelfLearning 原始档案仍可在历史资料查阅。">检索本插件全部提案和变更记录。旧 SelfLearning 原始档案仍可在历史资料查阅。</p>
+              </div>
+            </details>
+          </div>
+          <div class="console-controls">
+            <select id="library-scope" aria-label="版本中心群聊" data-series-aria-label="版本中心群聊"></select>
+            <select id="library-state" aria-label="版本状态" data-series-aria-label="版本状态">
+              <option value="" data-series-text="全部状态">全部状态</option>
+              <option value="applied" data-series-text="已应用">已应用</option>
+              <option value="pending" data-series-text="待审查">待审查</option>
+              <option value="reviewed" data-series-text="初审通过">初审通过</option>
+              <option value="rejected" data-series-text="已拒绝">已拒绝</option>
+              <option value="rolled_back" data-series-text="已回滚">已回滚</option>
+              <option value="archived" data-series-text="已归档">已归档</option>
+            </select>
+            <select id="library-category" aria-label="版本类别" data-series-aria-label="版本类别">
+              <option value="" data-series-text="全部类别">全部类别</option>
+            </select>
+            <input id="library-query" aria-label="搜索版本" data-series-aria-label="搜索版本" placeholder="内容、关键词或成员账号" data-series-placeholder="内容、关键词或成员账号" maxlength="160">
+            <button id="library-load" type="button" data-series-text="查询版本">查询版本</button>
+          </div>
+          <p id="library-summary" class="muted"></p>
+          <div id="library-records"></div>
+          <div class="actions">
+            <button id="library-prev" type="button" data-series-text="上一页">上一页</button>
+            <button id="library-next" type="button" data-series-text="下一页">下一页</button>
+          </div>
+        </section>
+
+        <section id="history" hidden>
+          <div class="section-head">
+            <h2 data-series-text="历史资料">历史资料</h2>
+            <details class="info-popover">
+              <summary aria-label="历史资料说明" data-series-aria-label="历史资料说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="说明">说明</span></summary>
+              <div class="info-popover-body">
+                <p class="muted" data-series-text="保留从 SelfLearning 迁入的原文和旧审查状态。无法确认成员或来源的资料仅供查阅，不自动作为当前事实或角色设定。完整原库另有备份。">保留从 SelfLearning 迁入的原文和旧审查状态。无法确认成员或来源的资料仅供查阅，不自动作为当前事实或角色设定。完整原库另有备份。</p>
+              </div>
+            </details>
+          </div>
+          <div class="toolbar">
+            <select id="history-scope" aria-label="历史资料群聊" data-series-aria-label="历史资料群聊"></select>
+            <select id="history-category" aria-label="历史资料类别" data-series-aria-label="历史资料类别">
+              <option value="" data-series-text="全部类别">全部类别</option>
+              <option value="expression" data-series-text="表达样例">表达样例</option>
+              <option value="style_review" data-series-text="表达审查">表达审查</option>
+              <option value="affection" data-series-text="好感度">好感度</option>
+              <option value="jargon" data-series-text="黑话">黑话</option>
+              <option value="profile" data-series-text="成员画像">成员画像</option>
+              <option value="example" data-series-text="参考对话">参考对话</option>
+              <option value="legacy_goal" data-series-text="旧会话目标">旧会话目标</option>
+              <option value="legacy_mood" data-series-text="旧心情">旧心情</option>
+              <option value="legacy_persona_review" data-series-text="旧人格审查">旧人格审查</option>
+            </select>
+            <button id="history-load" type="button" data-series-text="查看历史">查看历史</button>
+          </div>
+          <p id="history-summary" class="muted"></p>
+          <div id="history-records"></div>
+          <div class="actions">
+            <button id="history-prev" type="button" data-series-text="上一页">上一页</button>
+            <button id="history-next" type="button" data-series-text="下一页">下一页</button>
+          </div>
+        </section>
+
+        <section id="scopes" hidden>
+          <div class="section-head">
+            <h2 data-series-text="会话与设置">会话与设置</h2>
+            <details class="info-popover">
+              <summary aria-label="会话与设置说明" data-series-aria-label="会话与设置说明"><span class="info-icon" aria-hidden="true">i</span><span class="info-label" data-series-text="说明">说明</span></summary>
+              <div class="info-popover-body">
+                <p class="muted" data-series-text="在插件原生配置中选择分析模型、审查模型、生效会话和各类别的审查方式。会话使用完整 UMO，空列表不采集。">在插件原生配置中选择分析模型、审查模型、生效会话和各类别的审查方式。会话使用完整 UMO，空列表不采集。</p>
+                <p class="muted" data-series-text="事件默认保留 30 天；提案引用的证据保留用于审查与回滚。删除会话学习数据会同时删除这些证据。">事件默认保留 30 天；提案引用的证据保留用于审查与回滚。删除会话学习数据会同时删除这些证据。</p>
+              </div>
+            </details>
+          </div>
+          <div id="scope-list"></div>
+          <h3 data-series-text="审查方式">审查方式</h3>
+          <div id="modes"></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="material-detail">
+    <div id="material-body"></div>
+    <footer><button id="material-close" type="button" data-series-text="关闭详情">关闭详情</button></footer>
+  </dialog>
+
+  <dialog id="edit">
+    <form method="dialog">
+      <h2 data-series-text="修改并重新提案">修改并重新提案</h2>
+      <p data-series-text="修改后的提案重新进入审查，旧的审查意见不会自动沿用。">修改后的提案重新进入审查，旧的审查意见不会自动沿用。</p>
+      <label><span data-series-text="调整内容">调整内容</span><textarea id="edit-value" rows="6" required></textarea></label>
+      <label><span data-series-text="修改理由">修改理由</span><textarea id="edit-reason" rows="3" maxlength="1500" required></textarea></label>
+      <footer>
+        <button value="cancel" formnovalidate data-series-text="取消">取消</button>
+        <button id="save-edit" type="button" class="primary" data-series-text="保存新提案">保存新提案</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="batch-confirm" aria-labelledby="batch-title" aria-describedby="batch-summary batch-help">
+    <h2 id="batch-title" data-series-text="核对本次批量调整">核对本次批量调整</h2>
+    <p id="batch-summary"></p>
+    <p id="batch-help" class="muted" data-series-text="逐项核对下面的调整前后内容。提交时会检查审查结果和记录版本；任一项已变化，整批都不会应用。">逐项核对下面的调整前后内容。提交时会检查审查结果和记录版本；任一项已变化，整批都不会应用。</p>
+    <p id="batch-excluded" class="muted" hidden></p>
+    <label id="batch-reason-label" hidden>
+      <span data-series-text="拒绝理由（可选，记录在每项审查历史中）">拒绝理由（可选，记录在每项审查历史中）</span>
+      <textarea id="batch-reason" rows="2" maxlength="1000"></textarea>
+    </label>
+    <div id="batch-values"></div>
+    <p id="batch-message" role="status"></p>
+    <footer>
+      <button id="cancel-batch" type="button" data-series-text="取消">取消</button>
+      <button id="commit-batch" type="button" class="primary" data-series-text="确认批准并应用">确认批准并应用</button>
+    </footer>
+  </dialog>
+
+  <script type="module" src="app.js?v=0.14.0"></script>
+</body>
+</html>

@@ -19,6 +19,8 @@ def test_presence_buttons_and_safe_navigation_fallback(server,width):  # noqa: F
         navigateToPlugin:async(...args)=>window.__nav.push(args)};''')
         page.goto(server)
         root=page.locator('#dynamics-series-panel')
+        if root.locator('.sp-matrix-trigger').count():
+            root.locator('.sp-matrix-trigger').click()
         root.get_by_role('button').filter(has_text='对话主控').wait_for()
         assert root.get_by_role('button').filter(has_text='群间记忆').is_disabled()
         assert root.get_by_role('button').filter(has_text='群间学习').is_disabled()

@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 420" width="1080" height="420" role="img" aria-label="群间学习 · Dynamics Learning 核心架构">
+  <defs>
+    <linearGradient id="hdrGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#312E81"/>
+      <stop offset="55%" stop-color="#4338CA"/>
+      <stop offset="100%" stop-color="#6366F1"/>
+    </linearGradient>
+    <linearGradient id="coreGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#EEF2FF"/>
+      <stop offset="100%" stop-color="#E0E7FF"/>
+    </linearGradient>
+    <filter id="cardShadow" x="-4%" y="-6%" width="108%" height="116%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.06"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#6366F1"/>
+    </marker>
+    <marker id="arrowMuted" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#64748B"/>
+    </marker>
+    <marker id="arrowEmerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+    <style>
+      .t-title { font-family: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', 'Segoe UI', system-ui, sans-serif; font-size: 21px; font-weight: 700; fill: #FFFFFF; }
+      .t-sub { font-family: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', 'Segoe UI', system-ui, sans-serif; font-size: 12.5px; font-weight: 400; fill: #E0E7FF; }
+      .t-badge { font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; font-size: 10.5px; font-weight: 700; fill: #E0E7FF; letter-spacing: 0.8px; }
+      .c-title { font-family: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', 'Segoe UI', system-ui, sans-serif; font-size: 14.5px; font-weight: 700; fill: #0F172A; }
+      .c-sub { font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; font-size: 11px; font-weight: 600; fill: #64748B; }
+      .c-body { font-family: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', 'Segoe UI', system-ui, sans-serif; font-size: 12px; fill: #475569; }
+      .c-chip { font-family: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', 'Segoe UI', system-ui, sans-serif; font-size: 11px; font-weight: 600; }
+      .c-num { font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; font-size: 11.5px; font-weight: 700; fill: #FFFFFF; }
+      .c-sec { font-family: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', 'Segoe UI', system-ui, sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 0.4px; }
+    </style>
+  </defs>
+  <rect x="0.5" y="0.5" width="1079" height="419" rx="16" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="1"/>
+  <path d="M 16 1 L 1064 1 Q 1079 1 1079 16 L 1079 76 L 1 76 L 1 16 Q 1 1 16 1 Z" fill="url(#hdrGrad)"/>
+  <text x="28" y="34" class="t-title">群间学习 · Dynamics Learning 核心架构</text>
+  <text x="28" y="57" class="t-sub">坚守固定性格红线的社交与表达适应层 · 增量学习 · 独立审查 · 版本回滚</text>
+  <rect x="872" y="22" width="180" height="26" rx="13" fill="#FFFFFF" fill-opacity="0.14" stroke="#FFFFFF" stroke-opacity="0.28"/>
+  <text x="962" y="39" text-anchor="middle" class="t-badge">DYNAMICS LEARNING</text>
+
+  <g filter="url(#cardShadow)">
+    <rect x="28" y="100" width="236" height="196" rx="12" fill="#FFFFFF" stroke="#7DD3FC" stroke-width="1.4"/>
+    <path d="M 40 100 L 252 100 Q 264 100 264 112 L 264 140 L 28 140 L 28 112 Q 28 100 40 100 Z" fill="#F0F9FF"/>
+    <line x1="28" y1="140" x2="264" y2="140" stroke="#7DD3FC" stroke-width="1"/>
+    <rect x="40" y="109" width="26" height="22" rx="6" fill="#0369A1"/>
+    <text x="53" y="124" text-anchor="middle" class="c-num">01</text>
+    <text x="74" y="125" class="c-title" fill="#0369A1">增量采集队列</text>
+    <text x="42" y="158" class="c-sub">Native + Turn Feedback</text>
+    <text x="42" y="179" class="c-body">· 按 UMO 白名单持久化入队</text>
+    <text x="42" y="200" class="c-body">· 仅消费已核对消息与送达回执</text>
+    <text x="42" y="221" class="c-body">· 不将 Bot 输出误作真人样例</text>
+    <text x="42" y="242" class="c-body">· 锁外调用模型，支持并发限流</text>
+  </g>
+  <line x1="264" y1="198" x2="285" y2="198" stroke="#6366F1" stroke-width="2" marker-end="url(#arrow)"/>
+  <g filter="url(#cardShadow)">
+    <rect x="290" y="100" width="236" height="196" rx="12" fill="#FFFFFF" stroke="#C4B5FD" stroke-width="1.4"/>
+    <path d="M 302 100 L 514 100 Q 526 100 526 112 L 526 140 L 290 140 L 290 112 Q 290 100 302 100 Z" fill="#F5F3FF"/>
+    <line x1="290" y1="140" x2="526" y2="140" stroke="#C4B5FD" stroke-width="1"/>
+    <rect x="302" y="109" width="26" height="22" rx="6" fill="#6D28D9"/>
+    <text x="315" y="124" text-anchor="middle" class="c-num">02</text>
+    <text x="336" y="125" class="c-title" fill="#6D28D9">三层成员建模</text>
+    <text x="304" y="158" class="c-sub">Style · Habit · Preference</text>
+    <text x="304" y="179" class="c-body">· 原话样例：上下文—原话对</text>
+    <text x="304" y="200" class="c-body">· 习惯统计：短句/标点/碎发率</text>
+    <text x="304" y="221" class="c-body">· 喜恶摘要：原话核对与适用条件</text>
+    <text x="304" y="242" class="c-body">· 内置群友互动图谱与词库统计</text>
+  </g>
+  <line x1="526" y1="198" x2="547" y2="198" stroke="#6366F1" stroke-width="2" marker-end="url(#arrow)"/>
+  <g filter="url(#cardShadow)">
+    <rect x="552" y="100" width="236" height="196" rx="12" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.4"/>
+    <path d="M 564 100 L 776 100 Q 788 100 788 112 L 788 140 L 552 140 L 552 112 Q 552 100 564 100 Z" fill="#FFFBEB"/>
+    <line x1="552" y1="140" x2="788" y2="140" stroke="#FCD34D" stroke-width="1"/>
+    <rect x="564" y="109" width="26" height="22" rx="6" fill="#B45309"/>
+    <text x="577" y="124" text-anchor="middle" class="c-num">03</text>
+    <text x="598" y="125" class="c-title" fill="#B45309">独立审查工作台</text>
+    <text x="566" y="158" class="c-sub">Human / LLM / Hybrid</text>
+    <text x="566" y="179" class="c-body">· 人工、自动或初审+复核三模</text>
+    <text x="566" y="200" class="c-body">· 按群/角色/成员分组差异对比</text>
+    <text x="566" y="221" class="c-body">· 绝不改写角色卡与固定核心性格</text>
+    <text x="566" y="242" class="c-body">· 每项生效均留审计并支持回滚</text>
+  </g>
+  <line x1="788" y1="198" x2="809" y2="198" stroke="#6366F1" stroke-width="2" marker-end="url(#arrow)"/>
+  <g filter="url(#cardShadow)">
+    <rect x="814" y="100" width="236" height="196" rx="12" fill="#FFFFFF" stroke="#A5B4FC" stroke-width="1.4"/>
+    <path d="M 826 100 L 1038 100 Q 1050 100 1050 112 L 1050 140 L 814 140 L 814 112 Q 814 100 826 100 Z" fill="#EEF2FF"/>
+    <line x1="814" y1="140" x2="1050" y2="140" stroke="#A5B4FC" stroke-width="1"/>
+    <rect x="826" y="109" width="26" height="22" rx="6" fill="#4338CA"/>
+    <text x="839" y="124" text-anchor="middle" class="c-num">04</text>
+    <text x="860" y="125" class="c-title" fill="#4338CA">缓存式回复投影</text>
+    <text x="828" y="158" class="c-sub">reply_projection_v1</text>
+    <text x="828" y="179" class="c-body">· 仅投影已批准未过期的本成员资料</text>
+    <text x="828" y="200" class="c-body">· 私聊只读继承授权群，不跨群混用</text>
+    <text x="828" y="221" class="c-body">· 请求前复核批准版本与边界状态</text>
+    <text x="828" y="242" class="c-body">· 资料使用页如实记录，不伪造采纳</text>
+  </g>
+  <rect x="28" y="316" width="1024" height="82" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2"/>  <text x="44" y="341" class="c-sec" fill="#1E293B">安全与可观测护栏（固定性格不变式 · 审查通过 ≠ 效果已验证）</text>
+  <rect x="44" y="356" width="239" height="26" rx="13" fill="#EEF2FF" stroke="#A5B4FC" stroke-width="1"/>
+  <text x="163.5" y="373" text-anchor="middle" class="c-chip" fill="#4338CA">三层严格隔离：UMO/角色/成员</text>
+  <rect x="295" y="356" width="239" height="26" rx="13" fill="#FFFBEB" stroke="#FCD34D" stroke-width="1"/>
+  <text x="414.5" y="373" text-anchor="middle" class="c-chip" fill="#B45309">阈值调幅硬上限与配置绑定</text>
+  <rect x="546" y="356" width="239" height="26" rx="13" fill="#F5F3FF" stroke="#C4B5FD" stroke-width="1"/>
+  <text x="665.5" y="373" text-anchor="middle" class="c-chip" fill="#6D28D9">接管原 SelfLearning 社交职责</text>
+  <rect x="797" y="356" width="239" height="26" rx="13" fill="#FFF1F2" stroke="#FDA4AF" stroke-width="1"/>
+  <text x="916.5" y="373" text-anchor="middle" class="c-chip" fill="#BE123C">整批原子回滚与会话级清除</text>
+</svg>

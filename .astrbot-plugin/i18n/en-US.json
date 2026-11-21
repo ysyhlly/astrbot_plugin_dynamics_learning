@@ -1,4 +1,8 @@
 {
+  "metadata": {
+    "display_name": "Dynamics Learning",
+    "desc": "Social and expression adaptation plugin for the Chat Dynamics series with strict fixed-persona boundaries, independent review, and version rollback."
+  },
   "series_ui": {
     "语言": "Language",
     "互通插件": "Companion plugins",

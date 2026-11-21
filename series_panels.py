@@ -6,13 +6,14 @@ import inspect
 import re
 import subprocess
 import sys
+import time
 from importlib import import_module
 from pathlib import Path
 
 from astrbot.api.web import json_response, request
 
 CATALOG = (
-    ("astrbot_plugin_chat_dynamics", "Chat Dynamics", "app", "对话调度与回复"),
+    ("astrbot_plugin_chat_dynamics", "对话主控", "app", "对话调度与回复"),
     ("astrbot_plugin_dynamics_learning", "群间学习", "review", "学习与审查"),
     ("astrbot_plugin_dynamics_world", "群间世界", "world", "角色与生活状态"),
     ("astrbot_plugin_dynamics_memory", "群间记忆", "dashboard", "记忆与证据"),
@@ -26,7 +27,7 @@ CATALOG = (
     ("astrbot_plugin_visual_media", "视觉工坊", "workshop", "表情、图片与视觉表达"),
     (
         "astrbot_plugin_group_chronicle",
-        "群史记",
+        "群文化沿革",
         "culture",
         "收录有价值的结果与群史传记",
     ),
@@ -38,6 +39,75 @@ CATALOG = (
         "兼容检查；已由群间学习接管",
     ),
 )
+
+_SUMMARY_TTL_SECONDS = 10.0
+_SUMMARY_TONES = frozenset({"accent", "warm", "info", "danger", "muted"})
+_SUMMARY_CACHE: dict[tuple[str, int], tuple[float, dict | None]] = {}
+
+
+def invalidate_summary_cache(identity: str | None = None) -> None:
+    """Drop cached per-plugin summary badges (all plugins or one identity)."""
+    if identity is None:
+        _SUMMARY_CACHE.clear()
+        return
+    for key in [k for k in _SUMMARY_CACHE if k[0] == identity]:
+        _SUMMARY_CACHE.pop(key, None)
+
+
+def _sanitize_series_summary(raw) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    badge_out = None
+    raw_badge = raw.get("badge")
+    if isinstance(raw_badge, dict):
+        raw_count = raw_badge.get("count", 0)
+        count = 0
+        if not isinstance(raw_count, bool):
+            try:
+                count = max(0, int(raw_count))
+            except (TypeError, ValueError):
+                count = 0
+        tone = str(raw_badge.get("tone") or "accent").strip().lower()
+        if tone not in _SUMMARY_TONES:
+            tone = "accent"
+        label = str(raw_badge.get("label") or "").strip()[:80]
+        badge_out = {"count": count, "tone": tone, "label": label}
+
+    pulse_out = None
+    raw_pulse = raw.get("pulse")
+    if isinstance(raw_pulse, dict):
+        headline = str(raw_pulse.get("headline") or "").strip()[:160]
+        updated_at = str(raw_pulse.get("updated_at") or "").strip()[:64]
+        pulse_out = {"headline": headline, "updated_at": updated_at}
+
+    if badge_out is None and pulse_out is None:
+        return None
+    return {"badge": badge_out, "pulse": pulse_out}
+
+
+def _read_series_summary(identity: str, owner) -> dict | None:
+    if owner is None:
+        return None
+    getter = getattr(owner, "get_series_summary", None)
+    if not callable(getter) or inspect.iscoroutinefunction(getter):
+        return None
+    now = time.monotonic()
+    cache_key = (identity, id(owner))
+    cached = _SUMMARY_CACHE.get(cache_key)
+    if cached is not None and (now - cached[0]) < _SUMMARY_TTL_SECONDS:
+        return cached[1]
+    summary = None
+    try:
+        raw = getter()
+        if inspect.isawaitable(raw):
+            if inspect.iscoroutine(raw):
+                raw.close()
+        else:
+            summary = _sanitize_series_summary(raw)
+    except Exception:
+        summary = None
+    _SUMMARY_CACHE[cache_key] = (now, summary)
+    return summary
 
 # These four IDs and titles mirror Dynamics Games' runtime.LEGACY_PLUGINS.
 LEGACY_CONFLICTS = (
@@ -341,6 +411,8 @@ def presence(context, current, root=None):
             "runtime_enabled": None,
             "version": "",
             "can_open": False,
+            "badge": None,
+            "pulse": None,
         }
         if not matches:
             data["state"] = "unloaded" if installed else "missing"
@@ -415,6 +487,10 @@ def presence(context, current, root=None):
                             )
                     except Exception as exc:
                         data.update(state="error", error=type(exc).__name__)
+                summary = _read_series_summary(identity, owner)
+                if summary is not None:
+                    data["badge"] = summary.get("badge")
+                    data["pulse"] = summary.get("pulse")
         output.append(data)
 
     active_ids = {

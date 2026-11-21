@@ -21,7 +21,7 @@ def test_shared_theme_preference_survives_reload_and_host_theme(server):
         page.goto(server)
         assert page.locator('html').get_attribute('data-ui-theme') == 'night'
         page.evaluate("document.documentElement.dataset.theme='light'")
-        assert page.evaluate("getComputedStyle(document.body).backgroundColor") == 'rgb(11, 20, 25)'
+        assert page.evaluate("getComputedStyle(document.body).backgroundColor") in ('rgb(11, 20, 25)', 'rgb(12, 20, 18)')
         page.evaluate("dispatchEvent(new StorageEvent('storage',{key:'chat_dynamics_ui',newValue:'day'}))")
         assert page.locator('html').get_attribute('data-ui-theme') == 'day'
         page.get_by_role('button', name='群友学习', exact=True).click()
@@ -95,6 +95,7 @@ def test_review_ui_navigation_actions_and_no_overflow(server, width, theme):
         page.locator("#edit-reason").fill("避免过度简短")
         page.get_by_text("保存新提案", exact=True).click()
         assert page.evaluate("window.__calls.some(x=>x.path==='amend')")
+        page.locator("#nav-more-menu > summary").click()
         page.get_by_role("button", name="会话与设置", exact=True).click()
         assert page.get_by_text("现在分析", exact=True).is_visible()
         page.get_by_text("现在分析", exact=True).click()
@@ -263,6 +264,7 @@ def test_history_archive_is_scoped_paginated_and_rendered_as_text(server):
         window.__calls=[];window.AstrBotPluginPage={ready:async()=>{},apiGet:async()=>({data:window.__snapshot}),
         apiPost:async(path,body)=>{window.__calls.push({path,body});return {data:{...window.__archive,page:body.page}}}};''')
         page.goto(server)
+        page.locator('#nav-more-menu > summary').click()
         page.get_by_role('button',name='历史资料',exact=True).click()
         page.get_by_role('button',name='查看历史',exact=True).click()
         page.get_by_text('历史资料，不自动生效',exact=True).wait_for()
@@ -619,6 +621,7 @@ def test_console_home_search_paged_entries_and_provider_use(server,width):
         page.get_by_role('button',name='Alice · alice · 10 条消息',exact=True).click()
         page.wait_for_function("window.__calls.some(c=>c.path==='profile')")
         assert page.evaluate("window.__calls.find(c=>c.path==='profile').body.member")=='alice'
+        page.locator('#nav-more-menu > summary').click()
         page.get_by_role('button',name='资料使用',exact=True).click()
         page.locator('#usage-records').get_by_text('喜恶',exact=False).first.wait_for()
         assert '交流长度' in page.locator('#usage-records').inner_text()

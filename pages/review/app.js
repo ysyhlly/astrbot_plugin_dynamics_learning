@@ -5,6 +5,7 @@ const $ = s => document.querySelector(s);
 const formatDate = (seconds) => new Date(seconds*1000).toLocaleString(document.documentElement.lang);
 const formatTime = (seconds) => new Date(seconds*1000).toLocaleTimeString(document.documentElement.lang);
 const SUB_SCOPE_SELECTORS=['#entries-scope','#social-scope','#profile-scope','#usage-scope','#preview-scope','#library-scope','#history-scope'];
+const OPS_TABS=new Set(['preview','library','usage','history','scopes']);
 window.DynamicsGetActiveScope=()=>($('#global-scope')?.value||'').trim();
 const categories = {expression_style:"本群表达习惯",expression_adjustment:"表达反馈调整",scene_pattern:"群内接话场景",scene_adjustment:"接话反馈调整",expression_example:msg("原话样例"),style:msg("群友表达方式"),typing_habit:msg("群友打字习惯"),preference:msg("群友喜恶"),jargon:msg("群聊黑话"),affection:msg("数值好感度"),relationship:msg("社交关系"),state:msg("短期状态"),persona:msg("旧人格增量（已停用）"),decision_guidance:msg("决策指导"),participation:msg("接话阈值")};
 const states = {pending:msg("待审查"),reviewed:msg("初审通过"),applied:msg("已应用"),rejected:msg("已拒绝"),rolled_back:msg("已回滚"),archived:msg("已归档")};
@@ -78,11 +79,23 @@ function renderReviewCards(){
   const mode=snapshot.review_modes[p.category]||p.mode,ready=canApprove(p),pending=['pending','reviewed'].includes(p.state);
   const c=el('article','review-item'),top=el('div','review-item-head'),head=el('div','review-title');c.dataset.proposalId=p.id;c.tabIndex=0;
   if((groupReview()||reviewGroupKey)&&canSelect(p)){const check=el('input');check.type='checkbox';check.dataset.proposal=p.id;check.checked=reviewSelected.has(p.id);check.setAttribute('aria-label','选择调整 '+p.key);check.onchange=()=>{if(check.checked&&reviewSelected.size>=batchLimit()){check.checked=false;note(`每次最多选择 ${batchLimit()} 条`);return;}if(check.checked){reviewSelected.add(p.id);reviewSelectionRows.set(p.id,p);}else{reviewSelected.delete(p.id);reviewSelectionRows.delete(p.id);}selectionStatus();};top.append(check);}
+  const actorLabel=String(p.display_name||p.member||'群').trim();
+  const avatar=el('span','review-avatar',actorLabel.slice(0,1).toUpperCase());avatar.setAttribute('aria-hidden','true');top.append(avatar);
   head.append(el('span','review-category',categories[p.category]||p.category),el('h3','',p.key));top.append(head);
   const status=p.can_archive?'已失效':p.reason_code==='held'?'批次保留':ready?'待确认':p.state==='reviewed'&&mode==='llm'?'已通过 · 自动生效中':pending&&mode!=='human'?'等待 LLM 审查':states[p.state];
-  top.append(el('span','badge',status));c.append(top);
-  const body=el('div','review-item-body'),valWrap=el('div','review-val-col'),value=el('div','review-value',displayValue(p.value));valWrap.append(value);
-  if(p.before?.active){const idiff=el('div','review-inline-diff');const oldText=String(displayValue(p.before.value)||'').replace(/\s+/g,' ').slice(0,110);const newText=String(displayValue(p.value)||'').replace(/\s+/g,' ').slice(0,110);idiff.append(el('div','diff-del','修改前：'+oldText),el('div','diff-add','修改后：'+newText));valWrap.append(idiff);}
+  const badgeTone=p.can_archive?' tone-danger':(ready||p.reason_code==='held'||(pending&&mode!=='human'))?' tone-warm':(p.state==='reviewed'&&mode==='llm')?' tone-info':'';
+  top.append(el('span','badge'+badgeTone,status));c.append(top);
+  const body=el('div','review-item-body'),valWrap=el('div','review-val-col');
+  const proposedText=displayValue(p.value);
+  if(p.before?.active){
+   const diffGrid=el('div','review-journal-diff');
+   const beforeBox=el('div','review-journal-before');beforeBox.append(el('small','review-journal-label',msg('原记录')),el('div','',displayValue(p.before.value)));
+   const afterBox=el('div','review-journal-after');afterBox.append(el('small','review-journal-label',msg('建议调整后')),el('div','review-value',proposedText));
+   diffGrid.append(beforeBox,afterBox);valWrap.append(diffGrid);
+  }else{
+   const singleBox=el('div','review-journal-single');singleBox.append(el('div','review-value',proposedText));
+   valWrap.append(singleBox);
+  }
   body.append(valWrap);
   const actions=el('div','review-row-actions');
   const evidence=proposalDetails(p);const original=button(msg('查看原文'),()=>{detail.open=true;evidence.open=true;evidence.scrollIntoView({block:'nearest'});});original.classList.add('series-open-source');actions.append(original);
@@ -138,19 +151,47 @@ function proposalDetails(p){
  body.append(el('p','muted',msg('展开后加载')));let loaded=false,loading=false;
  d.addEventListener('toggle',async()=>{if(!d.open||loaded||loading)return;loading=true;body.setAttribute('aria-busy','true');try{const full=await api('apiPost','proposal_detail',{id:p.id});body.replaceChildren(evidenceBody(full.evidence),details(msg('完整审查意见'),full.reviews),details(msg('应用前后观察'),full.observations));loaded=true;}catch(e){body.replaceChildren(el('p','',e.message));}finally{loading=false;body.removeAttribute('aria-busy');}});return d;
 }
+function updatePendingTabBadge(pendingCount) {
+ const badge = $('#tab-pending-badge');
+ const tabBtn = document.querySelector('[data-tab="proposals"]');
+ const count = Math.max(0, Number(pendingCount) || 0);
+ if (badge) {
+  badge.hidden = count <= 0;
+  badge.textContent = count > 99 ? '99+' : String(count);
+ }
+ if (tabBtn) {
+  tabBtn.title = count > 0 ? msg('调整审查 · {0} 项待审', count) : msg('调整审查');
+ }
+}
 function renderOverviewStats() {
  const counts = snapshot.proposal_counts;
+ const pendingCount = counts ? (counts.pending||0)+(counts.reviewed||0) : snapshot.proposals.filter(p=>['pending','reviewed'].includes(p.state)).length;
+ const appliedCount = counts?.applied??snapshot.proposals.filter(p=>p.state==='applied').length;
+ const sessionCount = snapshot.sessions.length;
+ const batchTurns = snapshot.batches.reduce((n,b)=>n+b.count,0);
+ updatePendingTabBadge(pendingCount);
+ const totalProposals = Math.max(1, pendingCount + appliedCount);
  const metrics = [
-  ['待审查', counts ? (counts.pending||0)+(counts.reviewed||0) : snapshot.proposals.filter(p=>['pending','reviewed'].includes(p.state)).length],
-  ['已应用', counts?.applied??snapshot.proposals.filter(p=>p.state==='applied').length],
-  ['生效会话', snapshot.sessions.length],
-  ['待分析回合', snapshot.batches.reduce((n,b)=>n+b.count,0)],
+  ['待审查', pendingCount, pendingCount > 0 ? {pill: msg('需关注'), tone: 'warm', ratio: Math.min(100, Math.round((pendingCount / totalProposals) * 100))} : {pill: msg('已清空'), tone: 'accent'}],
+  ['已应用', appliedCount, {pill: msg('已生效'), tone: 'accent', ratio: Math.min(100, Math.round((appliedCount / totalProposals) * 100))}],
+  ['生效会话', sessionCount, {pill: sessionCount > 0 ? msg('运行中') : msg('未启用'), tone: sessionCount > 0 ? 'info' : 'warm'}],
+  ['待分析回合', batchTurns, batchTurns > 0 ? {pill: msg('积压中'), tone: 'warm'} : {pill: msg('空闲'), tone: 'accent'}],
  ];
  $('#stats').replaceChildren(...metrics.map(metricCard));
 }
-function metricCard([label,value]) {
- const card = el('div','stat');
- card.append(el('strong','',value),el('span','',msg(label)));
+function metricCard([label, value, meta]) {
+ const card = el('div', 'stat');
+ const top = el('div', 'stat-top');
+ top.append(el('span', 'stat-label', msg(label)));
+ if (meta?.pill) top.append(el('span', 'stat-pill tone-' + (meta.tone || 'accent'), meta.pill));
+ card.append(top, el('strong', '', value));
+ if (typeof meta?.ratio === 'number') {
+  const bar = el('div', 'stat-bar' + (meta.tone === 'warm' ? ' tone-warm' : ''));
+  const fill = document.createElement('i');
+  fill.style.width = Math.max(4, Math.min(100, meta.ratio)) + '%';
+  bar.append(fill);
+  card.append(bar);
+ }
  return card;
 }
 function render(){
@@ -216,7 +257,12 @@ function syncGlobalScopeToSubtabs(scope,triggerFetch=true){
 async function load(){
  try{
   snapshot=await api('apiGet','overview');
-  if(activeSection===null)activate(snapshot.console_version?'home':'proposals',false);
+  if(activeSection===null){
+   const requestedTab=new URLSearchParams(location.search).get('tab')||'';
+   const validTabs=['home','proposals','entries','social','profiles','usage','history','scopes','preview','library'];
+   const initialTab=validTabs.includes(requestedTab)?requestedTab:(snapshot.console_version?'home':'proposals');
+   activate(initialTab,false);
+  }
   if(globalScope===null){
    if(groupReview())reviewView='all';
    const incoming=getSharedScope();
@@ -434,7 +480,51 @@ $('#commit-batch').onclick=async()=>{
 };
 
 function fillScope(selector,all=false){const select=$(selector),old=select.value;select.replaceChildren();if(all){const o=el('option','',msg("全部群"));o.value='';select.append(o);}for(const s of snapshot.sessions){const o=el('option','',s);o.value=s;select.append(o);}if(snapshot.sessions.includes(old)||all&&old==='')select.value=old;}
-function activate(section,fetch=true){activeSection=section;$('#stats').hidden=section!=='home';for(const s of ['home','proposals','entries','social','profiles','usage','history','scopes','preview','library'])$('#'+s).hidden=s!==section;for(const n of document.querySelectorAll('[data-tab]')){const selected=n.dataset.tab===section;n.classList.toggle('selected',selected);if(selected)n.setAttribute('aria-current','page');else n.removeAttribute('aria-current');}if(!fetch)return;if(section==='social')loadSocial();if(section==='entries'&&snapshot.entries_paged)loadEntries();if(section==='proposals')fetchReviewGroup().then(render).catch(e=>note(e.message,'error'));if(section==='usage')loadUsage();if(section==='library')workbench?.loadLibrary();}
+function activate(section,fetch=true){
+ activeSection=section;
+ $('#stats').hidden=section!=='home';
+ for(const s of ['home','proposals','entries','social','profiles','usage','history','scopes','preview','library'])$('#'+s).hidden=s!==section;
+ for(const n of document.querySelectorAll('[data-tab]')){
+  const selected=n.dataset.tab===section;
+  n.classList.toggle('selected',selected);
+  if(selected)n.setAttribute('aria-current','page');
+  else n.removeAttribute('aria-current');
+ }
+ const moreMenu=$('#nav-more-menu');
+ if(moreMenu){
+  moreMenu.classList.toggle('has-active',OPS_TABS.has(section));
+  moreMenu.open=false;
+ }
+ if(!fetch)return;
+ if(section==='social')loadSocial();
+ if(section==='entries'&&snapshot.entries_paged)loadEntries();
+ if(section==='proposals')fetchReviewGroup().then(render).catch(e=>note(e.message,'error'));
+ if(section==='usage')loadUsage();
+ if(section==='library')workbench?.loadLibrary();
+}
+document.addEventListener('click',ev=>{
+ const moreMenu=$('#nav-more-menu');
+ if(moreMenu?.open&&!moreMenu.contains(ev.target))moreMenu.open=false;
+ for(const pop of document.querySelectorAll('.info-popover[open]')){
+  if(!pop.contains(ev.target))pop.open=false;
+ }
+});
+document.addEventListener('keydown',ev=>{
+ if(ev.key==='Escape'){
+  const moreMenu=$('#nav-more-menu');
+  if(moreMenu?.open){moreMenu.open=false;moreMenu.querySelector('summary')?.focus();}
+  for(const pop of document.querySelectorAll('.info-popover[open]'))pop.open=false;
+ }
+ const moreMenu=$('#nav-more-menu');
+ if(moreMenu?.open&&moreMenu.contains(document.activeElement)&&(ev.key==='ArrowDown'||ev.key==='ArrowUp')){
+  const items=[...moreMenu.querySelectorAll('.nav-more-popover [data-tab]')];
+  if(!items.length)return;
+  ev.preventDefault();
+  const idx=items.indexOf(document.activeElement);
+  const next=ev.key==='ArrowDown'?(idx+1)%items.length:(idx<=0?items.length-1:idx-1);
+  items[next].focus();
+ }
+});
 function renderHome() {
  const pending = (snapshot.batches || []).filter(batch=>batch.count>0);
  const oldest = Math.min(...pending.map(batch=>batch.oldest||Date.now()/1000));
@@ -515,10 +605,46 @@ function affectionVersion(entry){
  if(entry.affection_role_id)setText(version,msg('角色：{0}',entry.affection_role_id),'title');
  return version;
 }
+function affectionMeter(entry){
+ const raw=entry.value||{};
+ const level=Number(raw.affection_level||0);
+ const tone=Number(raw.tone||0);
+ const delta=Number(raw.experience_delta||0);
+ const box=el('div','affection-meter');
+ const head=el('div','affection-meter-head');
+ head.append(el('strong','affection-score',level.toFixed(4)));
+ let chipText=msg('基准 100'),chipCls='is-neutral';
+ if(Number.isFinite(tone)&&Math.abs(tone)>=0.01){
+  chipText=msg('近期语气 {0}',(tone>0?'+':'')+tone.toFixed(2));
+  chipCls=tone>0?'is-pos':'is-neg';
+ }else if(Number.isFinite(delta)&&Math.abs(delta)>=0.01){
+  chipText=msg('经验变化 {0}',(delta>0?'+':'')+delta.toFixed(1));
+  chipCls=delta>0?'is-pos':'is-neg';
+ }
+ head.append(el('span','affection-tone-chip '+chipCls,chipText));
+ const track=el('div','affection-track');
+ track.setAttribute('role','img');
+ track.setAttribute('aria-label',`${msg('好感度')} ${level.toFixed(2)} · ${chipText}`);
+ const refTick=el('span','affection-ref-tick');
+ refTick.title=msg('100 参照基准');
+ const basePct=level<=200?Math.max(2,Math.min(86,(level/200)*100)):Math.min(90,86+Math.log2(1+(level-200)/100)*2);
+ const baseSeg=el('span','affection-seg-base');
+ baseSeg.style.width=basePct.toFixed(1)+'%';
+ track.append(refTick,baseSeg);
+ const toneMagnitude=Math.abs(tone)>=0.01?Math.min(1,Math.abs(tone)):(Math.abs(delta)>=0.01?Math.min(1,Math.abs(delta)/20):0);
+ if(toneMagnitude>0){
+  const toneSeg=el('span','affection-seg-tone '+(chipCls==='is-neg'?'is-neg':'is-pos'));
+  const tonePct=Math.max(3,Math.min(100-basePct,toneMagnitude*14));
+  toneSeg.style.width=tonePct.toFixed(1)+'%';
+  track.append(toneSeg);
+ }
+ box.append(head,track);
+ return box;
+}
 function renderAffections(entries,users){
  $('#affection-table').replaceChildren(table([msg('成员'),msg('好感度'),msg('人设文本版本'),msg('来源')],entries.map(entry=>[
   users[entry.member]?.name||entry.member,
-  Number(entry.value.affection_level).toFixed(4),
+  affectionMeter(entry),
   affectionVersion(entry),
   el('span','',msg(entry.imported?'历史关系继承':'已生效调整')),
  ])));
@@ -557,8 +683,6 @@ $('#profile-search').onclick=()=>{memberPage=1;searchMembers();};$('#members-pre
 async function loadUsage(){const current=ticket('usage');try{const scope=$('#usage-scope').value;if(!scope)return;const d=await api('apiPost','usage',{scope,page:usagePage});if(!current())return;usageTotal=d.total;$('#usage-summary').textContent=`${d.total} 条 · 第 ${d.page} 页`;$('#usage-records').replaceChildren(...d.records.map(r=>{const c=el('article','card');c.append(el('h3','',`${r.member} · ${formatDate(r.created)}`),el('p','muted',`已送入模型参数 · 过往引用 ${r.memory_refs.length} · ${r.dialogue?'有连续对话锚点':'无连续对话锚点'} · 性格锁 ${r.personality_locked?'保留':'未知'}`),table(['实际提供的学习资料','版本'],[...r.profiles,...(r.learning||[])].map(p=>[`${categories[p.category]||p.category} · ${p.label||p.source_id}`,p.revision])),details('本轮节奏',r.rhythm),details('未进入组合层的候选（过滤或身份校验）',r.omitted),el('p','muted','未审查、过期或不相关的资料不会被提供为候选；这里不推断模型最终采用了哪句话。'));return c;}));$('#usage-prev').disabled=usagePage<=1;$('#usage-next').disabled=usagePage*20>=usageTotal;}catch(e){if(current())note(e.message,'error');}}
 $('#usage-load').onclick=()=>{usagePage=1;loadUsage();};$('#usage-prev').onclick=()=>{if(usagePage>1){usagePage--;loadUsage();}};$('#usage-next').onclick=()=>{if(usagePage*20<usageTotal){usagePage++;loadUsage();}};
 setInterval(()=>{if(activeSection==='home'&&!document.hidden)load();},20000);
-
-for(const id of ['entries','profiles','usage','history','scopes']){const section=$('#'+id),help=section.querySelector(':scope > p.muted');if(help){const d=el('details','page-help');d.append(el('summary','','说明'),help);section.querySelector('h2').after(d);}}
 
 async function loadBatchJobs(){
  if(!batchActions())return;
@@ -603,6 +727,13 @@ $('#profile-member').addEventListener('input',()=>{ticket('members');ticket('pro
 $('#profile-scope').onchange=()=>{ticket('members');ticket('profile');memberPage=1;$('#member-results').replaceChildren();$('#profile-content').replaceChildren();};
 if($('#global-scope'))$('#global-scope').onchange=()=>syncGlobalScopeToSubtabs($('#global-scope').value,true);
 window.addEventListener('dynamics-scopechange',ev=>{const next=ev.detail?.umo||'';if(next!==globalScope)syncGlobalScopeToSubtabs(next);});
+window.addEventListener('dynamics-cmdk-deeplink',ev=>{
+ const link=ev.detail?.deep_link;
+ const tab=typeof link==='object'?link?.tab:'';
+ const scope=typeof link==='object'?link?.scope:'';
+ if(scope&&scope!==globalScope)syncGlobalScopeToSubtabs(scope,false);
+ if(tab&&['home','proposals','entries','social','profiles','usage','history','scopes','preview','library'].includes(tab))activate(tab,true);
+});
 function focusReviewCard(nextIdx){
  const items=[...document.querySelectorAll('#cards .review-item')];
  if(!items.length){focusedReviewIndex=-1;return null;}

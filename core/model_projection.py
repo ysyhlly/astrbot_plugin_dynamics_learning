@@ -9,13 +9,20 @@ context needed by the model.
 
 from __future__ import annotations
 
-from .contract import digest, encode
+from .contract import PERSONALITY_POLICY, digest, encode
 
 DEFER_FINGERPRINT = "review_defer_fingerprint"
-ANALYZE_PAYLOAD_BUDGET = 36_000
+ANALYZE_PAYLOAD_BUDGET = 22_000
+ANALYZE_CURRENT_BUDGET = 8_000
 ANALYZE_SINGLE_EVENT_MAX = 112_000
-REVIEW_BATCH_PAYLOAD_BUDGET = 28_000
+REVIEW_BATCH_PAYLOAD_BUDGET = 24_000
 _REPLY_TEXT_CAP = 800
+
+
+def utf8_len(value) -> int:
+    """Return UTF-8 byte length of a string or compact JSON-encoded value."""
+    text = value if isinstance(value, str) else encode(value)
+    return len(text.encode("utf-8"))
 
 
 def _compact_interaction(interaction):
@@ -33,8 +40,13 @@ def _compact_interaction(interaction):
     return out or None
 
 
-def extract_character_context(events, *, scope="", persona=""):
-    """Hoist static per-(scope, persona) character summary & baseline once."""
+def extract_character_context(events, *, scope="", persona="", include_scope=False):
+    """Hoist static persona-level character summary & baseline once.
+
+    Omits `scope` by default so multiple groups sharing the same persona produce
+    100% byte-identical system_prompt prefixes and implicit-cache anchors;
+    `scope` remains present in user JSON payloads.
+    """
     summary = ""
     threshold = None
     for ev in events or ():
@@ -55,7 +67,7 @@ def extract_character_context(events, *, scope="", persona=""):
     if not summary:
         return None
     out = {"persona_summary": summary}
-    if scope:
+    if include_scope and scope:
         out["scope"] = scope
     if persona:
         out["persona"] = persona
@@ -65,10 +77,21 @@ def extract_character_context(events, *, scope="", persona=""):
 
 
 def format_system_prompt(base_prompt, character_context=None):
-    """Append deterministic static character_context to system_prompt tail."""
+    """Prepend deterministic persona-level character_context + policy before task rules.
+
+    Placing the shared persona prefix first enables cross-group AND cross-task
+    (ANALYZE / UNIFIED_REVIEW / ANALYZE_SCENES / ANALYZE_STYLE) prefix cache sharing.
+    """
     if not character_context:
         return base_prompt
-    return base_prompt + "\n\n[character_context]\n" + encode(character_context)
+    return (
+        "[character_context]\n"
+        + encode(character_context)
+        + "\n\n[personality_policy]\n"
+        + PERSONALITY_POLICY
+        + "\n\n"
+        + base_prompt
+    )
 
 
 def project_event_for_model(event, *, include_scope=True):

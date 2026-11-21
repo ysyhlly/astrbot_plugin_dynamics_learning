@@ -240,6 +240,15 @@ class Store:
                 ORDER BY created DESC LIMIT 1""",
                 (scope, persona),
             ).fetchone()
+            if row is None and persona:
+                row = self.db.execute(
+                    """SELECT body FROM events
+                    WHERE persona=?
+                    AND json_extract(body,'$.context.persona_summary') IS NOT NULL
+                    AND length(trim(json_extract(body,'$.context.persona_summary')))>0
+                    ORDER BY created DESC LIMIT 1""",
+                    (persona,),
+                ).fetchone()
             return json.loads(row[0]) if row else None
 
     def get(self, proposal_id):

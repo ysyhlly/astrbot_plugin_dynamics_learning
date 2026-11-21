@@ -8,7 +8,7 @@ ensure_current(
     __package__,
     __name__,
     __file__,
-    version="2.0.0-rc.4+cost.1",
+    version="2.0.0-rc.5+cost.1",
     checks=[
         ("core.engine", "Engine", "_review_contract_v1"),
         ("core.engine", "Engine", "_automatic_review_contract_v1"),
@@ -16,9 +16,13 @@ ensure_current(
 )
 
 import asyncio
+import hashlib
 import inspect
 import json
+import math
+import time
 from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -46,6 +50,126 @@ from .series_panels import get_series_defaults, inherit_provider, inherit_umos
 PLUGIN = "astrbot_plugin_dynamics_learning"
 MIN_SAFE_MODEL_MAX_TOKENS = 1536
 REASONING_EFFORT_OPTIONS = frozenset({"none", "minimal", "low", "medium", "high"})
+_CATEGORY_LABELS = {
+    "expression_style": "本群表达习惯",
+    "expression_adjustment": "表达反馈调整",
+    "scene_pattern": "群内接话场景",
+    "scene_adjustment": "接话反馈调整",
+    "expression_example": "原话样例",
+    "style": "群友表达方式",
+    "typing_habit": "群友打字习惯",
+    "preference": "群友喜恶",
+    "jargon": "群聊黑话",
+    "affection": "数值好感度",
+    "relationship": "社交关系",
+    "state": "短期状态",
+    "decision_guidance": "决策指导",
+    "participation": "接话阈值",
+}
+
+
+_TZ_SHANGHAI = timezone(timedelta(hours=8))
+_UNBOUND_PERSONA_SENTINELS = frozenset({"__none__", "[%None]"})
+
+
+def _iso_timestamp(ts: float | None = None) -> str:
+    stamp = time.time() if ts is None else float(ts)
+    return datetime.fromtimestamp(stamp, tz=_TZ_SHANGHAI).isoformat(timespec="seconds")
+
+
+def _date_window(date_str: str, *, now_ts: float | None = None) -> tuple[float, float] | None:
+    clean = str(date_str or "today").strip().lower()
+    if clean in {"", "today"}:
+        stamp = time.time() if now_ts is None else float(now_ts)
+        now = datetime.fromtimestamp(stamp, tz=_TZ_SHANGHAI)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start.timestamp(), start.timestamp() + 86400.0
+    try:
+        parsed = datetime.strptime(clean, "%Y-%m-%d").replace(tzinfo=_TZ_SHANGHAI)
+        start = parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start.timestamp(), start.timestamp() + 86400.0
+    except ValueError:
+        return None
+
+
+def _resolve_journal_window(
+    date_str: str,
+    start_ts: float | None = None,
+    end_ts: float | None = None,
+    *,
+    now_ts: float | None = None,
+) -> tuple[bool, tuple[float, float] | None]:
+    if start_ts is not None or end_ts is not None:
+        if (
+            isinstance(start_ts, bool)
+            or isinstance(end_ts, bool)
+            or not isinstance(start_ts, (int, float))
+            or not isinstance(end_ts, (int, float))
+        ):
+            return False, None
+        s_val = float(start_ts)
+        e_val = float(end_ts)
+        if not (math.isfinite(s_val) and math.isfinite(e_val) and e_val > s_val):
+            return False, None
+        return True, (s_val, e_val)
+    clean = str(date_str or "today").strip().lower()
+    if clean in {"all", "*"}:
+        return True, None
+    bounds = _date_window(clean, now_ts=now_ts)
+    if bounds is None:
+        return False, None
+    return True, bounds
+
+
+def _value_snippet(raw, limit: int = 80) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        text_val = raw
+    elif isinstance(raw, dict):
+        if raw.get("kind") == "expression_example":
+            text_val = str(raw.get("expression") or raw.get("situation") or "")
+        elif raw.get("stance"):
+            text_val = f"{raw.get('topic', '')}：{raw.get('quote', '')}"
+        elif "affection_level" in raw:
+            try:
+                level = float(raw.get("affection_level") or 0)
+                text_val = f"好感 {level:.1f}"
+            except (TypeError, ValueError):
+                text_val = "好感变化"
+        else:
+            text_val = encode(raw)
+    else:
+        text_val = str(raw)
+    flat = " ".join(text_val.split())
+    return flat[:limit] + ("…" if len(flat) > limit else "")
+
+
+def _accepts_kwarg(fn, name):
+    """Return True if callable fn accepts keyword argument `name` (explicitly or via **kwargs)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    param = params.get(name)
+    return param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
+def _cache_anchor_contexts(instruction):
+    """Build a deterministic 2-message static anchor so Gemini/Responses implicit caching hits across calls."""
+    if not isinstance(instruction, str) or not instruction.strip():
+        return []
+    prefix = hashlib.sha256(instruction.encode("utf-8")).hexdigest()[:12]
+    anchor = f"[cache_anchor task=dynamics_learning prefix={prefix}]"
+    return [
+        {"role": "user", "content": anchor},
+        {"role": "assistant", "content": "OK"},
+    ]
 
 
 def _text_chat_extra_kwargs(provider, config):
@@ -229,6 +353,326 @@ class DynamicsLearning(Star):
             "ready": self.ready and not self.closed,
             "capabilities": {"social": 1},
         }
+
+    def get_series_summary(self) -> dict:
+        """Synchronous, read-only badge and pulse summary for series_presence v2."""
+        updated_at = _iso_timestamp()
+        if self.closed or not self.ready or self.engine is None:
+            return {
+                "badge": {"count": 0, "tone": "muted", "label": "未就绪"},
+                "pulse": {"headline": "群间学习尚未就绪", "updated_at": updated_at},
+            }
+        try:
+            counts = self.engine.store.proposal_counts()
+            pending = int(counts.get("pending", 0)) + int(counts.get("reviewed", 0))
+            applied = int(counts.get("applied", 0))
+            master_enabled = bool(self.config.get("enabled", True))
+            if not master_enabled:
+                label = f"总开关已关闭 · {pending} 项待审" if pending > 0 else "总开关已关闭"
+                headline = f"学习总开关已关闭 · 待审 {pending} 项 · 已应用 {applied} 条"
+                return {
+                    "badge": {"count": pending, "tone": "muted", "label": label},
+                    "pulse": {"headline": headline, "updated_at": updated_at},
+                }
+            tone = "warm" if pending > 0 else "accent"
+            label = f"{pending} 项待审" if pending > 0 else "队列空闲"
+            job_note = f"处理中 {len(self.jobs)} 项" if self.jobs else "队列空闲"
+            headline = f"待审 {pending} 项 · 已应用 {applied} 条 · {job_note}"
+            return {
+                "badge": {"count": pending, "tone": tone, "label": label},
+                "pulse": {"headline": headline, "updated_at": updated_at},
+            }
+        except Exception:
+            return {
+                "badge": {"count": 0, "tone": "muted", "label": "暂不可用"},
+                "pulse": {"headline": "状态读取暂不可用", "updated_at": updated_at},
+            }
+
+    def get_series_scope_status(self, umo: str) -> dict:
+        """Read-only per-scope status for the cross-plugin group control matrix."""
+        scope = str(umo or "").strip()[:512]
+        master_enabled = bool(self.config.get("enabled", True))
+        if self.closed or not self.ready or self.engine is None:
+            return {
+                "enabled": False,
+                "configured": False,
+                "master_enabled": master_enabled,
+                "supported": False,
+                "persona_id": "",
+                "activity_today": None,
+                "summary": "群间学习尚未就绪",
+                "version": 0,
+            }
+        try:
+            sessions = self._effective_sessions()
+            configured = bool(scope and scope in sessions)
+            active = bool(scope and self.engine.allowed(scope))
+            persona_id = str(self.engine.current_personas.get(scope, "") or "")
+            version = int(self.engine.scope_projection_generation(scope)) if scope else 0
+            if not scope:
+                summary = (
+                    f"已配置 {len(sessions)} 个会话"
+                    if master_enabled
+                    else f"学习总开关已关闭（已配置 {len(sessions)} 个会话）"
+                )
+                return {
+                    "enabled": False,
+                    "configured": False,
+                    "master_enabled": master_enabled,
+                    "supported": True,
+                    "persona_id": "",
+                    "activity_today": 0,
+                    "summary": summary,
+                    "version": version,
+                }
+            now = time.time()
+            today_bounds = _date_window("today")
+            day_start, day_end = today_bounds if today_bounds is not None else (0.0, now + 1.0)
+            store = self.engine.store
+            with store.lock:
+                pending_row = store.db.execute(
+                    "SELECT count(*) FROM proposals WHERE scope=? AND state IN ('pending','reviewed')",
+                    (scope,),
+                ).fetchone()
+                active_row = store.db.execute(
+                    "SELECT count(*) FROM entries WHERE json_extract(body,'$.scope')=? "
+                    "AND json_extract(body,'$.active')=1 "
+                    "AND (json_extract(body,'$.category')='affection' OR json_extract(body,'$.expires')>?)",
+                    (scope, now),
+                ).fetchone()
+                today_row = store.db.execute(
+                    "SELECT count(*) FROM proposals WHERE scope=? AND updated>=? AND updated<?",
+                    (scope, day_start, day_end),
+                ).fetchone()
+            pending_count = int(pending_row[0]) if pending_row else 0
+            active_count = int(active_row[0]) if active_row else 0
+            activity_today = int(today_row[0]) if today_row else 0
+            if active:
+                summary = f"待审 {pending_count} · 有效资料 {active_count}"
+            elif configured and not master_enabled:
+                summary = f"总开关已关闭 · 已配置该群（待审 {pending_count} · 有效资料 {active_count}）"
+            elif not master_enabled:
+                summary = "总开关已关闭 · 未纳入生效会话"
+            else:
+                summary = "未纳入生效会话"
+            return {
+                "enabled": active,
+                "configured": configured,
+                "master_enabled": master_enabled,
+                "supported": True,
+                "persona_id": persona_id,
+                "activity_today": activity_today,
+                "summary": summary,
+                "version": version,
+            }
+        except Exception:
+            return {
+                "enabled": None,
+                "configured": False,
+                "master_enabled": master_enabled,
+                "supported": True,
+                "persona_id": "",
+                "activity_today": None,
+                "summary": "状态读取失败",
+                "version": 0,
+            }
+
+    def series_search_items(self, query: str, scope: str = "", limit: int = 8, persona: str = "") -> list[dict]:
+        """Lightweight read-only search across pending proposals and active learned entries."""
+        q = str(query or "").strip()[:128]
+        target_scope = str(scope or "").strip()[:512]
+        target_persona = str(persona or "").strip()[:256]
+        try:
+            max_items = max(1, min(20, int(limit or 8)))
+        except (TypeError, ValueError):
+            max_items = 8
+        if self.closed or not self.ready or self.engine is None or not q:
+            return []
+        if target_persona in _UNBOUND_PERSONA_SENTINELS:
+            return []
+        try:
+            allowed = tuple(self._effective_sessions())
+            if not allowed:
+                return []
+            if target_scope and target_scope not in allowed:
+                return []
+            q_lower = q.lower()
+            results: list[dict] = []
+            seen_ids: set[str] = set()
+            store = self.engine.store
+            allowed_json = encode(list(allowed))
+            with store.lock:
+                prop_rows = store.db.execute(
+                    """SELECT body FROM proposals
+                    WHERE state IN ('pending','reviewed')
+                    AND (?='' OR scope=?)
+                    AND (?='' OR persona=?)
+                    AND scope IN (SELECT value FROM json_each(?))
+                    AND instr(lower(body), ?) > 0
+                    ORDER BY updated DESC LIMIT ?""",
+                    (target_scope, target_scope, target_persona, target_persona, allowed_json, q_lower, max_items),
+                ).fetchall()
+                for row in prop_rows:
+                    p = json.loads(row[0])
+                    pid = str(p.get("id") or "")
+                    if not pid or pid in seen_ids:
+                        continue
+                    seen_ids.add(pid)
+                    cat = _CATEGORY_LABELS.get(p.get("category", ""), p.get("category", ""))
+                    member = p.get("member") or "全群"
+                    snippet = _value_snippet(p.get("value"), 64)
+                    results.append(
+                        {
+                            "kind": "learning_proposal",
+                            "title": f"待审 · {cat} · {p.get('key', '')}",
+                            "subtitle": f"{member} · {snippet}" if snippet else str(member),
+                            "plugin_id": PLUGIN,
+                            "page": "review",
+                            "deep_link": {"tab": "proposals", "scope": p.get("scope", ""), "id": pid},
+                        }
+                    )
+                    if len(results) >= max_items:
+                        return results
+
+                remaining = max_items - len(results)
+                if remaining > 0:
+                    now = time.time()
+                    entry_rows = store.db.execute(
+                        """SELECT body FROM entries
+                        WHERE json_extract(body,'$.active')=1
+                        AND (json_extract(body,'$.category')='affection' OR json_extract(body,'$.expires')>?)
+                        AND (?='' OR json_extract(body,'$.scope')=?)
+                        AND (?='' OR json_extract(body,'$.persona')=?)
+                        AND json_extract(body,'$.scope') IN (SELECT value FROM json_each(?))
+                        AND instr(lower(body), ?) > 0
+                        ORDER BY rowid DESC LIMIT ?""",
+                        (now, target_scope, target_scope, target_persona, target_persona, allowed_json, q_lower, remaining),
+                    ).fetchall()
+                    for row in entry_rows:
+                        e = json.loads(row[0])
+                        eid = str(e.get("id") or "")
+                        if not eid or eid in seen_ids:
+                            continue
+                        seen_ids.add(eid)
+                        cat = _CATEGORY_LABELS.get(e.get("category", ""), e.get("category", ""))
+                        member = e.get("member") or "全群"
+                        snippet = _value_snippet(e.get("value"), 64)
+                        results.append(
+                            {
+                                "kind": "learning_entry",
+                                "title": f"{cat} · {e.get('key', '')}",
+                                "subtitle": f"{member} · {snippet}" if snippet else str(member),
+                                "plugin_id": PLUGIN,
+                                "page": "review",
+                                "deep_link": {"tab": "entries", "scope": e.get("scope", ""), "id": eid},
+                            }
+                        )
+            return results
+        except Exception:
+            return []
+
+    def get_journal_events(
+        self,
+        persona: str = "",
+        scope: str = "",
+        date: str = "today",
+        limit: int = 20,
+        start_ts: float | None = None,
+        end_ts: float | None = None,
+    ) -> list[dict]:
+        """Read-only journal events for Dynamics World's Today's Living Journal feed."""
+        if self.closed or not self.ready or self.engine is None:
+            return []
+        try:
+            max_items = max(1, min(50, int(limit or 20)))
+        except (TypeError, ValueError):
+            max_items = 20
+        target_scope = str(scope or "").strip()[:512]
+        target_persona = str(persona or "").strip()[:256]
+        if target_persona in _UNBOUND_PERSONA_SENTINELS:
+            return []
+        try:
+            allowed = tuple(self._effective_sessions())
+            if not allowed:
+                return []
+            if target_scope and target_scope not in allowed:
+                return []
+            if target_scope and not target_persona:
+                bound_persona = str(self.engine.current_personas.get(target_scope, "") or "").strip()
+                if not bound_persona or bound_persona in _UNBOUND_PERSONA_SENTINELS:
+                    return []
+                target_persona = bound_persona
+            ok, bounds = _resolve_journal_window(date, start_ts, end_ts)
+            if not ok:
+                return []
+            allowed_json = encode(list(allowed))
+            store = self.engine.store
+            with store.lock:
+                sql = (
+                    "SELECT body FROM proposals "
+                    "WHERE state IN ('pending','reviewed','applied') "
+                )
+                params: list[object] = []
+                if bounds is not None:
+                    sql += "AND updated >= ? AND updated < ? "
+                    params.extend(bounds)
+                sql += (
+                    "AND (?='' OR scope=?) "
+                    "AND (?='' OR persona=?) "
+                    "AND scope IN (SELECT value FROM json_each(?)) "
+                    "ORDER BY updated DESC LIMIT ?"
+                )
+                params.extend(
+                    (
+                        target_scope,
+                        target_scope,
+                        target_persona,
+                        target_persona,
+                        allowed_json,
+                        max_items,
+                    )
+                )
+                rows = store.db.execute(sql, params).fetchall()
+            events: list[dict] = []
+            for row in rows:
+                p = json.loads(row[0])
+                pid = str(p.get("id") or "")
+                if not pid:
+                    continue
+                cat_key = str(p.get("category") or "")
+                cat = _CATEGORY_LABELS.get(cat_key, cat_key or "学习调整")
+                member = p.get("member") or "全群"
+                state = str(p.get("state") or "")
+                snippet = _value_snippet(p.get("value"), 72)
+                if state in {"pending", "reviewed"}:
+                    tone = "warm"
+                    title = f"观察到新提案：{cat} · {p.get('key', '')}"
+                    subtitle = f"{member} · 点击进入调整审查核对"
+                elif cat_key == "affection":
+                    tone = "info"
+                    title = f"好感度更新：{member}"
+                    subtitle = snippet or "已记录新的互动好感变化"
+                else:
+                    tone = "accent"
+                    title = f"已学会：{cat} · {p.get('key', '')}"
+                    subtitle = f"{member} · {snippet}" if snippet else str(member)
+                events.append(
+                    {
+                        "id": pid,
+                        "category": "learning",
+                        "source_label": "群间学习",
+                        "tone": tone,
+                        "occurred_at": _iso_timestamp(p.get("updated") or p.get("created")),
+                        "title": title,
+                        "subtitle": subtitle,
+                        "target_plugin": PLUGIN,
+                        "target_route": "review",
+                        "target_id": pid,
+                    }
+                )
+            return events
+        except Exception:
+            return []
 
     def peek_context_revision(self, scope):
         scope_key = str(scope.get("umo", ""))
@@ -653,14 +1097,14 @@ class DynamicsLearning(Star):
             if callable(attributed_call)
             else nullcontext()
         )
-        extra_kwargs = _text_chat_extra_kwargs(provider, self.config)
+        call_kwargs = dict(_text_chat_extra_kwargs(provider, self.config))
+        if _accepts_kwarg(provider.text_chat, "contexts"):
+            call_kwargs["contexts"] = _cache_anchor_contexts(instruction)
         async with asyncio.timeout(timeout):
             with attribution:
                 if review_dispatch:
                     self.engine.store.automatic_reviews.record_dispatch(review_dispatch)
-                response = await provider.text_chat(
-                    prompt=payload, system_prompt=instruction, contexts=[], **extra_kwargs
-                )
+                response = await provider.text_chat(prompt=payload, system_prompt=instruction, **call_kwargs)
         if (
             self.closed
             or self.context.get_provider_by_id(provider_id) is not provider
