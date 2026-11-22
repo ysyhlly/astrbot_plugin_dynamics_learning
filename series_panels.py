@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import inspect
+import math
 import re
 import subprocess
 import sys
+import threading
 import time
+from datetime import timedelta, timezone
 from importlib import import_module
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api.web import json_response, request
 
@@ -40,75 +44,6 @@ CATALOG = (
     ),
 )
 
-_SUMMARY_TTL_SECONDS = 10.0
-_SUMMARY_TONES = frozenset({"accent", "warm", "info", "danger", "muted"})
-_SUMMARY_CACHE: dict[tuple[str, int], tuple[float, dict | None]] = {}
-
-
-def invalidate_summary_cache(identity: str | None = None) -> None:
-    """Drop cached per-plugin summary badges (all plugins or one identity)."""
-    if identity is None:
-        _SUMMARY_CACHE.clear()
-        return
-    for key in [k for k in _SUMMARY_CACHE if k[0] == identity]:
-        _SUMMARY_CACHE.pop(key, None)
-
-
-def _sanitize_series_summary(raw) -> dict | None:
-    if not isinstance(raw, dict):
-        return None
-    badge_out = None
-    raw_badge = raw.get("badge")
-    if isinstance(raw_badge, dict):
-        raw_count = raw_badge.get("count", 0)
-        count = 0
-        if not isinstance(raw_count, bool):
-            try:
-                count = max(0, int(raw_count))
-            except (TypeError, ValueError):
-                count = 0
-        tone = str(raw_badge.get("tone") or "accent").strip().lower()
-        if tone not in _SUMMARY_TONES:
-            tone = "accent"
-        label = str(raw_badge.get("label") or "").strip()[:80]
-        badge_out = {"count": count, "tone": tone, "label": label}
-
-    pulse_out = None
-    raw_pulse = raw.get("pulse")
-    if isinstance(raw_pulse, dict):
-        headline = str(raw_pulse.get("headline") or "").strip()[:160]
-        updated_at = str(raw_pulse.get("updated_at") or "").strip()[:64]
-        pulse_out = {"headline": headline, "updated_at": updated_at}
-
-    if badge_out is None and pulse_out is None:
-        return None
-    return {"badge": badge_out, "pulse": pulse_out}
-
-
-def _read_series_summary(identity: str, owner) -> dict | None:
-    if owner is None:
-        return None
-    getter = getattr(owner, "get_series_summary", None)
-    if not callable(getter) or inspect.iscoroutinefunction(getter):
-        return None
-    now = time.monotonic()
-    cache_key = (identity, id(owner))
-    cached = _SUMMARY_CACHE.get(cache_key)
-    if cached is not None and (now - cached[0]) < _SUMMARY_TTL_SECONDS:
-        return cached[1]
-    summary = None
-    try:
-        raw = getter()
-        if inspect.isawaitable(raw):
-            if inspect.iscoroutine(raw):
-                raw.close()
-        else:
-            summary = _sanitize_series_summary(raw)
-    except Exception:
-        summary = None
-    _SUMMARY_CACHE[cache_key] = (now, summary)
-    return summary
-
 # These four IDs and titles mirror Dynamics Games' runtime.LEGACY_PLUGINS.
 LEGACY_CONFLICTS = (
     (
@@ -137,6 +72,141 @@ _SHARED_STR_KEYS = (
     "rhythm_timezone",
     "ui_language",
 )
+_SUMMARY_TTL_SECONDS = 10.0
+_VALID_BADGE_TONES = frozenset({"accent", "warm", "info", "danger", "muted"})
+_SUMMARY_CACHE_LOCK = threading.Lock()
+_SUMMARY_CACHE: dict[tuple[str, int], tuple[float, dict[str, object] | None]] = {}
+
+
+def invalidate_presence_cache(plugin_id: str | None = None) -> None:
+    """Drop cached get_series_summary() entries for one plugin or all plugins."""
+    with _SUMMARY_CACHE_LOCK:
+        if plugin_id is None:
+            _SUMMARY_CACHE.clear()
+        else:
+            for key in [k for k in _SUMMARY_CACHE if k[0] == plugin_id]:
+                _SUMMARY_CACHE.pop(key, None)
+
+
+invalidate_summary_cache = invalidate_presence_cache
+clear_summary_cache = invalidate_presence_cache
+invalidate_series_summary_cache = invalidate_presence_cache
+
+
+def _sanitize_summary(raw) -> dict[str, object] | None:
+    if not isinstance(raw, dict):
+        return None
+    badge = None
+    badge_raw = raw.get("badge")
+    if isinstance(badge_raw, dict):
+        count_raw = badge_raw.get("count", 0)
+        if (
+            isinstance(count_raw, bool)
+            or not isinstance(count_raw, (int, float))
+            or not math.isfinite(count_raw)
+        ):
+            count = 0
+        else:
+            count = max(0, int(count_raw))
+        tone_raw = badge_raw.get("tone")
+        tone = (
+            tone_raw.strip().lower()
+            if isinstance(tone_raw, str)
+            and tone_raw.strip().lower() in _VALID_BADGE_TONES
+            else "accent"
+        )
+        label_raw = badge_raw.get("label")
+        label = label_raw.strip()[:48] if isinstance(label_raw, str) else ""
+        if label or count > 0 or isinstance(tone_raw, str):
+            badge = {"count": count, "tone": tone, "label": label}
+
+    pulse = None
+    pulse_raw = raw.get("pulse")
+    if isinstance(pulse_raw, dict):
+        headline_raw = pulse_raw.get("headline")
+        updated_raw = pulse_raw.get("updated_at")
+        headline = headline_raw.strip()[:160] if isinstance(headline_raw, str) else ""
+        updated_at = updated_raw.strip()[:64] if isinstance(updated_raw, str) else ""
+        if headline or updated_at:
+            pulse = {"headline": headline, "updated_at": updated_at}
+
+    if badge is None and pulse is None:
+        return None
+    return {"badge": badge, "pulse": pulse}
+
+
+def _read_plugin_summary(
+    identity: str,
+    owner,
+    *,
+    ttl: float = _SUMMARY_TTL_SECONDS,
+    force_refresh: bool = False,
+) -> dict[str, object] | None:
+    if owner is None:
+        return None
+    getter = getattr(owner, "get_series_summary", None)
+    if not callable(getter) or inspect.iscoroutinefunction(getter):
+        return None
+    now = time.monotonic()
+    cache_key = (identity, id(owner))
+    if not force_refresh and ttl > 0:
+        with _SUMMARY_CACHE_LOCK:
+            cached = _SUMMARY_CACHE.get(cache_key)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+    summary = None
+    try:
+        raw = getter()
+        if inspect.isawaitable(raw):
+            if inspect.iscoroutine(raw):
+                raw.close()
+        else:
+            summary = _sanitize_summary(raw)
+    except Exception:
+        summary = None
+    if ttl > 0:
+        with _SUMMARY_CACHE_LOCK:
+            if len(_SUMMARY_CACHE) > 64:
+                expired = [k for k, (exp, _val) in _SUMMARY_CACHE.items() if exp <= now]
+                for k in expired:
+                    _SUMMARY_CACHE.pop(k, None)
+                if len(_SUMMARY_CACHE) > 64:
+                    _SUMMARY_CACHE.clear()
+            _SUMMARY_CACHE[cache_key] = (now + ttl, summary)
+    return summary
+
+
+def find_plugin_owner(context, identity: str):
+    """Return the active, non-conflicting Star instance for ``identity``, or ``None``."""
+    if context is None or not identity:
+        return None
+    registered_entries = _iter_registered_entries(context)
+    if registered_entries:
+        matches = []
+        for names, row in registered_entries:
+            if identity in names and all(existing is not row for existing in matches):
+                matches.append(row)
+        if len(matches) == 1:
+            row = matches[0]
+            if value(row, "activated", False) is not True:
+                return None
+            return _extract_owner(row)
+        if len(matches) > 1:
+            return None
+    get_star = getattr(context, "get_registered_star", None)
+    if callable(get_star) and not inspect.iscoroutinefunction(get_star):
+        try:
+            star = get_star(identity)
+        except Exception:
+            return None
+        if inspect.isawaitable(star):
+            if inspect.iscoroutine(star):
+                star.close()
+            return None
+        if star is None or value(star, "activated", True) is False:
+            return None
+        return _extract_owner(star)
+    return None
 
 
 def value(row, key, default=None):
@@ -387,7 +457,306 @@ def inherit_provider(explicit, context, role: str = "reply") -> str:
     return str(defaults.get("reply_provider") or "")
 
 
-def presence(context, current, root=None):
+class ProviderBudgetBusyError(RuntimeError):
+    """Raised when the shared ProviderBudget queue is full or acquire_timeout elapses."""
+
+    is_provider_budget_busy = True
+
+    def __init__(
+        self,
+        message: str = "Provider admission queue is busy",
+        *,
+        provider: str = "",
+        purpose: str = "",
+        reason: str = "busy",
+    ) -> None:
+        super().__init__(message)
+        self.provider = str(provider or "")
+        self.purpose = str(purpose or "")
+        self.reason = str(reason or "busy")
+
+
+def is_provider_budget_busy_error(exc: BaseException | None) -> bool:
+    """Identify a ProviderBudgetBusyError even across plugin module boundaries."""
+    if exc is None:
+        return False
+    return bool(
+        isinstance(exc, ProviderBudgetBusyError)
+        or getattr(exc, "is_provider_budget_busy", False)
+        or type(exc).__name__ == "ProviderBudgetBusyError"
+    )
+
+
+def get_series_shared_config(context) -> dict:
+    """Return sanitized shared defaults from chat_dynamics, or ``{}`` when absent."""
+    return get_series_defaults(context)
+
+
+def _valid_zoneinfo(name: str):
+    clean = str(name or "").strip()
+    if not clean:
+        return None
+    try:
+        return ZoneInfo(clean)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return None
+
+
+def resolve_series_timezone_name(
+    context, explicit_tz: str = "", default_tz: str = "Asia/Shanghai"
+) -> str:
+    """Resolve normalized IANA timezone name: explicit > chat_dynamics > default > Asia/Shanghai."""
+    shared = get_series_shared_config(context)
+    candidates = (
+        explicit_tz,
+        shared.get("rhythm_timezone", "") if isinstance(shared, dict) else "",
+        default_tz,
+        "Asia/Shanghai",
+        "UTC",
+    )
+    for candidate in candidates:
+        clean = str(candidate or "").strip()
+        if not clean:
+            continue
+        if _valid_zoneinfo(clean) is not None:
+            return clean
+    return "UTC"
+
+
+def resolve_series_timezone(
+    context, explicit_tz: str = "", default_tz: str = "Asia/Shanghai"
+):
+    """Resolve a tzinfo (ZoneInfo when available): explicit > chat_dynamics > default."""
+    name = resolve_series_timezone_name(
+        context, explicit_tz=explicit_tz, default_tz=default_tz
+    )
+    tz = _valid_zoneinfo(name)
+    if tz is not None:
+        return tz
+    if name == "Asia/Shanghai":
+        return timezone(timedelta(hours=8))
+    return timezone.utc
+
+
+def resolve_series_provider(
+    context,
+    explicit_provider: str = "",
+    fallback_provider: str = "",
+    *,
+    role: str = "reply",
+) -> str:
+    """Resolve provider ID: explicit > chat_dynamics shared provider > fallback > ''."""
+    own = explicit_provider.strip() if isinstance(explicit_provider, str) else ""
+    if own:
+        return own
+    inherited = inherit_provider("", context, role=role)
+    if inherited:
+        return inherited
+    return fallback_provider.strip() if isinstance(fallback_provider, str) else ""
+
+
+def is_series_group_excluded(context, umo: str = "", group_id: str = "") -> bool:
+    """Return True if the group/UMO is listed in chat_dynamics exclude_groups."""
+    shared = get_series_shared_config(context)
+    raw_excluded = shared.get("exclude_groups") if isinstance(shared, dict) else None
+    if not raw_excluded:
+        return False
+    excluded = _normalize_str_list(raw_excluded)
+    if not excluded:
+        return False
+    clean_umo = str(umo or "").strip()
+    clean_gid = str(group_id or "").strip()
+    if not clean_gid and ":" in clean_umo:
+        clean_gid = clean_umo.rsplit(":", 1)[-1].strip()
+    if not clean_umo and not clean_gid:
+        return False
+    for entry in excluded:
+        if clean_umo and entry == clean_umo:
+            return True
+        if clean_gid and entry == clean_gid:
+            return True
+        if not clean_umo and clean_gid and ":" in entry:
+            if entry.rsplit(":", 1)[-1].strip() == clean_gid:
+                return True
+    return False
+
+
+def is_series_in_quiet_hours(context) -> bool:
+    """Return True when chat_dynamics reports active quiet/sleep hours."""
+    shared = get_series_shared_config(context)
+    quiet = shared.get("quiet_hours") if isinstance(shared, dict) else None
+    if isinstance(quiet, dict):
+        return bool(quiet.get("in_quiet_hours", False))
+    return False
+
+
+def _is_error_llm_response(response) -> bool:
+    if response is None:
+        return False
+    return str(getattr(response, "role", "") or "").strip().lower() == "err"
+
+
+def record_series_llm_usage(
+    context,
+    *,
+    plugin_id: str,
+    provider_id: str,
+    purpose: str,
+    response=None,
+    queue_seconds: float = 0.0,
+    generation_seconds: float = 0.0,
+    ok: bool = True,
+    error_type: str = "",
+) -> bool:
+    """Report one LLM call's usage & timing to chat_dynamics telemetry if present."""
+    if context is None:
+        return False
+    telemetry = getattr(context, "_chat_dynamics_series_telemetry", None)
+    if telemetry is None:
+        budget = getattr(context, "_chat_dynamics_provider_budget", None)
+        telemetry = getattr(budget, "telemetry", None) if budget is not None else None
+    recorder = getattr(telemetry, "record", None) if telemetry is not None else None
+    if not callable(recorder):
+        return False
+    try:
+        recorder(
+            plugin_id=str(plugin_id or "unknown").strip() or "unknown",
+            provider_id=str(provider_id or "default").strip() or "default",
+            purpose=str(purpose or "background").strip() or "background",
+            response=response,
+            queue_seconds=max(0.0, float(queue_seconds or 0.0)),
+            generation_seconds=max(0.0, float(generation_seconds or 0.0)),
+            ok=bool(ok),
+            error_type=str(error_type or "").strip()[:64],
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def series_llm_call(
+    context,
+    provider_id: str,
+    plugin_id: str,
+    purpose: str,
+    invoke,
+    *,
+    acquire_timeout: float | None = 15.0,
+):
+    """Run an LLM call via shared ProviderBudget when present, else directly.
+
+    Translates cross-plugin ``ProviderBudgetBusyError`` into this module's
+    ``ProviderBudgetBusyError`` so companion plugins can catch it without
+    importing ``astrbot_plugin_chat_dynamics``.
+    """
+    clean_provider = str(provider_id or "").strip() or "default"
+    clean_plugin = str(plugin_id or "").strip() or "unknown"
+    clean_purpose = str(purpose or "").strip() or "background"
+    budget = (
+        getattr(context, "_chat_dynamics_provider_budget", None)
+        if context is not None
+        else None
+    )
+    runner = getattr(budget, "run", None) if budget is not None else None
+    if callable(runner) and inspect.iscoroutinefunction(runner):
+        if getattr(budget, "supports_series_telemetry", False) is True:
+            try:
+                return await runner(
+                    clean_provider,
+                    clean_purpose,
+                    invoke,
+                    plugin_id=clean_plugin,
+                    acquire_timeout=acquire_timeout,
+                )
+            except BaseException as exc:
+                if is_provider_budget_busy_error(exc):
+                    if isinstance(exc, ProviderBudgetBusyError):
+                        raise
+                    raise ProviderBudgetBusyError(
+                        str(exc),
+                        provider=getattr(exc, "provider", clean_provider),
+                        purpose=getattr(exc, "purpose", clean_purpose),
+                        reason=getattr(exc, "reason", "busy"),
+                    ) from exc
+                raise
+        started = time.monotonic()
+        try:
+            result = await runner(clean_provider, clean_purpose, invoke)
+        except BaseException as exc:
+            elapsed = max(0.0, time.monotonic() - started)
+            if is_provider_budget_busy_error(exc):
+                record_series_llm_usage(
+                    context,
+                    plugin_id=clean_plugin,
+                    provider_id=clean_provider,
+                    purpose=clean_purpose,
+                    queue_seconds=elapsed,
+                    ok=False,
+                    error_type=f"budget_{getattr(exc, 'reason', 'busy')}",
+                )
+                if isinstance(exc, ProviderBudgetBusyError):
+                    raise
+                raise ProviderBudgetBusyError(
+                    str(exc),
+                    provider=getattr(exc, "provider", clean_provider),
+                    purpose=getattr(exc, "purpose", clean_purpose),
+                    reason=getattr(exc, "reason", "busy"),
+                ) from exc
+            record_series_llm_usage(
+                context,
+                plugin_id=clean_plugin,
+                provider_id=clean_provider,
+                purpose=clean_purpose,
+                generation_seconds=elapsed,
+                ok=False,
+                error_type=type(exc).__name__,
+            )
+            raise
+        elapsed = max(0.0, time.monotonic() - started)
+        is_err = _is_error_llm_response(result)
+        record_series_llm_usage(
+            context,
+            plugin_id=clean_plugin,
+            provider_id=clean_provider,
+            purpose=clean_purpose,
+            response=result,
+            generation_seconds=elapsed,
+            ok=not is_err,
+            error_type="host_error_response" if is_err else "",
+        )
+        return result
+
+    started = time.monotonic()
+    try:
+        value = invoke()
+        result = await value if inspect.isawaitable(value) else value
+    except BaseException as exc:
+        record_series_llm_usage(
+            context,
+            plugin_id=clean_plugin,
+            provider_id=clean_provider,
+            purpose=clean_purpose,
+            generation_seconds=max(0.0, time.monotonic() - started),
+            ok=False,
+            error_type=type(exc).__name__,
+        )
+        raise
+    elapsed = max(0.0, time.monotonic() - started)
+    is_err = _is_error_llm_response(result)
+    record_series_llm_usage(
+        context,
+        plugin_id=clean_plugin,
+        provider_id=clean_provider,
+        purpose=clean_purpose,
+        response=result,
+        generation_seconds=elapsed,
+        ok=not is_err,
+        error_type="host_error_response" if is_err else "",
+    )
+    return result
+
+
+def presence(context, current, root=None, *, force_refresh: bool = False):
     root = Path(root) if root else Path(__file__).resolve().parent.parent
     registered_entries = _iter_registered_entries(context)
     output = []
@@ -487,8 +856,10 @@ def presence(context, current, root=None):
                             )
                     except Exception as exc:
                         data.update(state="error", error=type(exc).__name__)
-                summary = _read_series_summary(identity, owner)
-                if summary is not None:
+                summary = _read_plugin_summary(
+                    identity, owner, force_refresh=force_refresh
+                )
+                if summary:
                     data["badge"] = summary.get("badge")
                     data["pulse"] = summary.get("pulse")
         output.append(data)
@@ -559,8 +930,21 @@ class SeriesPanels:
             )
             if not username or expected and username != expected:
                 raise PermissionError()
+            query = getattr(request, "query", None) or {}
+            refresh_flag = str(query.get("refresh") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            if refresh_flag:
+                invalidate_presence_cache()
             return json_response(
-                {"status": "ok", "data": presence(self.owner.context, self.identity)}
+                {
+                    "status": "ok",
+                    "data": presence(
+                        self.owner.context, self.identity, force_refresh=refresh_flag
+                    ),
+                }
             )
         except PermissionError:
             return json_response(

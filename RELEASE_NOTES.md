@@ -1,4 +1,10 @@
-# astrbot_plugin_dynamics_learning v2.0.0-rc.5
+# astrbot_plugin_dynamics_learning v2.0.0-rc.6
+
+## v2.0.0-rc.6 — 2026-11-22
+
+- 接入全系列共享 `ProviderBudget` 并发池与遥测上报（`main.py` 经 `series_llm_call` 调用，队列繁忙时优雅延后为 `ReviewUnavailable`）。
+- 下沉主控共享配置（SSOT）：手账与日统计窗口统一解析共享时区；模型解析遵循「显式配置 > 主控 `reply_provider`/`decision_provider` > 宿主默认」；观察、注入与总控矩阵全面联动 `exclude_groups` 排除护栏。
+- 同步按语言拆包的 `series-messages.js` 轻加载器（`series-messages-{en,ja,ru}.js` 按需懒加载）及统一 `series_panels.py`。
 
 ## v2.0.0-rc.5 — 2026-11-21
 

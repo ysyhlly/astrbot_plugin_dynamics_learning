@@ -8,7 +8,7 @@ ensure_current(
     __package__,
     __name__,
     __file__,
-    version="2.0.0-rc.5+cost.1",
+    version="2.0.0-rc.6",
     checks=[
         ("core.engine", "Engine", "_review_contract_v1"),
         ("core.engine", "Engine", "_automatic_review_contract_v1"),
@@ -45,7 +45,15 @@ from .core.review_evidence import provider_model
 from .core.social import Social, character_key, observed_event
 from .core.source_withdrawals import recall_source
 from .core.store import Store
-from .series_panels import get_series_defaults, inherit_provider, inherit_umos
+from .series_panels import (
+    get_series_defaults,
+    inherit_umos,
+    is_provider_budget_busy_error,
+    is_series_group_excluded,
+    resolve_series_provider,
+    resolve_series_timezone,
+    series_llm_call,
+)
 
 PLUGIN = "astrbot_plugin_dynamics_learning"
 MIN_SAFE_MODEL_MAX_TOKENS = 1536
@@ -72,22 +80,26 @@ _TZ_SHANGHAI = timezone(timedelta(hours=8))
 _UNBOUND_PERSONA_SENTINELS = frozenset({"__none__", "[%None]"})
 
 
-def _iso_timestamp(ts: float | None = None) -> str:
+def _iso_timestamp(ts: float | None = None, *, tz=None) -> str:
+    zone = tz or _TZ_SHANGHAI
     stamp = time.time() if ts is None else float(ts)
-    return datetime.fromtimestamp(stamp, tz=_TZ_SHANGHAI).isoformat(timespec="seconds")
+    return datetime.fromtimestamp(stamp, tz=zone).isoformat(timespec="seconds")
 
 
-def _date_window(date_str: str, *, now_ts: float | None = None) -> tuple[float, float] | None:
+def _date_window(
+    date_str: str, *, now_ts: float | None = None, tz=None
+) -> tuple[float, float] | None:
+    zone = tz or _TZ_SHANGHAI
     clean = str(date_str or "today").strip().lower()
     if clean in {"", "today"}:
         stamp = time.time() if now_ts is None else float(now_ts)
-        now = datetime.fromtimestamp(stamp, tz=_TZ_SHANGHAI)
+        now = datetime.fromtimestamp(stamp, tz=zone)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return start.timestamp(), start.timestamp() + 86400.0
+        return start.timestamp(), (start + timedelta(days=1)).timestamp()
     try:
-        parsed = datetime.strptime(clean, "%Y-%m-%d").replace(tzinfo=_TZ_SHANGHAI)
+        parsed = datetime.strptime(clean, "%Y-%m-%d").replace(tzinfo=zone)
         start = parsed.replace(hour=0, minute=0, second=0, microsecond=0)
-        return start.timestamp(), start.timestamp() + 86400.0
+        return start.timestamp(), (start + timedelta(days=1)).timestamp()
     except ValueError:
         return None
 
@@ -98,6 +110,7 @@ def _resolve_journal_window(
     end_ts: float | None = None,
     *,
     now_ts: float | None = None,
+    tz=None,
 ) -> tuple[bool, tuple[float, float] | None]:
     if start_ts is not None or end_ts is not None:
         if (
@@ -115,7 +128,7 @@ def _resolve_journal_window(
     clean = str(date_str or "today").strip().lower()
     if clean in {"all", "*"}:
         return True, None
-    bounds = _date_window(clean, now_ts=now_ts)
+    bounds = _date_window(clean, now_ts=now_ts, tz=tz)
     if bounds is None:
         return False, None
     return True, bounds
@@ -259,7 +272,9 @@ class DynamicsLearning(Star):
         if explicit:
             return explicit
         if role == "analysis_provider":
-            return inherit_provider("", self.context, role="reply")
+            return resolve_series_provider(
+                self.context, "", role="reply"
+            ) or Engine._host_default_provider_id(self.context)
         if role == "review_provider":
             defaults = get_series_defaults(self.context)
             candidate = str(defaults.get("decision_provider") or "").strip()
@@ -268,7 +283,9 @@ class DynamicsLearning(Star):
                 provider = getter(candidate) if callable(getter) else None
                 if provider is None or not getattr(provider, "is_native_decision_provider", False):
                     return candidate
-            return str(defaults.get("reply_provider") or "").strip()
+            return str(defaults.get("reply_provider") or "").strip() or Engine._host_default_provider_id(
+                self.context
+            )
         return ""
 
     def _provider_status(self):
@@ -356,7 +373,8 @@ class DynamicsLearning(Star):
 
     def get_series_summary(self) -> dict:
         """Synchronous, read-only badge and pulse summary for series_presence v2."""
-        updated_at = _iso_timestamp()
+        tz = resolve_series_timezone(self.context)
+        updated_at = _iso_timestamp(tz=tz)
         if self.closed or not self.ready or self.engine is None:
             return {
                 "badge": {"count": 0, "tone": "muted", "label": "未就绪"},
@@ -406,7 +424,8 @@ class DynamicsLearning(Star):
         try:
             sessions = self._effective_sessions()
             configured = bool(scope and scope in sessions)
-            active = bool(scope and self.engine.allowed(scope))
+            excluded_by_core = bool(scope and is_series_group_excluded(self.context, umo=scope))
+            active = bool(scope and not excluded_by_core and self.engine.allowed(scope))
             persona_id = str(self.engine.current_personas.get(scope, "") or "")
             version = int(self.engine.scope_projection_generation(scope)) if scope else 0
             if not scope:
@@ -418,6 +437,7 @@ class DynamicsLearning(Star):
                 return {
                     "enabled": False,
                     "configured": False,
+                    "excluded_by_core": False,
                     "master_enabled": master_enabled,
                     "supported": True,
                     "persona_id": "",
@@ -426,7 +446,8 @@ class DynamicsLearning(Star):
                     "version": version,
                 }
             now = time.time()
-            today_bounds = _date_window("today")
+            tz = resolve_series_timezone(self.context)
+            today_bounds = _date_window("today", tz=tz)
             day_start, day_end = today_bounds if today_bounds is not None else (0.0, now + 1.0)
             store = self.engine.store
             with store.lock:
@@ -447,7 +468,9 @@ class DynamicsLearning(Star):
             pending_count = int(pending_row[0]) if pending_row else 0
             active_count = int(active_row[0]) if active_row else 0
             activity_today = int(today_row[0]) if today_row else 0
-            if active:
+            if excluded_by_core:
+                summary = "主控排除"
+            elif active:
                 summary = f"待审 {pending_count} · 有效资料 {active_count}"
             elif configured and not master_enabled:
                 summary = f"总开关已关闭 · 已配置该群（待审 {pending_count} · 有效资料 {active_count}）"
@@ -458,6 +481,7 @@ class DynamicsLearning(Star):
             return {
                 "enabled": active,
                 "configured": configured,
+                "excluded_by_core": excluded_by_core,
                 "master_enabled": master_enabled,
                 "supported": True,
                 "persona_id": persona_id,
@@ -602,7 +626,8 @@ class DynamicsLearning(Star):
                 if not bound_persona or bound_persona in _UNBOUND_PERSONA_SENTINELS:
                     return []
                 target_persona = bound_persona
-            ok, bounds = _resolve_journal_window(date, start_ts, end_ts)
+            tz = resolve_series_timezone(self.context)
+            ok, bounds = _resolve_journal_window(date, start_ts, end_ts, tz=tz)
             if not ok:
                 return []
             allowed_json = encode(list(allowed))
@@ -662,7 +687,7 @@ class DynamicsLearning(Star):
                         "category": "learning",
                         "source_label": "群间学习",
                         "tone": tone,
-                        "occurred_at": _iso_timestamp(p.get("updated") or p.get("created")),
+                        "occurred_at": _iso_timestamp(p.get("updated") or p.get("created"), tz=tz),
                         "title": title,
                         "subtitle": subtitle,
                         "target_plugin": PLUGIN,
@@ -823,6 +848,10 @@ class DynamicsLearning(Star):
     async def get_social_context(
         self, scope, participants, purpose="reply", card_version="", card_context=None, **kwargs
     ):
+        if isinstance(scope, dict) and is_series_group_excluded(
+            self.context, umo=str(scope.get("umo", "") or "")
+        ):
+            return {"schema_version": 1, "available": False, "items": []}
         if self.config.get("replace_selflearning", False):
             if (
                 not self.ready
@@ -899,6 +928,10 @@ class DynamicsLearning(Star):
     @filter.on_llm_request(priority=2)
     async def inject_social_context(self, event: AstrMessageEvent, req=None):
         if req is None or not self.ready or not replacement_allowed(self):
+            return
+        if is_series_group_excluded(
+            self.context, umo=str(getattr(event, "unified_msg_origin", "") or "")
+        ):
             return
         owned = getattr(event, "_chat_dynamics_owned_request", False) is True
         if owned and ":GroupMessage:" in str(getattr(event, "unified_msg_origin", "")):
@@ -1029,6 +1062,10 @@ class DynamicsLearning(Star):
     async def observe_group_message(self, event: AstrMessageEvent):
         if self.closed or not self.engine or not self.engine.social:
             return
+        if is_series_group_excluded(
+            self.context, umo=str(getattr(event, "unified_msg_origin", "") or "")
+        ):
+            return
         try:
             self.engine.capture_message(native_message(event))
             observed = observed_event(
@@ -1100,11 +1137,24 @@ class DynamicsLearning(Star):
         call_kwargs = dict(_text_chat_extra_kwargs(provider, self.config))
         if _accepts_kwarg(provider.text_chat, "contexts"):
             call_kwargs["contexts"] = _cache_anchor_contexts(instruction)
-        async with asyncio.timeout(timeout):
-            with attribution:
-                if review_dispatch:
-                    self.engine.store.automatic_reviews.record_dispatch(review_dispatch)
-                response = await provider.text_chat(prompt=payload, system_prompt=instruction, **call_kwargs)
+        try:
+            async with asyncio.timeout(timeout):
+                with attribution:
+                    if review_dispatch:
+                        self.engine.store.automatic_reviews.record_dispatch(review_dispatch)
+                    response = await series_llm_call(
+                        self.context,
+                        provider_id,
+                        PLUGIN,
+                        role.removesuffix("_provider"),
+                        lambda: provider.text_chat(prompt=payload, system_prompt=instruction, **call_kwargs),
+                    )
+        except Exception as exc:
+            if is_provider_budget_busy_error(exc):
+                raise ReviewUnavailable(
+                    f"共享模型并发池繁忙 ({getattr(exc, 'reason', 'busy')})"
+                ) from exc
+            raise
         if (
             self.closed
             or self.context.get_provider_by_id(provider_id) is not provider
