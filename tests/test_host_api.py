@@ -34,7 +34,7 @@ def test_sdk_lifecycle_and_scoped_unregister(tmp_path, monkeypatch):
         context = Context()
         plugin = DynamicsLearning(context, {"sessions": []})
         await plugin.initialize()
-        assert len(context.registered_web_apis) == 30
+        assert len(context.registered_web_apis) == 31
         assert {row[0].split("/series_workspace/")[1] for row in context.registered_web_apis
                 if "/series_workspace/" in row[0]} == {"open/<target>", "panel/<target>/<path:operation>"}
         assert plugin.learning_capabilities()["ready"]
@@ -74,7 +74,7 @@ def test_model_reload_invalidates_response():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('endpoint',['overview','review_queue','group_batch_action','group_batch_review','group_batch_reject','review_batch_jobs','review_batch_control','reply_preview','library','material_detail','governance_action'])
+@pytest.mark.parametrize('endpoint',['overview','review_queue','group_batch_action','group_batch_review','group_batch_reject','review_batch_jobs','review_batch_control','reply_preview','library','material_detail','governance_action','archive_stale'])
 def test_api_rejects_unauthenticated_requests(monkeypatch,endpoint):
     async def run():
         plugin = DynamicsLearning(Context(), {})

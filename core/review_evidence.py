@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+from ..series_panels import find_provider_silently
 from .contract import MODEL_INPUT_LIMIT, candidate, digest, encode, policy_allowed
 
 DEFER_FINGERPRINT = "review_defer_fingerprint"
@@ -104,15 +105,20 @@ def provider_model(provider):
 
 def _route(engine):
     provider_id = engine.provider_for("review_provider")
-    getter = getattr(getattr(engine, "_host_context", None), "get_provider_by_id", None)
-    provider = getter(provider_id) if provider_id and callable(getter) else None
+    host_context = getattr(engine, "_host_context", None)
+    has_lookup = host_context is not None and (
+        getattr(host_context, "provider_manager", None) is not None
+        or callable(getattr(host_context, "get_all_providers", None))
+        or callable(getattr(host_context, "get_provider_by_id", None))
+    )
+    provider = find_provider_silently(host_context, provider_id) if provider_id and has_lookup else None
     config = getattr(provider, "provider_config", None) or {}
     route = {
         key: str(config[key])
         for key in ("type", "api_base", "base_url", "provider_source_id")
         if config.get(key)
     }
-    ready = not callable(getter) or (
+    ready = not has_lookup or (
         callable(getattr(provider, "text_chat", None))
         and not getattr(provider, "is_native_decision_provider", False)
     )

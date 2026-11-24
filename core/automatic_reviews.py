@@ -8,14 +8,16 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 
+from .. import series_panels
 from .contract import MODEL_INPUT_LIMIT, MalformedModelResponse, encode, review_result
 from .model_projection import REVIEW_BATCH_PAYLOAD_BUDGET, build_batch_review_payload, utf8_len
-from .review_batches import ReviewUnavailable
+from .review_batches import ReviewDeferred, ReviewUnavailable
 from .store import Conflict
 
 MAX_ITEMS = 4
 WAIT_SECONDS = 300
 DEFAULT_COALESCE_SECONDS = 15.0
+BUDGET_BACKOFF_STEPS = (60.0, 120.0, 300.0)
 BATCH_OUTPUT = """
 逐项独立审查 proposals 数组。每项只能使用自己 proposal 的信息、引用证据、before
 及自己的 target_material，禁止以其它提案的内容、结论或证据互相佐证。
@@ -112,6 +114,48 @@ class AutomaticReviews:
         self.running = False
         self.reconcile = True
         self.wait_seconds = WAIT_SECONDS
+        self._budget_backoff_until = 0.0
+        self._budget_backoff_streak = 0
+
+    def _provider_circuit_remaining(self) -> float:
+        ctx = getattr(self.engine, "_host_context", None)
+        if ctx is None:
+            return 0.0
+        pid = self.engine.provider_for("review_provider") if hasattr(self.engine, "provider_for") else ""
+        if not pid:
+            return 0.0
+        probe = getattr(series_panels, "provider_circuit_remaining", lambda _c, _p: 0.0)
+        try:
+            return max(0.0, float(probe(ctx, pid) or 0.0))
+        except Exception:
+            return 0.0
+
+    def note_budget_busy(self, exc_or_retry_after=None, *, now: float | None = None) -> float:
+        stamp = time.time() if now is None else float(now)
+        if isinstance(exc_or_retry_after, BaseException):
+            retry_after = max(0.0, float(getattr(exc_or_retry_after, "retry_after", 0.0) or 0.0))
+        else:
+            retry_after = max(0.0, float(exc_or_retry_after or 0.0))
+        step = BUDGET_BACKOFF_STEPS[min(self._budget_backoff_streak, len(BUDGET_BACKOFF_STEPS) - 1)]
+        wait = max(step, retry_after)
+        self._budget_backoff_streak += 1
+        until = stamp + wait
+        self._budget_backoff_until = max(self._budget_backoff_until, until)
+        return self._budget_backoff_until
+
+    def reset_budget_backoff(self) -> None:
+        self._budget_backoff_streak = 0
+        self._budget_backoff_until = 0.0
+
+    def budget_backoff_remaining(self, *, now: float | None = None) -> float:
+        stamp = time.time() if now is None else float(now)
+        circuit_rem = self._provider_circuit_remaining()
+        if circuit_rem > 0:
+            self._budget_backoff_until = max(self._budget_backoff_until, stamp + circuit_rem)
+        return max(0.0, self._budget_backoff_until - stamp)
+
+    def is_budget_backed_off(self, *, now: float | None = None) -> bool:
+        return self.budget_backoff_remaining(now=now) > 0.0
 
     @property
     def enabled(self):
@@ -262,9 +306,12 @@ class AutomaticReviews:
                     "review_provider", "", {"scope": rows[0][0]["scope"]}, prepare=prepare
                 )
             except MalformedModelResponse:
+                self.reset_budget_backoff()
                 if len(sent) <= 1:
                     raise
                 raw = None
+            else:
+                self.reset_budget_backoff()
             if len(sent) > 1:
                 verdicts = batch_verdicts(raw, {item.proposal["id"] for item in sent})
             else:
@@ -292,11 +339,16 @@ class AutomaticReviews:
                 except Exception as exc:
                     self.engine.last_error = type(exc).__name__
                     retry = time.time() + self.engine.review_retry_interval()
+        except ReviewDeferred as exc:
+            retry = self.note_budget_busy(exc)
         except ReviewUnavailable:
             pass
         except Exception as exc:
-            self.engine.last_error = type(exc).__name__
-            retry = time.time() + self.engine.review_retry_interval()
+            if series_panels.is_provider_budget_busy_error(exc):
+                retry = self.note_budget_busy(exc)
+            else:
+                self.engine.last_error = type(exc).__name__
+                retry = time.time() + self.engine.review_retry_interval()
         finally:
             await self.engine.review_write(lambda: self.queue.release(lease, retry))
 
@@ -317,7 +369,10 @@ class AutomaticReviews:
                 interval = self.engine.review_retry_interval()
                 delay = interval if self.enabled else 5
                 slots = 2 - len(self.active)
-                if self.enabled and slots:
+                backoff_rem = self.budget_backoff_remaining() if self.enabled else 0.0
+                if backoff_rem > 0.0:
+                    delay = backoff_rem
+                elif self.enabled and slots:
                     busy = {pid for pids in self.active.values() for pid in pids}
                     now = time.time()
                     discover = self.reconcile or now >= next_reconcile

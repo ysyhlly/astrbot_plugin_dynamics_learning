@@ -54,6 +54,13 @@ function selectionStatus(){
  $('#selection-note').textContent=selected?`已选择 ${selected} 项${groupReview()?'（可跨页'+(reviewGroupKey?'':' · 自动按群分组')+'）':''}`:`批准前核对变更，每次最多 ${batchLimit()} 项`;
  const candidates=selected?[...reviewSelectionRows.values()]:visibleReviews();
  for(const [action,id,label] of [['review','preview-batch-review','LLM 审查'],['reject','preview-batch-reject','拒绝'],['archive','preview-batch-archive','归档'],['release','preview-batch-release','交回自动']]){const b=$('#'+id),count=candidates.filter(p=>actionAllowed(p,action)).length;b.hidden=!batchActions()||(action==='archive'&&reviewView!=='stale')||(action==='release'&&reviewView!=='held');b.disabled=reviewBusy||!scopeEnabled||!count;b.textContent=`${label}${selected?'所选':'本页'}（${count}）`;}
+ const archiveAllBtn=$('#archive-all-stale');
+ if(archiveAllBtn){
+  const staleTotal=queueData?.stale_total??0;
+  archiveAllBtn.hidden=!batchActions()||reviewView!=='stale'||!reviewGroupKey||!staleTotal;
+  archiveAllBtn.disabled=reviewBusy||!reviewGroupKey||!staleTotal;
+  archiveAllBtn.textContent=`一键归档本群失效（${staleTotal}）`;
+ }
  if(batchActions()){const count=candidates.filter(canApprove).length;$('#preview-batch').disabled=reviewBusy||!scopeEnabled||!count;$('#preview-batch').textContent=`批准${selected?'所选':'本页'}（${count}）`;}
  for(const c of document.querySelectorAll('.review-item'))c.classList.toggle('is-selected',reviewSelected.has(c.dataset.proposalId));
 }
@@ -151,25 +158,31 @@ function proposalDetails(p){
  body.append(el('p','muted',msg('展开后加载')));let loaded=false,loading=false;
  d.addEventListener('toggle',async()=>{if(!d.open||loaded||loading)return;loading=true;body.setAttribute('aria-busy','true');try{const full=await api('apiPost','proposal_detail',{id:p.id});body.replaceChildren(evidenceBody(full.evidence),details(msg('完整审查意见'),full.reviews),details(msg('应用前后观察'),full.observations));loaded=true;}catch(e){body.replaceChildren(el('p','',e.message));}finally{loading=false;body.removeAttribute('aria-busy');}});return d;
 }
-function updatePendingTabBadge(pendingCount) {
+function updatePendingTabBadge(pendingCount, staleCount = 0) {
  const badge = $('#tab-pending-badge');
  const tabBtn = document.querySelector('[data-tab="proposals"]');
  const count = Math.max(0, Number(pendingCount) || 0);
+ const stale = Math.max(0, Number(staleCount) || 0);
  if (badge) {
   badge.hidden = count <= 0;
   badge.textContent = count > 99 ? '99+' : String(count);
  }
  if (tabBtn) {
-  tabBtn.title = count > 0 ? msg('调整审查 · {0} 项待审', count) : msg('调整审查');
+  tabBtn.title = count > 0
+   ? (stale > 0 ? msg('调整审查 · {0} 项可审 · {1} 项失效', count, stale) : msg('调整审查 · {0} 项待审', count))
+   : (stale > 0 ? msg('调整审查 · {0} 项失效', stale) : msg('调整审查'));
  }
 }
 function renderOverviewStats() {
  const counts = snapshot.proposal_counts;
+ const qSummary = snapshot.queue_summary;
  const pendingCount = counts ? (counts.pending||0)+(counts.reviewed||0) : snapshot.proposals.filter(p=>['pending','reviewed'].includes(p.state)).length;
+ const readyCount = qSummary ? Number(qSummary.ready_count || 0) : pendingCount;
+ const staleCount = qSummary ? Number(qSummary.stale_count || 0) : 0;
  const appliedCount = counts?.applied??snapshot.proposals.filter(p=>p.state==='applied').length;
  const sessionCount = snapshot.sessions.length;
  const batchTurns = snapshot.batches.reduce((n,b)=>n+b.count,0);
- updatePendingTabBadge(pendingCount);
+ updatePendingTabBadge(readyCount, staleCount);
  const totalProposals = Math.max(1, pendingCount + appliedCount);
  const metrics = [
   ['待审查', pendingCount, pendingCount > 0 ? {pill: msg('需关注'), tone: 'warm', ratio: Math.min(100, Math.round((pendingCount / totalProposals) * 100))} : {pill: msg('已清空'), tone: 'accent'}],
@@ -450,6 +463,16 @@ $('#preview-batch').onclick=()=>previewBatch('approve');
 $('#preview-batch-review').onclick=()=>previewBatch('review');
 $('#preview-batch-reject').onclick=()=>previewBatch('reject');
 $('#preview-batch-archive').onclick=()=>previewBatch('archive');$('#preview-batch-release').onclick=()=>previewBatch('release');
+if($('#archive-all-stale'))$('#archive-all-stale').onclick=async()=>{
+ if(!reviewGroupKey||reviewBusy)return;
+ if(!await window.DynamicsUI.confirm(msg('确认一键归档当前群的全部失效提案？原始证据与历史记录会保留。')))return;
+ try{
+  const r=await api('apiPost','archive_stale',{scope:reviewGroupKey});
+  clearReviewSelection();
+  await load();
+  note(msg('已归档本群全部失效提案（{0} 项），原始证据已保留。',r.count||0));
+ }catch(e){note(e.message,'error');}
+};
 $('#cancel-batch').onclick=()=>$('#batch-confirm').close();
 $('#commit-batch').onclick=async()=>{
  const b=$('#commit-batch');b.disabled=true;

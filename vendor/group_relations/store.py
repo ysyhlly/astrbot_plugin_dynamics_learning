@@ -191,7 +191,9 @@ class RelationStore:
                 );
                 """
             )
-            conn.execute("CREATE TABLE IF NOT EXISTS relation_source_receipts(group_id TEXT,source_id TEXT,fingerprint TEXT,PRIMARY KEY(group_id,source_id))")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS relation_source_receipts(group_id TEXT,source_id TEXT,fingerprint TEXT,created INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(group_id,source_id))"
+            )
             # directed edge events (idempotent; table + indexes use IF NOT EXISTS)
             conn.execute(DIRECTED_EVENTS_DDL)
             for stmt in DIRECTED_EVENTS_INDEXES:
@@ -204,11 +206,15 @@ class RelationStore:
                 "ALTER TABLE relations ADD COLUMN sentiment_hits INTEGER NOT NULL DEFAULT 0",
                 *RELATIONS_COUNTER_ALTERS,
                 "ALTER TABLE relation_daily ADD COLUMN focused_hits INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE relation_source_receipts ADD COLUMN created INTEGER NOT NULL DEFAULT 0",
             ):
                 try:
                     conn.execute(stmt)
                 except sqlite3.OperationalError:
                     pass
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_relation_source_receipts_created ON relation_source_receipts(created)"
+            )
             # Backfill directed history exactly once. Historical tone is unknown.
             if not conn.execute(
                 "SELECT 1 FROM meta WHERE key='network_v2_started'"
@@ -453,7 +459,10 @@ class RelationStore:
                     if old[0] != stamp:
                         raise ValueError("group message source id collision")
                     return
-                conn.execute("INSERT INTO relation_source_receipts VALUES(?,?,?)", (group_id,source_id,stamp))
+                conn.execute(
+                    "INSERT INTO relation_source_receipts(group_id,source_id,fingerprint,created) VALUES(?,?,?,?)",
+                    (group_id, source_id, stamp, int(ts or _now())),
+                )
             conn.execute(
                 """INSERT INTO member_daily(group_id,day,user_id,message_count) VALUES(?,?,?,1)
                 ON CONFLICT(group_id,day,user_id) DO UPDATE SET message_count=message_count+1""",
@@ -637,6 +646,7 @@ class RelationStore:
                 )
 
             self._prune_directed_events_sync(conn, directed_event_retain_days)
+            self._prune_source_receipts_sync(conn, ts, retain_days=30)
             conn.execute(
                 "DELETE FROM relation_daily WHERE day<?", (window_start(ts, 90),)
             )
@@ -1900,4 +1910,19 @@ class RelationStore:
             return 0
         cutoff = _now() - retain_days * 86400
         cur = conn.execute("DELETE FROM directed_events WHERE ts < ?", (cutoff,))
+        return int(cur.rowcount or 0)
+
+    @staticmethod
+    def _prune_source_receipts_sync(
+        conn: sqlite3.Connection, now_ts: int | float | None = None, *, retain_days: int = 30
+    ) -> int:
+        try:
+            days = int(retain_days)
+        except Exception:
+            return 0
+        if days <= 0:
+            return 0
+        stamp = int(now_ts) if now_ts is not None else _now()
+        cutoff = stamp - days * 86400
+        cur = conn.execute("DELETE FROM relation_source_receipts WHERE created < ?", (cutoff,))
         return int(cur.rowcount or 0)

@@ -48,6 +48,26 @@ def govern(engine,scope,rows,action,actor):
     return {'count':len(rows),'action':action}
 
 
+def archive_stale_scope(engine, scope, actor):
+    """Archive all stale pending/reviewed proposals within a single group scope."""
+    result = engine.store.archive_stale_proposals(
+        current_personas=dict(engine.current_personas),
+        latest_baselines=dict(engine.latest),
+        actor=actor,
+        scope=scope,
+        include_policy_invalid=True,
+        include_revision_changed=True,
+        require_known_baseline=False,
+    )
+    return {
+        'scope': scope,
+        'action': 'archive_stale',
+        'count': result['count'],
+        'archived': result['archived'],
+        'reasons': result['reasons'],
+    }
+
+
 def library(store,scopes,scope='',state='',category='',query='',page=1):
     if scope and scope not in scopes or state not in ('','pending','reviewed','applied','rejected','rolled_back','archived'):
         raise ValueError('invalid history filter')

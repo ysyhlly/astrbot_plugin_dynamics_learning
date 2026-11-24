@@ -12,7 +12,7 @@ from astrbot_plugin_dynamics_learning.main import PLUGIN, DynamicsLearning
 
 def _make_plugin(tmp_path: Path, sessions: list[str]) -> DynamicsLearning:
     store = Store(tmp_path / "learning.sqlite3")
-    config = {"sessions": list(sessions), "replace_selflearning": True}
+    config = {"sessions": list(sessions), "replace_selflearning": True, "jargon_review": "human"}
     engine = Engine(store, config, lambda *_args, **_kwargs: None)
     plugin = DynamicsLearning(NS(), config)
     plugin.engine = engine
@@ -159,7 +159,9 @@ def test_learning_v2_hooks_not_ready_and_populated(tmp_path):
         plugin.engine.current_personas[scope] = "anan-v1"
 
         summary = plugin.get_series_summary()
-        assert summary["badge"]["count"] == 2  # includes all pending rows in store
+        assert summary["badge"]["count"] == 1  # ready_count in authorized scope only
+        assert summary["ready_count"] == 1
+        assert summary["stale_count"] == 0
         assert summary["badge"]["tone"] == "warm"
         assert "待审" in summary["badge"]["label"]
         assert summary["pulse"]["updated_at"]

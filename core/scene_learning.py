@@ -35,14 +35,25 @@ class SceneLearning:
                         and row['active'] and row['expires'] > now and (row['proposal_id'], row['revision']) in wanted]
         else:
             selected = select_patterns(pair_entries, scope, persona, scene, now, self.recent, query)
+        total_budget = self.engine.reply_projection_budget() if hasattr(self.engine, 'reply_projection_budget') else 6000
+        if frozen is None and hasattr(self.engine, '_turn_budget_remaining'):
+            cap = min(3200, self.engine._turn_budget_remaining(scope, persona, member, query, include_scene=False))
+        else:
+            cap = min(3200, total_budget)
         for e in selected[:1]:
             value = {k: e['value'][k] for k in ('scene', 'method', 'conditions', 'avoid', 'examples', 'support')}
             item = {'source_id': e['proposal_id'], 'revision': e['revision'], 'member': '', 'category': 'scene_pattern',
                     'source_umo': scope, 'source_uids': e.get('source_uids', []),
                     'provenance_complete': e.get('provenance_complete', False), 'expires': e['expires'], 'value': value}
-            if len(encode(item)) <= 3200:
+            item_len = len(encode(item))
+            if frozen is None and item_len > cap and value.get('examples'):
+                item = {**item, 'value': {**value, 'examples': []}}
+                item_len = len(encode(item))
+            if item_len <= cap:
                 result['items'].append(item)
                 result['versions'].append(e['proposal_id'])
+                if frozen is None and hasattr(self.engine, '_record_turn_budget'):
+                    self.engine._record_turn_budget(scope, persona, member, query, scene=item_len)
         return result
 
     async def disambiguate(self, *, scope, persona, member, turn_id, text, context=None, **_):

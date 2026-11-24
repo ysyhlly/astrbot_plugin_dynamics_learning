@@ -73,12 +73,12 @@
     "description": "可选输出 Token 上限",
     "type": "int",
     "default": 0,
-    "hint": "0 表示沿用模型默认配置；非零时最低按 1536 保护，避免截断 JSON，仅在提供方支持该参数时透传。"
+    "hint": "0 表示自动按任务分层上限（单条审查 768、批量审查/分析 1536）；非零时单条审查最低按 512、批量/分析最低按 1024 保护，仅在提供方支持该参数时透传。"
   },
   "model_reasoning_effort": {
     "description": "可选思考强度透传",
     "type": "string",
-    "default": "",
+    "default": "low",
     "options": [
       "",
       "none",
@@ -87,7 +87,7 @@
       "medium",
       "high"
     ],
-    "hint": "留空表示沿用模型默认配置；仅在提供方支持 reasoning_effort 参数时透传。"
+    "hint": "默认 low 以抑制结构化 JSON 分类任务的冗长思考输出；留空表示沿用模型默认配置；仅在提供方支持 reasoning_effort 或 extra_body 时透传。"
   },
   "style_review": {
     "description": "群友表达方式审查方式",

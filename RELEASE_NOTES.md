@@ -1,4 +1,10 @@
-# astrbot_plugin_dynamics_learning v2.0.0-rc.6
+# astrbot_plugin_dynamics_learning v2.0.0-rc.7
+
+## v2.0.0-rc.7 — 2026-11-24
+
+- 根治熔断器风暴：区分瞬态 `ReviewDeferred(retry_after)` 与永久 `ReviewUnavailable`，`AutomaticReviews` 增加全局 `_budget_backoff_until` 与指数退避（60s->120s->300s）并跳过熔断期垃圾审计写入，批量审查遇熔断立即暂停保留队列。
+- `learning.sqlite3` 启用 `PRAGMA auto_vacuum=INCREMENTAL`、`journal_size_limit=64MiB`、定期 `incremental_vacuum`/`wal_checkpoint(TRUNCATE)`，并新增终态 proposal 证据压缩/裁剪、`audit.superseded` 瘦身、`analysis_inbox` 与 `relation_source_receipts` 过期清理。
+- 后台审查默认 `model_reasoning_effort='low'` 与分级 `max_tokens`（768/1536），移除 `system_prompt` 中的易变 `baseline_threshold` 以提升缓存命中；同步最新 `series_panels.py`。
 
 ## v2.0.0-rc.6 — 2026-11-22
 

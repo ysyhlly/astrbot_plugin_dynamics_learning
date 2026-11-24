@@ -21,6 +21,7 @@ from .contract import (
     encode,
     entry_key,
     event_record,
+    jargon_matches,
     llm_approved,
     policy_allowed,
     review_result,
@@ -34,19 +35,24 @@ from .model_projection import (
     build_analyze_payload,
     build_batch_review_payload,
     build_single_review_payload,
+    extract_baseline_threshold,
     extract_character_context,
     format_system_prompt,
     project_current_entry_for_model,
     project_event_for_model,
     utf8_len,
 )
-from .review_batches import ReviewUnavailable
+from .review_batches import ReviewDeferred, ReviewUnavailable
 from .review_evidence import DEFER_FINGERPRINT, ReviewContext, review_context, review_is_sleeping
 from .scenes import REVIEW_SCENES
 from .store import Conflict
+from .. import series_panels
 from ..series_panels import (
+    find_provider_silently,
     get_series_defaults,
     inherit_umos,
+    invalidate_presence_cache,
+    is_provider_budget_busy_error,
     is_series_group_excluded,
     resolve_series_provider,
 )
@@ -109,7 +115,18 @@ REVIEW_CONCISE_RULE = (
     "每条 reason 仅一句话（不超过 35 字），直接给出判定依据且不复述提案；"
     "无明确风险时 risks 必须为 []，否则最多 2 条简短项（每条不超过 15 字）。"
 )
-UNIFIED_REVIEW = REVIEW + REVIEW_SCENES + REVIEW_STYLE + REVIEW_OUTPUT + BATCH_REVIEW_RULE + REVIEW_CONCISE_RULE
+def build_review_instruction(*, include_scenes: bool = True, include_style: bool = True) -> str:
+    """Assemble the static review system instruction, omitting disabled optional modules."""
+    parts = [REVIEW]
+    if include_scenes:
+        parts.append(REVIEW_SCENES)
+    if include_style:
+        parts.append(REVIEW_STYLE)
+    parts.extend((REVIEW_OUTPUT, BATCH_REVIEW_RULE, REVIEW_CONCISE_RULE))
+    return "".join(parts)
+
+
+UNIFIED_REVIEW = build_review_instruction(include_scenes=True, include_style=True)
 
 GROUP_ANALYZE_CATEGORIES = frozenset({"jargon", "participation", "decision_guidance"})
 DEDICATED_ANALYZE_CATEGORIES = frozenset(
@@ -340,6 +357,7 @@ class Engine:
         self.scope_projection_generations = {}
         self.review_retry_at = {}
         self.cache_refresh_pending = False
+        self._turn_budget_usage = {}
         from .review_batches import ReviewBatches
 
         self.review_batches = ReviewBatches(self)
@@ -398,8 +416,7 @@ class Engine:
             defaults = get_series_defaults(self._host_context)
             candidate = str(defaults.get("decision_provider") or "").strip()
             if candidate:
-                getter = getattr(self._host_context, "get_provider_by_id", None)
-                provider = getter(candidate) if callable(getter) else None
+                provider = find_provider_silently(self._host_context, candidate)
                 if provider is None or not getattr(provider, "is_native_decision_provider", False):
                     return candidate
             return str(defaults.get("reply_provider") or "").strip() or self._host_default_provider_id(
@@ -686,6 +703,64 @@ class Engine:
     async def consume_record(self, row):
         await self.consume_batch([row])
 
+    def reply_projection_budget(self) -> int:
+        from .reply_projection import MAX_UNIFIED_REPLY_BUDGET, MIN_UNIFIED_REPLY_BUDGET, UNIFIED_REPLY_BUDGET
+
+        raw = self.config.get("reply_projection_budget", UNIFIED_REPLY_BUDGET)
+        if isinstance(raw, bool):
+            return UNIFIED_REPLY_BUDGET
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            return UNIFIED_REPLY_BUDGET
+        return max(MIN_UNIFIED_REPLY_BUDGET, min(MAX_UNIFIED_REPLY_BUDGET, parsed))
+
+    def _max_jargon_per_turn(self) -> int:
+        from .reply_projection import MAX_JARGON_PER_TURN
+
+        raw = self.config.get("max_jargon_per_turn", MAX_JARGON_PER_TURN)
+        if isinstance(raw, bool):
+            return MAX_JARGON_PER_TURN
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            return MAX_JARGON_PER_TURN
+        return max(1, min(10, parsed))
+
+    @staticmethod
+    def _turn_budget_key(scope, persona, member, query):
+        return (str(scope or ""), str(persona or ""), str(member or ""), str(query or "")[:256])
+
+    def _record_turn_budget(self, scope, persona, member, query, *, learning=None, scene=None):
+        key = self._turn_budget_key(scope, persona, member, query)
+        now = time.monotonic()
+        entry = self._turn_budget_usage.get(key)
+        if entry is None or now - entry["ts"] > 30.0:
+            entry = {"learning": len(PERSONALITY_POLICY), "scene": 0, "ts": now}
+        if learning is not None:
+            entry["learning"] = int(learning)
+        if scene is not None:
+            entry["scene"] = int(scene)
+        entry["ts"] = now
+        self._turn_budget_usage[key] = entry
+        if len(self._turn_budget_usage) > 128:
+            cutoff = now - 30.0
+            expired = [k for k, v in self._turn_budget_usage.items() if v["ts"] < cutoff]
+            for k in expired:
+                self._turn_budget_usage.pop(k, None)
+            while len(self._turn_budget_usage) > 128:
+                self._turn_budget_usage.pop(next(iter(self._turn_budget_usage)))
+
+    def _turn_budget_remaining(self, scope, persona, member, query, *, include_scene=False) -> int:
+        total_budget = self.reply_projection_budget()
+        key = self._turn_budget_key(scope, persona, member, query)
+        entry = self._turn_budget_usage.get(key)
+        if entry is None or time.monotonic() - entry["ts"] > 30.0:
+            used = len(PERSONALITY_POLICY)
+        else:
+            used = int(entry["learning"]) + (int(entry["scene"]) if include_scene else 0)
+        return max(0, total_budget - used)
+
     def context(self, *, scope, persona, member, baseline, host_version, query="", character_scope=None, trace=False):
         result = {"schema_version": 1, "context": "", "threshold": None, "versions": []}
         if not self.allowed(scope):
@@ -711,13 +786,15 @@ class Engine:
         pieces = []
         pieces_len = 2
         piece_limit = 1500 if self.social else 3000
-        from .reply_projection import item, member_items
+        from .reply_projection import item, item_priority, member_items
 
         excluded = {}
         reply_items = member_items(self, scope, persona, member, query, trace=excluded if trace else None)
         from .profiles import relevance
 
         example_count = 0
+        jargon_count = 0
+        max_jargon = self._max_jargon_per_turn()
         for e in sorted(rows, key=lambda x: (bool(x["member"]), x["revision"]), reverse=True):
             if e["category"] in {"scene_pattern", "scene_adjustment", "expression_style", "expression_adjustment"}:
                 continue  # Optional scene protocol only; never leak through v1 or private projections.
@@ -726,9 +803,14 @@ class Engine:
             if e["category"] == "expression_example":
                 if example_count >= 2 or not relevance(e["value"], query):
                     continue
-            if e["category"] == "jargon" and (not self.config.get("jargon_enabled", True) or e["key"] not in query):
-                excluded[e["proposal_id"]] = "黑话已关闭或本轮未提及该词"
-                continue
+            if e["category"] == "jargon":
+                if not self.config.get("jargon_enabled", True) or not jargon_matches(e["key"], query):
+                    excluded[e["proposal_id"]] = "黑话已关闭或本轮未提及该词"
+                    continue
+                if jargon_count >= max_jargon:
+                    excluded[e["proposal_id"]] = "单回合黑话数量预算"
+                    continue
+                jargon_count += 1
             if e["category"] == "participation":
                 if (e["baseline"], e["host_version"]) == (baseline, host_version):
                     result["threshold"] = e["value"]
@@ -784,9 +866,20 @@ class Engine:
             "items": [],
             "character_scope": self.character_scopes.get((scope, persona)),
         }
+        total_budget = self.reply_projection_budget()
+        policy_len = len(PERSONALITY_POLICY)
+        proj_std_cap = min(8400, max(1200, total_budget - policy_len))
+        items_compact_cap = min(7500, proj_std_cap)
         items_compact_len = 2
         proj_std_len = len(json.dumps(projection, ensure_ascii=False, allow_nan=False))
-        for row in reply_items:
+        ordered_reply_items = [
+            row
+            for _idx, row in sorted(
+                enumerate(reply_items),
+                key=lambda pair: (item_priority(pair[1]), pair[0]),
+            )
+        ]
+        for row in ordered_reply_items:
             if len(projection["items"]) >= 30:
                 excluded[row["source_id"]] = "总回复材料预算"
                 continue
@@ -794,7 +887,7 @@ class Engine:
             next_compact_len = items_compact_len + row_compact_len + (1 if projection["items"] else 0)
             row_std_len = len(json.dumps(row, ensure_ascii=False, allow_nan=False))
             next_proj_std_len = proj_std_len + row_std_len + (2 if projection["items"] else 0)
-            if next_compact_len <= 7500 and next_proj_std_len <= 8400:
+            if next_compact_len <= items_compact_cap and next_proj_std_len <= proj_std_cap:
                 projection["items"].append(row)
                 items_compact_len = next_compact_len
                 proj_std_len = next_proj_std_len
@@ -803,6 +896,7 @@ class Engine:
             else:
                 excluded[row["source_id"]] = "总回复材料预算"
         result["reply_projection"] = projection
+        self._record_turn_budget(scope, persona, member, query, learning=policy_len + items_compact_len, scene=0)
         if trace:
             selected = {r["source_id"] for r in projection["items"]}
             candidates = []
@@ -836,6 +930,85 @@ class Engine:
             result["candidates"] = candidates
         return result
 
+    def unified_reply_context(
+        self,
+        *,
+        scope,
+        persona,
+        member,
+        baseline="",
+        host_version="",
+        query="",
+        scene=None,
+        action="",
+        character_scope=None,
+        trace=False,
+        budget=None,
+    ):
+        """Collect all three reply channels and prune globally under a single character budget."""
+        from .reply_projection import prune_unified_channels
+
+        effective_budget = self.reply_projection_budget() if budget is None else max(len(PERSONALITY_POLICY), int(budget))
+        learning = self.context(
+            scope=scope,
+            persona=persona,
+            member=member,
+            baseline=baseline,
+            host_version=host_version,
+            query=query,
+            character_scope=character_scope,
+            trace=trace,
+        )
+        scene_raw = self.scenes.context(
+            scope=scope,
+            persona=persona,
+            member=member,
+            scene=scene,
+            query=query,
+        )
+        # Collect expression candidate without sequential starvation so global priority decides.
+        self._record_turn_budget(scope, persona, member, query, learning=len(PERSONALITY_POLICY), scene=0)
+        scene_full = (
+            scene_raw
+            if scene_raw.get("items")
+            else self.scenes.context(scope=scope, persona=persona, member=member, scene=scene, query=query)
+        )
+        expr_full = self.expressions.context(
+            scope=scope,
+            persona=persona,
+            member=member,
+            scene=scene,
+            action=action,
+            query=query,
+        )
+        pruned = prune_unified_channels(
+            learning_items=learning.get("reply_projection", {}).get("items", []),
+            scene_items=scene_full.get("items", []),
+            expression_items=expr_full.get("items", []),
+            personality_policy=PERSONALITY_POLICY,
+            budget=effective_budget,
+        )
+        learning_proj = {**learning.get("reply_projection", {}), "items": pruned["learning_items"]}
+        scene_out = {
+            **scene_full,
+            "items": pruned["scene_items"],
+            "versions": [r["source_id"] for r in pruned["scene_items"]],
+        }
+        expr_out = {
+            **expr_full,
+            "items": pruned["expression_items"],
+            "versions": [r["source_id"] for r in pruned["expression_items"]],
+        }
+        return {
+            "personality_policy": pruned["personality_policy"],
+            "learning": {**learning, "reply_projection": learning_proj},
+            "scene": scene_out,
+            "expression": expr_out,
+            "budget": pruned["budget"],
+            "used_chars": pruned["used_chars"],
+            "omitted": pruned["omitted"],
+        }
+
     @asynccontextmanager
     async def operation(self, kind, key):
         identity = (kind, key)
@@ -857,6 +1030,17 @@ class Engine:
         self, role, instruction, data, valid=lambda: True, *, fast_lane=False, prepare=None, dispatch=None
     ):
         source = data.get("proposal") or next(iter(data.get("events", [])), {}) or data
+        if self._host_context is not None:
+            pid = self.provider_for(role)
+            if pid:
+                probe = getattr(series_panels, "provider_circuit_remaining", lambda _c, _p: 0.0)
+                rem = float(probe(self._host_context, pid) or 0.0)
+                if rem > 0.0:
+                    raise ReviewDeferred(
+                        f"provider circuit open ({pid})",
+                        retry_after=rem,
+                        reason="circuit_open",
+                    )
         async with self.lock:
             if self.closed or not valid():
                 self.stale_results += 1
@@ -888,6 +1072,15 @@ class Engine:
                 finally:
                     self.model_active -= 1
         except BaseException as exc:
+            if isinstance(exc, ReviewDeferred) or is_provider_budget_busy_error(exc):
+                await self.review_write(lambda: self.store.console.delete_task(task_id))
+                if isinstance(exc, ReviewDeferred):
+                    raise
+                raise ReviewDeferred(
+                    f"provider budget busy ({getattr(exc, 'reason', 'busy')})",
+                    retry_after=float(getattr(exc, "retry_after", 0.0) or 0.0),
+                    reason=str(getattr(exc, "reason", "busy") or "busy"),
+                ) from exc
             error = type(exc).__name__
             status = (
                 "cancelled"
@@ -1009,6 +1202,7 @@ class Engine:
                         current=cur,
                         events=sel_proj_events,
                         member_sources=proj_src_list,
+                        baseline_threshold=extract_baseline_threshold(sel_events),
                     )
                     return payload, sup_list
 
@@ -1255,10 +1449,21 @@ class Engine:
                 return extracted
         return None
 
+    def review_base_prompt(self, category: str = "") -> str:
+        include_scenes = bool(self.config.get("scene_learning_enabled", False)) or category in {
+            "scene_pattern",
+            "scene_adjustment",
+        }
+        include_style = bool(self.config.get("expression_style_enabled", False)) or category in {
+            "expression_style",
+            "expression_adjustment",
+        }
+        return build_review_instruction(include_scenes=include_scenes, include_style=include_style)
+
     def review_item(self, p):
         category = p["category"]
         char_ctx = self.character_context_for(p["scope"], p["persona"], p.get("evidence") or ())
-        instruction = format_system_prompt(UNIFIED_REVIEW, char_ctx)
+        instruction = format_system_prompt(self.review_base_prompt(category), char_ctx)
         return ReviewItem(
             p,
             instruction,
@@ -1461,6 +1666,11 @@ class Engine:
                 reviewed = await self.commit_review(
                     item, result, valid=valid, owner=owner, receipt=receipt, defer_apply=defer_apply, automatic=automatic
                 )
+            except ReviewDeferred as exc:
+                if automatic:
+                    until = self.automatic_reviews.note_budget_busy(exc)
+                    self.review_retry_at[p["id"]] = max(self.review_retry_at.get(p["id"], 0.0), until)
+                raise
             except (ReviewUnavailable, Conflict):
                 raise
             except Exception:
@@ -1708,6 +1918,8 @@ class Engine:
                     "fallback": fallback,
                     "errors": errors,
                 }
+            except ReviewDeferred:
+                raise
             except ReviewUnavailable:
                 raise
             except asyncio.CancelledError:
@@ -1804,6 +2016,12 @@ class Engine:
                         pid, owner=owner, valid=valid, defer_apply=defer_apply, automatic=automatic
                     )
                 }
+            except ReviewDeferred as exc:
+                if automatic:
+                    until = self.automatic_reviews.note_budget_busy(exc)
+                    self.review_retry_at[pid] = max(self.review_retry_at.get(pid, 0.0), until)
+                    return {}
+                raise
             except ReviewUnavailable:
                 return {}
             except Exception as exc:
@@ -1833,6 +2051,14 @@ class Engine:
             groups.setdefault((p["scope"], p["persona"]), []).append(p)
 
         results = {}
+
+        def _defer_remaining(exc: ReviewDeferred) -> dict:
+            until = self.automatic_reviews.note_budget_busy(exc)
+            for pid_rem in ids:
+                if pid_rem not in results:
+                    self.review_retry_at[pid_rem] = max(self.review_retry_at.get(pid_rem, 0.0), until)
+            return results
+
         for (scope, persona), proposals in groups.items():
             if self.closed or not valid() or not self.allowed(scope):
                 break
@@ -1852,6 +2078,10 @@ class Engine:
                         results[pid] = await self.review(
                             pid, owner=owner, valid=valid, defer_apply=defer_apply, automatic=automatic
                         )
+                    except ReviewDeferred as exc:
+                        if automatic:
+                            return _defer_remaining(exc)
+                        raise
                     except ReviewUnavailable:
                         pass
                     except Exception as exc:
@@ -1868,6 +2098,10 @@ class Engine:
                         automatic=automatic,
                         max_payload_bytes=max_payload_bytes,
                     )
+                except ReviewDeferred as exc:
+                    if automatic:
+                        return _defer_remaining(exc)
+                    raise
                 except ReviewUnavailable:
                     continue
                 except asyncio.CancelledError:
@@ -1892,6 +2126,10 @@ class Engine:
                         results[pid] = await self.review(
                             pid, owner=owner, valid=valid, defer_apply=defer_apply, automatic=automatic
                         )
+                    except ReviewDeferred as exc:
+                        if automatic:
+                            return _defer_remaining(exc)
+                        raise
                     except ReviewUnavailable:
                         pass
                     except Exception as exc:
@@ -1906,6 +2144,10 @@ class Engine:
                 results[pid] = await self.review(
                     pid, owner=owner, valid=valid, defer_apply=defer_apply, automatic=automatic
                 )
+            except ReviewDeferred as exc:
+                if automatic:
+                    return _defer_remaining(exc)
+                raise
             except ReviewUnavailable:
                 pass
             except Exception as exc:
@@ -1964,6 +2206,8 @@ class Engine:
         return result
 
     async def review_pending_profiles(self):
+        if self.automatic_reviews.is_budget_backed_off():
+            return
         rows = await asyncio.to_thread(self.store.pending_profiles)
         managed = await self.automatic_reviews.enqueue(rows)
         by_scope = {}
@@ -2216,18 +2460,29 @@ class Engine:
             if not selected:
                 break
 
+            deferred = False
+
             async def run(pair):
+                nonlocal deferred
                 self.analysis_last_served[pair] = time.monotonic()
                 try:
                     await self.analyze(*pair)
                     visited.add(pair)
+                except ReviewDeferred as exc:
+                    deferred = True
+                    failed.add(pair)
+                    self.automatic_reviews.note_budget_busy(exc)
                 except Exception as exc:
                     failed.add(pair)
                     self.last_error = type(exc).__name__
 
             await asyncio.gather(*(run(pair) for _, pair in selected.values()))
+            if deferred:
+                break
 
     async def review_pending_proposals(self):
+        if self.automatic_reviews.is_budget_backed_off():
+            return
         pending_by_scope = {}
         apply_only_by_scope = {}
         scopes_order = []
@@ -2305,22 +2560,47 @@ class Engine:
                         await self.refresh()
                 if self.social:
                     await self.social.write(self.social.graph.apply_daily_decay(self.social.settings["daily_decay"]))
-                await asyncio.to_thread(self.store.prune, max(1, int(self.config.get("retention_days", 30))))
+                retention_days = max(1, int(self.config.get("retention_days", 30)))
+                raw_audit_days = self.config.get("audit_retention_days")
+                audit_days = (
+                    max(1, int(raw_audit_days))
+                    if raw_audit_days is not None and not isinstance(raw_audit_days, bool)
+                    else None
+                )
+                prune_result = await asyncio.to_thread(
+                    self.store.prune,
+                    retention_days,
+                    current_personas=dict(self.current_personas),
+                    latest_baselines=dict(self.latest),
+                    audit_retention_days=audit_days,
+                    allowed_scopes=self.effective_sessions(),
+                    inbox_expire_days=max(retention_days, 14),
+                )
+                if isinstance(prune_result, dict) and prune_result.get("archived"):
+                    invalidate_presence_cache(context=self._host_context)
                 await self.apply_pending_affection()
                 await self.apply_approved_profiles()
                 await self.review_pending_profiles()
                 await self.review_pending_proposals()
-                if self.config.get("auto_analyze", True):
+                if self.config.get("auto_analyze", True) and not self.automatic_reviews.is_budget_backed_off():
                     await self.analysis_cycle()
                     for scope, persona in list(self.current_personas.items()):
+                        if self.automatic_reviews.is_budget_backed_off():
+                            break
                         if self.expressions.enabled(scope, persona):
                             try:
                                 await self.expressions.analyze(scope, persona)
+                            except ReviewDeferred as exc:
+                                self.automatic_reviews.note_budget_busy(exc)
+                                break
                             except Exception as exc:
                                 self.last_error = type(exc).__name__
                         if self.scenes.enabled(scope, persona):
                             try:
                                 await self.scenes.analyze(scope, persona)
+                            except ReviewDeferred as exc:
+                                self.automatic_reviews.note_budget_busy(exc)
+                                break
                             except Exception as exc:
                                 self.last_error = type(exc).__name__
             except Exception as exc:
@@ -2438,30 +2718,204 @@ class Engine:
             query_queue, self.store, scopes, modes, names, dict(self.current_personas), latest, **filters
         )
 
-    async def group_batch_action(self, scope, items, actor):
+    def queue_counts(self, *, scopes=None) -> dict[str, int]:
+        """Synchronous, read-only queue summary separating ready_count from stale_count."""
+        if scopes is None:
+            raw_scopes = self.effective_sessions()
+            target_scopes = [
+                s
+                for s in raw_scopes
+                if not (
+                    self._host_context is not None
+                    and is_series_group_excluded(self._host_context, umo=str(s or ""))
+                )
+            ]
+        else:
+            target_scopes = list(scopes)
+        if not target_scopes:
+            return {
+                "pending_total": 0,
+                "ready_count": 0,
+                "stale_count": 0,
+                "held_count": 0,
+                "waiting_count": 0,
+            }
+        modes = {c: self.mode(c) for c in CATEGORIES}
+        latest = [{"scope": s, "persona": p, "baseline": v[0], "host": v[1]} for (s, p), v in self.latest.items()]
+        args = {
+            "scopes": json.dumps(target_scopes),
+            "modes": json.dumps(modes),
+            "personas": json.dumps(dict(self.current_personas)),
+            "latest": json.dumps(latest),
+            "categories": json.dumps(sorted(CATEGORIES)),
+            "profiles": json.dumps(sorted(MEMBER_PROFILES)),
+            "now": time.time(),
+        }
+        sql = """WITH base AS (
+            SELECT p.id, p.scope, p.persona, p.state, p.created,
+                json_extract(p.body,'$.days') AS days,
+                json_extract(p.body,'$.profile_policy') AS profile_policy,
+                json_extract(p.body,'$.baseline') AS baseline,
+                json_extract(p.body,'$.host_version') AS host_version,
+                json_extract(p.body,'$.category') AS category,
+                json_extract(p.body,'$.member') AS member,
+                json_extract(p.body,'$.mode') AS original_mode,
+                json_extract(p.body,'$.base_revision') AS base_revision,
+                coalesce(json_extract(e.body,'$.revision'),0) AS current_revision,
+                m.value AS mode,
+                c.job AS claim,
+                s.value AS current_persona,
+                b.baseline AS current_baseline,
+                b.host AS current_host,
+                coalesce((SELECT json_extract(r.value,'$.verdict')='approve' FROM json_each(p.body,'$.reviews') r
+                    WHERE json_extract(r.value,'$.actor') LIKE 'llm:%' ORDER BY CAST(r.key AS INTEGER) DESC LIMIT 1),0) AS approved
+            FROM proposals p
+            LEFT JOIN entries e ON e.id=json_extract(p.body,'$.entry_id')
+            LEFT JOIN review_claims c ON c.proposal=p.id
+            LEFT JOIN json_each(:modes) m ON m.key=json_extract(p.body,'$.category')
+            LEFT JOIN json_each(:personas) s ON s.key=p.scope
+            LEFT JOIN (
+                SELECT json_extract(value,'$.scope') scope, json_extract(value,'$.persona') persona,
+                    json_extract(value,'$.baseline') baseline, json_extract(value,'$.host') host
+                FROM json_each(:latest)
+            ) b ON b.scope=p.scope AND b.persona=p.persona
+            WHERE p.state IN ('pending','reviewed')
+              AND p.scope IN (SELECT value FROM json_each(:scopes))
+        ), checked AS (
+            SELECT *, CASE
+                WHEN category NOT IN (SELECT value FROM json_each(:categories)) OR
+                     (category IN (SELECT value FROM json_each(:profiles)) AND (coalesce(member,'')='' OR coalesce(profile_policy,0)!=1)) THEN 'policy_invalid'
+                WHEN current_persona IS NOT NULL AND current_persona!=persona THEN 'persona_changed'
+                WHEN created+days*86400<=:now THEN 'expired'
+                WHEN base_revision!=current_revision THEN 'revision_changed'
+                WHEN category='participation' AND (current_baseline IS NULL OR current_host IS NULL OR current_baseline!=baseline OR current_host!=host_version) THEN 'baseline_changed'
+                ELSE '' END AS stale_reason
+            FROM base
+        ), flags AS (
+            SELECT *, CASE
+                WHEN stale_reason!='' THEN stale_reason
+                WHEN claim IS NOT NULL THEN 'held'
+                WHEN mode='auto' OR original_mode='auto' OR (mode='llm' AND category IN (SELECT value FROM json_each(:profiles))) THEN 'automatic'
+                WHEN NOT approved AND (mode!='human' OR original_mode IN ('llm','llm_then_human')) THEN 'llm_required'
+                ELSE 'ready' END AS reason
+            FROM checked
+        )
+        SELECT count(*) AS pending_total,
+               coalesce(sum(reason='ready'),0) AS ready_count,
+               coalesce(sum(stale_reason!=''),0) AS stale_count,
+               coalesce(sum(stale_reason='' AND claim IS NOT NULL),0) AS held_count,
+               coalesce(sum(stale_reason='' AND claim IS NULL AND reason!='ready'),0) AS waiting_count
+        FROM flags"""
+        with self.store.lock:
+            row = self.store.db.execute(sql, args).fetchone()
+        return {
+            "pending_total": int(row["pending_total"]) if row else 0,
+            "ready_count": int(row["ready_count"]) if row else 0,
+            "stale_count": int(row["stale_count"]) if row else 0,
+            "held_count": int(row["held_count"]) if row else 0,
+            "waiting_count": int(row["waiting_count"]) if row else 0,
+        }
+
+    async def archive_group_stale(self, scope, actor):
+        """One-click archive of all stale pending/reviewed proposals within a group scope."""
+        from .workbench import archive_stale_scope
+
+        if not actor.startswith("human:"):
+            raise ValueError("需要管理员权限")
+        if ":GroupMessage:" not in scope or not self.allowed(scope):
+            raise ValueError("scope not enabled")
+        async with self.lock:
+            result = await self.review_write(lambda: archive_stale_scope(self, scope, actor))
+        self.automatic_reviews.notify_context_change()
+        if result.get("count"):
+            invalidate_presence_cache(context=self._host_context)
+        return result
+
+    async def group_batch_action(self, scope, items, actor, *, partial=False):
         if not actor.startswith("human:") or not isinstance(items, list) or not 1 <= len(items) <= 100:
             raise ValueError("一次请选择同群的1至100条调整")
         if ":GroupMessage:" not in scope or not self.allowed(scope):
             raise ValueError("scope not enabled")
         async with self.lock:
-            prepared = []
-            targets = set()
-            for item in items:
-                if not isinstance(item, dict) or set(item) != {"id", "updated"}:
+            if not partial:
+                prepared = []
+                targets = set()
+                for item in items:
+                    if not isinstance(item, dict) or set(item) != {"id", "updated"}:
+                        raise ValueError("invalid batch item")
+                    p = await asyncio.to_thread(self.store.get, item["id"])
+                    if p["scope"] != scope or p["updated"] != item["updated"]:
+                        raise ValueError("所选记录已变化或不属于同一群，请刷新后重试")
+                    if p["entry_id"] in targets:
+                        raise ValueError("同一个学习项有多个版本，请分别处理")
+                    targets.add(p["entry_id"])
+                    allowed, reason = self.manual_review_status(p)
+                    if not allowed:
+                        raise ValueError(reason)
+                    prepared.append((p["id"], p["updated"], False))
+                results = await asyncio.to_thread(self.store.apply_batch, prepared, actor)
+                await self.refresh()
+                invalidate_presence_cache(context=self._host_context)
+                return {"applied": [p["id"] for p in results], "count": len(results)}
+
+            skipped = []
+            seen_ids = set()
+            eligible = []
+            for idx, item in enumerate(items):
+                if not isinstance(item, dict) or set(item) != {"id", "updated"} or not isinstance(item["id"], str):
                     raise ValueError("invalid batch item")
-                p = await asyncio.to_thread(self.store.get, item["id"])
-                if p["scope"] != scope or p["updated"] != item["updated"]:
-                    raise ValueError("所选记录已变化或不属于同一群，请刷新后重试")
-                if p["entry_id"] in targets:
-                    raise ValueError("同一个学习项有多个版本，请分别处理")
-                targets.add(p["entry_id"])
+                pid = item["id"]
+                if pid in seen_ids:
+                    skipped.append({"id": pid, "reason": "重复选择了同一提案"})
+                    continue
+                seen_ids.add(pid)
+                try:
+                    p = await asyncio.to_thread(self.store.get, pid)
+                except ValueError:
+                    skipped.append({"id": pid, "reason": "提案不存在"})
+                    continue
+                if p["scope"] != scope:
+                    skipped.append({"id": pid, "reason": "不属于当前群聊"})
+                    continue
+                if p["updated"] != item["updated"] or p["state"] not in {"pending", "reviewed"}:
+                    skipped.append({"id": pid, "reason": "所选记录已变化，请刷新后重试"})
+                    continue
                 allowed, reason = self.manual_review_status(p)
                 if not allowed:
-                    raise ValueError(reason)
-                prepared.append((p["id"], p["updated"], False))
-            results = await asyncio.to_thread(self.store.apply_batch, prepared, actor)
-            await self.refresh()
-            return {"applied": [p["id"] for p in results], "count": len(results)}
+                    skipped.append({"id": pid, "reason": reason})
+                    continue
+                eligible.append((idx, p))
+
+            # For competing proposals targeting the same entry_id, keep the newest and skip older ones.
+            best_by_entry = {}
+            for idx, p in eligible:
+                rank = (float(p.get("created", 0)), float(p.get("updated", 0)), idx)
+                prev = best_by_entry.get(p["entry_id"])
+                if prev is None:
+                    best_by_entry[p["entry_id"]] = (rank, idx, p)
+                elif rank > prev[0]:
+                    skipped.append({"id": prev[2]["id"], "reason": "同一个学习项存在更新版本，已跳过旧项"})
+                    best_by_entry[p["entry_id"]] = (rank, idx, p)
+                else:
+                    skipped.append({"id": p["id"], "reason": "同一个学习项存在更新版本，已跳过旧项"})
+
+            selected = sorted(best_by_entry.values(), key=lambda entry: entry[1])
+            applied_ids = []
+            for _rank, _idx, p in selected:
+                try:
+                    await asyncio.to_thread(self.store.apply, p["id"], actor, p["updated"], automatic_affection=False)
+                    applied_ids.append(p["id"])
+                except (Conflict, ValueError) as exc:
+                    skipped.append({"id": p["id"], "reason": str(exc)})
+            if applied_ids:
+                await self.refresh()
+                invalidate_presence_cache(context=self._host_context)
+            return {
+                "applied": applied_ids,
+                "count": len(applied_ids),
+                "skipped": skipped,
+                "skipped_count": len(skipped),
+            }
 
     async def batch_action(self, scope, persona, member, items, actor):
         if not actor.startswith("human:") or not isinstance(items, list) or not 1 <= len(items) <= 20:
@@ -2493,6 +2947,7 @@ class Engine:
             users = self.social.groups.get(group["scope"], {}).get("users", {}) if self.social else {}
             group["display_name"] = users.get(group["member"], {}).get("name", group["member"]) or "本群整体"
         counts = await asyncio.to_thread(self.store.proposal_counts)
+        queue_summary = await asyncio.to_thread(self.queue_counts)
         scene_summary = await asyncio.to_thread(self.store.scenes.summary)
         return {
             "schema_version": 1,
@@ -2521,6 +2976,7 @@ class Engine:
             "proposals": proposals,
             "review_groups": groups,
             "proposal_counts": counts,
+            "queue_summary": queue_summary,
             "daily": await asyncio.to_thread(self.store.console.daily),
             "tasks": await asyncio.to_thread(self.store.console.tasks),
             "next_check_at": self.next_check_at,

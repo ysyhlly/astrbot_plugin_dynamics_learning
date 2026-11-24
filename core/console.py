@@ -62,6 +62,10 @@ class Console:
                 (status, time.time(), error, retry, identity),
             )
 
+    def delete_task(self, identity):
+        with self.store.transaction():
+            self.store.db.execute("DELETE FROM console_tasks WHERE id=?", (identity,))
+
     def tasks(self):
         with self.store.lock:
             rows = [dict(r) for r in self.store.db.execute("SELECT * FROM console_tasks ORDER BY queued DESC LIMIT 60")]

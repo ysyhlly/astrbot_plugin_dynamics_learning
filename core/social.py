@@ -9,7 +9,7 @@ from collections import defaultdict
 from copy import deepcopy
 
 from .affection import state as affection_state
-from .contract import encode
+from .contract import encode, is_pure_ascii, jargon_matches
 from ..vendor.group_relations.store import RelationStore
 from ..vendor.group_relations.relation_model import SharedSentiment
 from ..vendor.group_relations.relation_signals import extract_directed_targets
@@ -364,13 +364,22 @@ class Social:
             entry=self.current_affection(scope,persona,member)
             return {'available':entry is not None,'source':'dynamics_learning','scope':scope,'member':member,
                     'relationship':entry['value'] if entry else None,'note':'这是角色对成员的亲近趋势，不代表对方感受或互动许可。'}
-        if kind=='jargon':
-            if not term or len(term)>64:
+        if kind == 'jargon':
+            clean_term = str(term or '').strip()
+            if not clean_term or len(clean_term) > 64 or (is_pure_ascii(clean_term) and len(clean_term) < 2):
                 raise ValueError('请给出需要解释的具体群内词语')
-            entries=[e for e in self.engine.cache if e['scope']==scope and e['persona']==persona and e['category']=='jargon'
-                     and e['active'] and e['expires']>time.time() and e['key']==term]
-            return {'available':bool(entries),'source':'dynamics_learning','scope':scope,
-                    'terms':[{'term':e['key'],'meaning':e['value'],'provenance':e.get('provenance',{})} for e in entries]}
+            now = time.time()
+            term_cf = clean_term.casefold()
+            active_jargon = [
+                e for e in self.engine.cache
+                if e['scope'] == scope and e['persona'] == persona and e['category'] == 'jargon'
+                and e['active'] and e['expires'] > now
+            ]
+            exact = [e for e in active_jargon if str(e['key']).strip().casefold() == term_cf]
+            entries = exact or [e for e in active_jargon if jargon_matches(e['key'], clean_term)]
+            entries = entries[:5]
+            return {'available': bool(entries), 'source': 'dynamics_learning', 'scope': scope,
+                    'terms': [{'term': e['key'], 'meaning': e['value'], 'provenance': e.get('provenance', {})} for e in entries]}
         if kind=='relations':
             edges=[self.edge(r) for r in graph.get('all_relations',[]) if member in (r['a'],r['b'])][:10]
             return {'available':member in graph.get('users',{}),'scope':scope,'member':member,'edges':edges,

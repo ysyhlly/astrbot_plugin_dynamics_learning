@@ -16,6 +16,18 @@ class ReviewUnavailable(ValueError):
     pass
 
 
+class ReviewDeferred(Exception):
+    """Transient deferral (e.g., provider budget/circuit busy); callers must back off and retry later."""
+
+    def __init__(self, message: str = "provider budget busy", *, retry_after: float = 0.0, reason: str = "busy"):
+        super().__init__(message)
+        try:
+            self.retry_after = max(0.0, float(retry_after or 0.0))
+        except (TypeError, ValueError):
+            self.retry_after = 0.0
+        self.reason = str(reason or "busy")
+
+
 class ReviewBatches:
     def __init__(self, engine):
         self.engine = engine
@@ -311,6 +323,26 @@ class ReviewBatches:
         chosen_ids = {p["id"] for p in chunks[0]}
         return [item for item, p in candidates if p["id"] in chosen_ids]
 
+    def _pause_on_deferred(self, identity, job, active_ids, exc: ReviewDeferred):
+        current = self.get(identity)
+        if not current:
+            return
+        if current["status"] == "cancelling":
+            self.finish_cancel(current)
+            job.update(current)
+            return
+        active_set = set(active_ids)
+        for item in current["items"]:
+            if item["id"] in active_set and not (item.get("committed") and item["status"] in RESULTS):
+                item.update(status="queued", error="")
+        current["status"] = "paused"
+        current["pause_reason"] = str(getattr(exc, "reason", "busy") or "busy")
+        current["retry_after"] = float(getattr(exc, "retry_after", 0.0) or 0.0)
+        self.save(current)
+        job.update(current)
+        if hasattr(self.engine, "automatic_reviews") and self.engine.automatic_reviews is not None:
+            self.engine.automatic_reviews.note_budget_busy(exc)
+
     async def _run_batch_chunk(self, identity, job, current, batch_items, single_only_ids):
         current["status"] = "running"
         batch_ids = {i["id"] for i in batch_items}
@@ -329,6 +361,8 @@ class ReviewBatches:
                 receipt=lambda p, r: self.committed(identity, p, r),
                 require_llm=True,
             )
+        except ReviewDeferred:
+            raise
         except ReviewUnavailable:
             outcome = {
                 "committed": {},
@@ -337,6 +371,14 @@ class ReviewBatches:
                 "errors": {},
             }
         except Exception as exc:
+            from ..series_panels import is_provider_budget_busy_error
+
+            if is_provider_budget_busy_error(exc):
+                raise ReviewDeferred(
+                    f"provider budget busy ({getattr(exc, 'reason', 'busy')})",
+                    retry_after=float(getattr(exc, "retry_after", 0.0) or 0.0),
+                    reason=str(getattr(exc, "reason", "busy") or "busy"),
+                ) from exc
             outcome = {
                 "committed": {},
                 "unavailable": {},
@@ -416,7 +458,11 @@ class ReviewBatches:
                         return
                     batch_items = self._select_batch_chunk(queued, single_only_ids)
                     if len(batch_items) >= 2:
-                        await self._run_batch_chunk(identity, job, current, batch_items, single_only_ids)
+                        try:
+                            await self._run_batch_chunk(identity, job, current, batch_items, single_only_ids)
+                        except ReviewDeferred as exc:
+                            self._pause_on_deferred(identity, job, [i["id"] for i in batch_items], exc)
+                            return
                         continue
                     pending = queued[0]
                     current["status"] = "running"
@@ -444,9 +490,26 @@ class ReviewBatches:
                             if p["state"] == "applied"
                             else {"approve": "reviewed", "reject": "rejected", "defer": "deferred"}[verdict]
                         )
+                    except ReviewDeferred as exc:
+                        self._pause_on_deferred(identity, job, [pending["id"]], exc)
+                        return
                     except (ReviewUnavailable, Conflict, KeyError):
                         outcome, error = "skipped", "记录、审查设置或版本已变化；请刷新核对"
                     except Exception as exc:
+                        from ..series_panels import is_provider_budget_busy_error
+
+                        if is_provider_budget_busy_error(exc):
+                            self._pause_on_deferred(
+                                identity,
+                                job,
+                                [pending["id"]],
+                                ReviewDeferred(
+                                    f"provider budget busy ({getattr(exc, 'reason', 'busy')})",
+                                    retry_after=float(getattr(exc, "retry_after", 0.0) or 0.0),
+                                    reason=str(getattr(exc, "reason", "busy") or "busy"),
+                                ),
+                            )
+                            return
                         outcome, error = "failed", type(exc).__name__
                     # Read controls again after the await; never overwrite a pause/cancel with stale state.
                     current = self.get(identity)

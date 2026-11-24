@@ -79,13 +79,23 @@ class ExpressionLearning:
             trait_ids, example_ids = [t['id'] for t in traits], [v['id'] for v in examples]
         if not traits:
             return result
+        total_budget = self.engine.reply_projection_budget() if hasattr(self.engine, 'reply_projection_budget') else 6000
+        if frozen is None and hasattr(self.engine, '_turn_budget_remaining'):
+            cap = min(3200, self.engine._turn_budget_remaining(scope, persona, member, query, include_scene=True))
+        else:
+            cap = min(3200, total_budget)
         value = {'mode': mode, 'guidance': '；'.join(t['guidance'] for t in traits)[:800],
                  'traits': [{'id': t['id'], 'kind': t['kind'], 'marker': t['marker']} for t in traits], 'examples': examples}
         item = {'source_id': row['proposal_id'], 'revision': row['revision'], 'member': '', 'category': 'expression_style',
                 'source_umo': scope, 'source_uids': row.get('source_uids', []), 'provenance_complete': row.get('provenance_complete', False),
                 'expires': row['expires'], 'value': value,
                 'selection': {'mode': mode, 'trait_ids': trait_ids, 'example_ids': example_ids}}
-        if len(encode(item)) <= 3200:
+        item_len = len(encode(item))
+        if frozen is None and item_len > cap and examples:
+            value = {**value, 'examples': []}
+            item = {**item, 'value': value, 'selection': {'mode': mode, 'trait_ids': trait_ids, 'example_ids': []}}
+            item_len = len(encode(item))
+        if item_len <= cap:
             result['items'], result['versions'] = [item], [row['proposal_id']]
         return result
 

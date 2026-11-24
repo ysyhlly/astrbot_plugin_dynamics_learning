@@ -9,7 +9,9 @@ context needed by the model.
 
 from __future__ import annotations
 
-from .contract import PERSONALITY_POLICY, digest, encode
+import json
+
+from .contract import PERSONALITY_POLICY, digest
 
 DEFER_FINGERPRINT = "review_defer_fingerprint"
 ANALYZE_PAYLOAD_BUDGET = 22_000
@@ -19,9 +21,14 @@ REVIEW_BATCH_PAYLOAD_BUDGET = 24_000
 _REPLY_TEXT_CAP = 800
 
 
+def encode_prompt_payload(value) -> str:
+    """Serialize LLM prompt payloads preserving static-first dict key order (sort_keys=False)."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=False, separators=(",", ":"), allow_nan=False)
+
+
 def utf8_len(value) -> int:
     """Return UTF-8 byte length of a string or compact JSON-encoded value."""
-    text = value if isinstance(value, str) else encode(value)
+    text = value if isinstance(value, str) else encode_prompt_payload(value)
     return len(text.encode("utf-8"))
 
 
@@ -40,15 +47,25 @@ def _compact_interaction(interaction):
     return out or None
 
 
-def extract_character_context(events, *, scope="", persona="", include_scope=False):
-    """Hoist static persona-level character summary & baseline once.
+def extract_baseline_threshold(events) -> float | None:
+    """Extract per-group baseline_threshold for inclusion in user JSON payloads (never system_prompt)."""
+    for ev in events or ():
+        if isinstance(ev, dict) and ev.get("baseline_threshold") is not None:
+            try:
+                return float(ev["baseline_threshold"])
+            except (TypeError, ValueError):
+                continue
+    return None
 
-    Omits `scope` by default so multiple groups sharing the same persona produce
-    100% byte-identical system_prompt prefixes and implicit-cache anchors;
-    `scope` remains present in user JSON payloads.
+
+def extract_character_context(events, *, scope="", persona="", include_scope=False):
+    """Hoist static persona-level character summary once.
+
+    Omits per-group `scope` and `baseline_threshold` so multiple groups sharing the
+    same persona produce 100% byte-identical system_prompt prefixes and implicit-cache
+    anchors; both `scope` and `baseline_threshold` remain in user JSON payloads.
     """
     summary = ""
-    threshold = None
     for ev in events or ():
         if not isinstance(ev, dict):
             continue
@@ -60,19 +77,14 @@ def extract_character_context(events, *, scope="", persona="", include_scope=Fal
             and ctx["persona_summary"].strip()
         ):
             summary = ctx["persona_summary"].strip()
-        if threshold is None and ev.get("baseline_threshold") is not None:
-            threshold = ev["baseline_threshold"]
-        if summary and threshold is not None:
             break
     if not summary:
         return None
     out = {"persona_summary": summary}
-    if include_scope and scope:
-        out["scope"] = scope
     if persona:
         out["persona"] = persona
-    if threshold is not None:
-        out["baseline_threshold"] = float(threshold)
+    if include_scope and scope:
+        out["scope"] = scope
     return out
 
 
@@ -86,7 +98,7 @@ def format_system_prompt(base_prompt, character_context=None):
         return base_prompt
     return (
         "[character_context]\n"
-        + encode(character_context)
+        + encode_prompt_payload(character_context)
         + "\n\n[personality_policy]\n"
         + PERSONALITY_POLICY
         + "\n\n"
@@ -227,12 +239,23 @@ def project_proposal_for_review(
     return out
 
 
-def build_analyze_payload(scope, persona, *, current, events, member_sources, character_context=None):
+def build_analyze_payload(
+    scope,
+    persona,
+    *,
+    current,
+    events,
+    member_sources,
+    character_context=None,
+    baseline_threshold=None,
+):
     """Assemble ANALYZE payload in cache-friendly static-before-volatile key order."""
     payload = {}
     if character_context:
         payload["character_context"] = character_context
     payload["current"] = current
+    if baseline_threshold is not None:
+        payload["baseline_threshold"] = float(baseline_threshold)
     payload["events"] = events
     payload["member_sources"] = member_sources
     return payload
@@ -242,11 +265,11 @@ def build_single_review_payload(proposal, *, target_material=..., include_charac
     """Assemble lean single-proposal REVIEW payload.
 
     By default `character_context` is placed in `system_prompt` by the caller so
-    it is not duplicated in user JSON.
+    it is not duplicated in user JSON; per-group `baseline_threshold` lives here.
     """
+    raw_evidence = proposal.get("evidence") or ()
     payload = {}
     if include_character_context:
-        raw_evidence = proposal.get("evidence") or ()
         char_ctx = extract_character_context(
             raw_evidence, scope=proposal.get("scope", ""), persona=proposal.get("persona", "")
         )
@@ -255,6 +278,9 @@ def build_single_review_payload(proposal, *, target_material=..., include_charac
     payload["proposal"] = project_proposal_for_review(
         proposal, include_scope_persona=True, include_evidence=True
     )
+    threshold = extract_baseline_threshold(raw_evidence)
+    if threshold is not None:
+        payload["baseline_threshold"] = threshold
     if target_material is not ...:
         payload["target_material"] = target_material
     return payload
@@ -302,8 +328,11 @@ def build_batch_review_payload(scope, persona, entries, *, resolve_target=None, 
         char_ctx = extract_character_context(all_raw_evidence, scope=scope, persona=persona)
         if char_ctx:
             payload["character_context"] = char_ctx
-    payload["evidence_pool"] = {k: evidence_pool[k] for k in sorted(evidence_pool)}
-    payload["persona"] = persona
-    payload["proposals"] = compact_proposals
     payload["scope"] = scope
+    payload["persona"] = persona
+    threshold = extract_baseline_threshold(all_raw_evidence)
+    if threshold is not None:
+        payload["baseline_threshold"] = threshold
+    payload["evidence_pool"] = {k: evidence_pool[k] for k in sorted(evidence_pool)}
+    payload["proposals"] = compact_proposals
     return payload

@@ -24,6 +24,37 @@ class Conflict(ValueError):
     pass
 
 
+DEFAULT_AUDIT_RETENTION_DAYS = 90
+JOURNAL_SIZE_LIMIT_BYTES = 67_108_864
+INCREMENTAL_VACUUM_PAGES = 256
+RELATION_RECEIPT_RETENTION_DAYS = 30
+
+
+def _compact_evidence_list(evidence):
+    if not isinstance(evidence, list):
+        return evidence, False
+    compacted = []
+    changed = False
+    for item in evidence:
+        if isinstance(item, dict):
+            if set(item) <= {"id", "message_id", "member", "scope", "trimmed"} and item.get("trimmed") is True:
+                compacted.append(item)
+            else:
+                compacted.append(
+                    {
+                        "id": item.get("id", ""),
+                        "message_id": item.get("message_id", ""),
+                        "member": item.get("member", ""),
+                        "scope": item.get("scope", ""),
+                        "trimmed": True,
+                    }
+                )
+                changed = True
+        else:
+            compacted.append(item)
+    return compacted, changed
+
+
 class Store:
     """All state transitions are SQLite transactions with compare-and-swap revisions."""
 
@@ -34,10 +65,12 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         current_version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        self.db.executescript("""
+        self.db.executescript(f"""
+        PRAGMA auto_vacuum=INCREMENTAL;
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
         PRAGMA busy_timeout=5000;
+        PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT_BYTES};
         CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, scope TEXT, persona TEXT, created REAL, body TEXT);
         CREATE INDEX IF NOT EXISTS events_scope ON events(scope, persona, created);
         CREATE INDEX IF NOT EXISTS events_scope_kind_created ON events(scope, json_extract(body,'$.kind'), created);
@@ -55,6 +88,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS review_claims(proposal TEXT PRIMARY KEY,scope TEXT,job TEXT);
         CREATE INDEX IF NOT EXISTS review_claims_scope ON review_claims(scope);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, proposal TEXT, action TEXT, actor TEXT, created REAL, body TEXT);
+        CREATE INDEX IF NOT EXISTS audit_created ON audit(created);
         CREATE TABLE IF NOT EXISTS checkpoints(scope TEXT, persona TEXT, cursor REAL, PRIMARY KEY(scope, persona));
         CREATE TABLE IF NOT EXISTS social_bindings(scope TEXT,persona TEXT,legacy_key TEXT,PRIMARY KEY(scope,persona));
         CREATE TABLE IF NOT EXISTS legacy_group_owners(scope TEXT PRIMARY KEY,legacy_key TEXT);
@@ -342,7 +376,7 @@ class Store:
             "previous": [row["id"] for row in previous],
             "current": list(current),
             "previous_reason": previous_reason,
-            "superseded": [row for row in previous if current.get(row["id"]) != row],
+            "superseded": [row["id"] for row in previous if current.get(row["id"]) != row],
         })
 
     def propose(self, data, mode, source):
@@ -662,13 +696,195 @@ class Store:
             self.db.execute("DELETE FROM review_batches WHERE scope=?", (scope,))
             self.db.execute("DELETE FROM review_claims WHERE scope=?", (scope,))
 
-    def prune(self, days):
+    def latest_baselines(self):
+        with self.lock:
+            rows = self.db.execute("""SELECT e.scope,e.persona,
+                json_extract(e.body,'$.baseline') AS baseline,
+                json_extract(e.body,'$.host_version') AS host_version
+                FROM events e JOIN
+                (SELECT scope,persona,max(created) AS stamp FROM events GROUP BY scope,persona) q
+                ON e.scope=q.scope AND e.persona=q.persona AND e.created=q.stamp""").fetchall()
+            return {
+                (r[0], r[1]): (r[2], r[3])
+                for r in rows
+                if r[2] is not None and r[3] is not None
+            }
+
+    def archive_stale_proposals(
+        self,
+        *,
+        current_personas=None,
+        latest_baselines=None,
+        now=None,
+        actor="system:auto-archive",
+        scope="",
+        include_policy_invalid=False,
+        include_revision_changed=False,
+        require_known_baseline=True,
+    ):
+        """Transition stale pending/reviewed proposals to archived with audit trail."""
+        stamp = time.time() if now is None else float(now)
+        archived = []
+        reasons: dict[str, int] = {}
+        with self.transaction():
+            personas = (
+                dict(self.latest_personas())
+                if current_personas is None
+                else {**self.latest_personas(), **current_personas}
+            )
+            baselines = (
+                dict(self.latest_baselines())
+                if latest_baselines is None
+                else {**self.latest_baselines(), **latest_baselines}
+            )
+            active_claims = {
+                r[0]
+                for r in self.db.execute(
+                    """SELECT c.proposal FROM review_claims c
+                    JOIN review_batches j ON j.id=c.job
+                    WHERE j.status IN ('queued','running','pausing','cancelling')"""
+                ).fetchall()
+            }
+            if scope:
+                rows = self.db.execute(
+                    "SELECT body FROM proposals WHERE scope=? AND state IN ('pending','reviewed')",
+                    (scope,),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT body FROM proposals WHERE state IN ('pending','reviewed')"
+                ).fetchall()
+            for row in rows:
+                p = json.loads(row[0])
+                if p["id"] in active_claims:
+                    continue
+                reason = ""
+                if include_policy_invalid and not policy_allowed(p):
+                    reason = "policy_invalid"
+                elif personas.get(p["scope"]) is not None and personas.get(p["scope"]) != p["persona"]:
+                    reason = "persona_changed"
+                elif p["created"] + p["days"] * 86400 <= stamp:
+                    reason = "expired"
+                elif include_revision_changed:
+                    entry_row = self.db.execute(
+                        "SELECT json_extract(body,'$.revision') FROM entries WHERE id=?",
+                        (p["entry_id"],),
+                    ).fetchone()
+                    if (entry_row[0] if entry_row else 0) != p["base_revision"]:
+                        reason = "revision_changed"
+                if not reason and p["category"] == "participation":
+                    pair = (p["scope"], p["persona"])
+                    if pair in baselines:
+                        if baselines[pair] != (p["baseline"], p["host_version"]):
+                            reason = "baseline_changed"
+                    elif not require_known_baseline:
+                        reason = "baseline_changed"
+                if not reason:
+                    continue
+                p.update(
+                    previous_state=p["state"],
+                    state="archived",
+                    archive_reason=reason,
+                    archived_at=stamp,
+                    archived_by=actor,
+                )
+                self.db.execute("DELETE FROM review_claims WHERE proposal=?", (p["id"],))
+                self._save(p)
+                self._audit(p, "archive", actor, {"reason": reason})
+                archived.append(p["id"])
+                reasons[reason] = reasons.get(reason, 0) + 1
+        return {"count": len(archived), "archived": archived, "reasons": reasons}
+
+    def _protected_applied_proposal_ids(self):
+        protected = set()
+        frontier = set()
+        for row in self.db.execute("SELECT body FROM entries").fetchall():
+            try:
+                entry = json.loads(row[0])
+            except (TypeError, ValueError):
+                continue
+            pid = entry.get("proposal_id")
+            if isinstance(pid, str) and pid and not pid.startswith("legacy:"):
+                protected.add(pid)
+                frontier.add(pid)
+        for _ in range(32):
+            if not frontier:
+                break
+            next_frontier = set()
+            placeholders = ",".join("?" for _ in frontier)
+            for row in self.db.execute(
+                f"SELECT body FROM proposals WHERE id IN ({placeholders})", tuple(frontier)
+            ).fetchall():
+                try:
+                    p = json.loads(row[0])
+                except (TypeError, ValueError):
+                    continue
+                before = p.get("before")
+                if isinstance(before, dict):
+                    prev_pid = before.get("proposal_id")
+                    if (
+                        isinstance(prev_pid, str)
+                        and prev_pid
+                        and not prev_pid.startswith("legacy:")
+                        and prev_pid not in protected
+                    ):
+                        protected.add(prev_pid)
+                        next_frontier.add(prev_pid)
+            frontier = next_frontier
+        return protected
+
+    def prune(
+        self,
+        days,
+        *,
+        current_personas=None,
+        latest_baselines=None,
+        audit_retention_days=None,
+        allowed_scopes=None,
+        inbox_expire_days=None,
+    ):
+        archived = self.archive_stale_proposals(
+            current_personas=current_personas,
+            latest_baselines=latest_baselines,
+            actor="system:auto-archive",
+            include_policy_invalid=False,
+            include_revision_changed=False,
+            require_known_baseline=True,
+        )
         self.automatic_reviews.prune(days)
         self.console.prune(days)
         self.scenes.prune(days)
         self.expressions.prune(days)
+        audit_days = (
+            max(1, int(audit_retention_days))
+            if audit_retention_days is not None
+            else max(DEFAULT_AUDIT_RETENTION_DAYS, max(1, int(days)))
+        )
+        proposals_compacted = 0
+        proposals_pruned = 0
+        inbox_expired = 0
+        receipts_pruned = 0
         with self.lock, self.db:
-            cutoff = time.time() - days * 86400
+            now = time.time()
+            cutoff = now - days * 86400
+            audit_cutoff = now - audit_days * 86400
+            if allowed_scopes is not None:
+                inbox_expired += self.db.execute(
+                    "UPDATE analysis_inbox SET processed=1 WHERE processed=0 AND scope NOT IN (SELECT value FROM json_each(?))",
+                    (encode(list(allowed_scopes)),),
+                ).rowcount
+            if current_personas is not None:
+                for sc, active_persona in current_personas.items():
+                    inbox_expired += self.db.execute(
+                        "UPDATE analysis_inbox SET processed=1 WHERE processed=0 AND scope=? AND persona!=? AND created<?",
+                        (sc, active_persona, cutoff),
+                    ).rowcount
+            if inbox_expire_days is not None:
+                inbox_cutoff = now - max(1, int(inbox_expire_days)) * 86400
+                inbox_expired += self.db.execute(
+                    "UPDATE analysis_inbox SET processed=1 WHERE processed=0 AND created<?",
+                    (inbox_cutoff,),
+                ).rowcount
             self.db.execute(
                 "DELETE FROM events WHERE created<? AND NOT EXISTS (SELECT 1 FROM analysis_inbox q WHERE q.event_id=events.id AND q.processed=0)",
                 (cutoff,),
@@ -690,6 +906,85 @@ class Store:
                     (cutoff,),
                 )
             self.db.execute("DELETE FROM native_receipts WHERE created<?", (cutoff,))
+
+            protected_applied = self._protected_applied_proposal_ids()
+            for row in self.db.execute(
+                "SELECT id, state, updated, body FROM proposals WHERE state IN ('rejected','archived','rolled_back','applied') AND updated<?",
+                (cutoff,),
+            ).fetchall():
+                pid, state, updated, raw_body = row[0], row[1], row[2], row[3]
+                if pid in protected_applied:
+                    continue
+                if state in {"rejected", "archived", "rolled_back"} and updated < audit_cutoff:
+                    self.db.execute("DELETE FROM proposals WHERE id=?", (pid,))
+                    proposals_pruned += 1
+                    continue
+                try:
+                    p = json.loads(raw_body)
+                except (TypeError, ValueError):
+                    continue
+                changed = False
+                compacted_ev, ev_changed = _compact_evidence_list(p.get("evidence"))
+                if ev_changed:
+                    p["evidence"] = compacted_ev
+                    changed = True
+                if state in {"rejected", "archived", "rolled_back"} and isinstance(p.get("before"), dict):
+                    slim_before = {
+                        k: p["before"][k]
+                        for k in ("id", "revision", "active", "proposal_id")
+                        if k in p["before"]
+                    }
+                    if slim_before != p["before"]:
+                        p["before"] = slim_before
+                        changed = True
+                if changed:
+                    self.db.execute("UPDATE proposals SET body=? WHERE id=?", (encode(p), pid))
+                    proposals_compacted += 1
+
+            for row in self.db.execute(
+                "SELECT id, body FROM audit WHERE action='evidence_updated' AND instr(body,'\"superseded\":[{')>0"
+            ).fetchall():
+                try:
+                    abody = json.loads(row[1])
+                except (TypeError, ValueError):
+                    continue
+                sup = abody.get("superseded")
+                if isinstance(sup, list) and any(isinstance(item, dict) for item in sup):
+                    abody["superseded"] = [item.get("id", "") if isinstance(item, dict) else item for item in sup]
+                    self.db.execute("UPDATE audit SET body=? WHERE id=?", (encode(abody), row[0]))
+
+            self.db.execute(
+                "DELETE FROM proposal_evidence_sources WHERE proposal NOT IN (SELECT id FROM proposals WHERE state IN ('pending','reviewed'))"
+            )
+            self.db.execute(
+                "DELETE FROM affection_source_claims WHERE proposal NOT IN (SELECT id FROM proposals WHERE state='applied')"
+            )
+            if self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='relation_source_receipts'"
+            ).fetchone():
+                cols = {r[1] for r in self.db.execute("PRAGMA table_info(relation_source_receipts)").fetchall()}
+                if "created" in cols:
+                    receipt_cutoff = int(now - RELATION_RECEIPT_RETENTION_DAYS * 86400)
+                    receipts_pruned = self.db.execute(
+                        "DELETE FROM relation_source_receipts WHERE created<?",
+                        (receipt_cutoff,),
+                    ).rowcount
+
+            audit_pruned = self.db.execute("DELETE FROM audit WHERE created<?", (audit_cutoff,)).rowcount
+
+        with self.lock:
+            self.db.execute(f"PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT_BYTES}")
+            self.db.execute(f"PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES})")
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return {
+            "archived": archived["count"],
+            "archived_ids": archived["archived"],
+            "audit_pruned": audit_pruned,
+            "proposals_compacted": proposals_compacted,
+            "proposals_pruned": proposals_pruned,
+            "inbox_expired": inbox_expired,
+            "receipts_pruned": receipts_pruned,
+        }
 
     def observations(self, proposal):
         """Operational observations, never inferred quality labels or counterfactual scores."""

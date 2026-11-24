@@ -16,12 +16,14 @@ from astrbot_plugin_dynamics_learning.core.engine import (
     REVIEW_CONCISE_RULE,
     UNIFIED_REVIEW,
     Engine,
+    build_review_instruction,
     parse_batch_review_verdicts,
 )
 from astrbot_plugin_dynamics_learning.core.expressions import REVIEW_STYLE
 from astrbot_plugin_dynamics_learning.core.model_projection import (
     ANALYZE_PAYLOAD_BUDGET,
     REVIEW_BATCH_PAYLOAD_BUDGET,
+    encode_prompt_payload,
     format_system_prompt,
     utf8_len,
 )
@@ -326,12 +328,17 @@ def test_analyze_current_stable_ascending_order_and_current_first_compact_json(s
         assert len(payloads) == 1
         data1 = payloads[0]
         # Dict insertion order has "current" strictly before volatile "events" and "member_sources"
-        assert list(data1.keys()) == ["current", "events", "member_sources"]
-        serialized1 = encode(data1)
+        assert list(data1.keys()) == ["current", "baseline_threshold", "events", "member_sources"]
+        serialized1 = encode_prompt_payload(data1)
         assert serialized1.startswith('{"current":[')
-        assert serialized1.index('"current":') < serialized1.index('"events":') < serialized1.index('"member_sources":')
-        # Compact separators=(",", ":") — no whitespace after structural colon/comma
-        assert json.dumps(data1, ensure_ascii=False, sort_keys=True, separators=(",", ":")) == serialized1
+        assert (
+            serialized1.index('"current":')
+            < serialized1.index('"baseline_threshold":')
+            < serialized1.index('"events":')
+            < serialized1.index('"member_sources":')
+        )
+        # Compact separators=(",", ":") preserving static-first insertion order
+        assert json.dumps(data1, ensure_ascii=False, sort_keys=False, separators=(",", ":")) == serialized1
 
         # Entries in current are strictly sorted ascending by (created_at, id)
         ids1 = [e["id"] for e in data1["current"]]
@@ -518,7 +525,7 @@ def test_review_batch_happy_path_deduplicates_evidence_pool_and_respects_modes(s
 
         async def model(role, instruction, data):
             calls.append((role, instruction, data))
-            assert instruction == UNIFIED_REVIEW
+            assert instruction == build_review_instruction(include_scenes=False, include_style=False)
             assert "evidence_pool" in data and "proposals" in data
             # Shared evidence must be deduplicated into evidence_pool (2 unique events, not 6 copies)
             assert set(data["evidence_pool"].keys()) == {ev1["id"], ev2["id"]}
@@ -572,7 +579,7 @@ def test_review_batch_partial_malformed_and_omitted_verdicts_fallback_to_single_
 
         async def model(role, instruction, data):
             nonlocal batch_calls
-            assert instruction == UNIFIED_REVIEW
+            assert instruction == build_review_instruction(include_scenes=False, include_style=False)
             if "proposals" in data:
                 batch_calls += 1
                 return {
@@ -745,7 +752,7 @@ def test_review_batches_job_batches_llm_calls_with_durable_receipts_and_partial_
 
         async def model_all_ok(role, instruction, data):
             calls.append("batch" if "proposals" in data else "single")
-            assert instruction == UNIFIED_REVIEW
+            assert instruction == build_review_instruction(include_scenes=False, include_style=False)
             assert "evidence_pool" in data
             return {
                 "verdicts": [
@@ -825,7 +832,9 @@ def test_scene_pending_reviews_use_batch_and_unified_prompt(store):
         engine.current_personas[SCOPE] = PERSONA
         await engine.scenes.analyze(SCOPE, PERSONA)
 
-        assert calls == [("review_provider", UNIFIED_REVIEW, True)]
+        assert calls == [
+            ("review_provider", build_review_instruction(include_scenes=True, include_style=False), True)
+        ]
         assert store.get(p1["id"])["state"] == "applied"
         assert store.get(p2["id"])["state"] == "applied"
 
@@ -875,7 +884,9 @@ def test_expression_review_pending_uses_batch_and_unified_prompt(store):
         engine.current_personas[SCOPE] = PERSONA
         await engine.expressions.review_pending(SCOPE, PERSONA, engine.scope_token(SCOPE))
 
-        assert calls == [("review_provider", UNIFIED_REVIEW, True, 2)]
+        assert calls == [
+            ("review_provider", build_review_instruction(include_scenes=False, include_style=True), True, 2)
+        ]
         assert store.get(p1["id"])["state"] == "reviewed"
         assert store.get(p2["id"])["state"] == "reviewed"
 
@@ -992,7 +1003,7 @@ def test_preserved_defer_fingerprint_sleeps_until_evidence_refreshed(store):
         assert first["state"] == "pending"
         assert first.get(DEFER_FINGERPRINT)
         assert len(calls) == 1
-        assert calls[0][1] == UNIFIED_REVIEW
+        assert calls[0][1] == build_review_instruction(include_scenes=False, include_style=False)
 
         # Unchanged evidence sleeps: automatic catchup does NOT re-call the LLM
         assert engine.automatic_review_waiting(first, time.time()) is True
@@ -1093,7 +1104,7 @@ def test_preserved_automatic_reviews_queue_uses_unified_prompt_and_evidence_pool
         assert len(seen) == 1
         role, instruction, data = seen[0]
         assert role == "review_provider"
-        assert instruction == UNIFIED_REVIEW
+        assert instruction == build_review_instruction(include_scenes=False, include_style=False)
         assert set(data["evidence_pool"].keys()) == {ev1["id"], ev2["id"]}
         assert all("evidence" not in item and item["evidence_ids"] for item in data["proposals"])
         assert store.get(p1["id"])["state"] == "applied"
@@ -1250,21 +1261,23 @@ def test_analyze_lean_projection_hoists_persona_summary_strips_policy_context_an
 
         assert res["proposals"] >= 1
         analyze_instruction, analyze_data = next((ins, d) for r, ins, d in captured if r == "analysis_provider")
-        serialized = encode(analyze_data)
+        serialized = encode_prompt_payload(analyze_data)
         projected_bytes = len(serialized.encode("utf-8"))
 
-        # Static persona-level character_context hoisted into system_prompt (omitting scope), omitted from user JSON
+        # Static persona-level character_context hoisted into system_prompt (omitting scope & baseline_threshold)
         expected_char_ctx = {
             "persona_summary": "人设摘要" * 450,
             "persona": PERSONA,
-            "baseline_threshold": 55.0,
         }
         assert analyze_instruction == format_system_prompt(ANALYZE, expected_char_ctx)
-        assert list(analyze_data.keys()) == ["current", "events", "member_sources"]
+        assert "baseline_threshold" not in analyze_instruction
+        assert list(analyze_data.keys()) == ["current", "baseline_threshold", "events", "member_sources"]
+        assert analyze_data["baseline_threshold"] == 55.0
         assert "character_context" not in analyze_data
         assert serialized.startswith('{"current":[')
         assert (
             serialized.index('"current":')
+            < serialized.index('"baseline_threshold":')
             < serialized.index('"events":')
             < serialized.index('"member_sources":')
         )
@@ -1350,11 +1363,10 @@ def test_review_single_and_batch_lean_projection_reduces_payload_and_hoists_char
         engine = Engine(store, {"sessions": [SCOPE], "review_provider": "rp"}, model)
         engine.current_personas[SCOPE] = PERSONA
         expected_review_instruction = format_system_prompt(
-            UNIFIED_REVIEW,
+            build_review_instruction(include_scenes=False, include_style=False),
             {
                 "persona_summary": "人设摘要" * 450,
                 "persona": PERSONA,
-                "baseline_threshold": 55.0,
             },
         )
 
@@ -1526,7 +1538,12 @@ def test_events_and_profile_messages_reviews_share_identical_system_prompt_with_
         # Brand-new Engine instance: _character_context_cache starts empty -> proves lazy SQLite hydration
         engine = Engine(
             store,
-            {"sessions": [SCOPE], "analysis_provider": "ap", "review_provider": "rp"},
+            {
+                "sessions": [SCOPE],
+                "analysis_provider": "ap",
+                "review_provider": "rp",
+                "expression_style_enabled": True,
+            },
             model,
         )
         engine.current_personas[SCOPE] = PERSONA
@@ -1561,9 +1578,10 @@ def test_events_and_profile_messages_reviews_share_identical_system_prompt_with_
         expected_char_ctx = {
             "persona_summary": "稳定角色人设" * 300,
             "persona": PERSONA,
-            "baseline_threshold": 55.0,
         }
-        expected_review_prompt = format_system_prompt(UNIFIED_REVIEW, expected_char_ctx)
+        expected_review_prompt = format_system_prompt(
+            build_review_instruction(include_scenes=False, include_style=True), expected_char_ctx
+        )
         expected_analyze_prompt = format_system_prompt(ANALYZE, expected_char_ctx)
 
         review_calls = [(ins, d) for role, ins, d in seen if role == "review_provider"]
@@ -1811,23 +1829,30 @@ def test_phase3_review_batch_size_cap_4_and_payload_budget_24k(store):
 
 
 def test_phase3_model_optional_max_tokens_and_reasoning_effort_passthrough():
-    from astrbot_plugin_dynamics_learning.main import DynamicsLearning, MIN_SAFE_MODEL_MAX_TOKENS
+    from astrbot_plugin_dynamics_learning.main import (
+        BATCH_OR_ANALYZE_MAX_TOKENS,
+        DEFAULT_MODEL_REASONING_EFFORT,
+        MIN_SAFE_MODEL_MAX_TOKENS,
+        MIN_SAFE_SINGLE_REVIEW_MAX_TOKENS,
+        SINGLE_REVIEW_MAX_TOKENS,
+        DynamicsLearning,
+    )
 
     schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     assert schema["model_max_tokens"]["default"] == 0
-    assert schema["model_reasoning_effort"]["default"] == ""
+    assert schema["model_reasoning_effort"]["default"] == DEFAULT_MODEL_REASONING_EFFORT == "low"
 
     async def run():
-        async def _call_with(provider, config):
+        async def _call_with(provider, config, *, role="review_provider", data=None):
             plugin = DynamicsLearning.__new__(DynamicsLearning)
             plugin.closed = False
-            plugin.config = {"review_provider": "rp", **config}
+            plugin.config = {"review_provider": "rp", "analysis_provider": "rp", **config}
             plugin.context = SimpleNamespace(get_provider_by_id=lambda pid: provider if pid == "rp" else None)
             plugin.engine = None
-            return await plugin._model("review_provider", UNIFIED_REVIEW, {"proposal": {"id": "p1"}})
+            return await plugin._model(role, UNIFIED_REVIEW, data if data is not None else {"proposal": {"id": "p1"}})
 
-        # 1) Provider accepting **kwargs: default config passes NO extra kwargs
+        # 1) Provider accepting **kwargs: defaults pass reasoning_effort='low' + tiered max_tokens
         kw_calls = []
 
         class KwargsProvider:
@@ -1839,13 +1864,27 @@ def test_phase3_model_optional_max_tokens_and_reasoning_effort_passthrough():
                 return SimpleNamespace(completion_text='{"verdict":"approve","reason":"ok","risks":[]}')
 
         await _call_with(KwargsProvider(), {})
-        assert kw_calls[-1] == {}
+        assert kw_calls[-1] == {
+            "max_tokens": SINGLE_REVIEW_MAX_TOKENS,
+            "reasoning_effort": DEFAULT_MODEL_REASONING_EFFORT,
+        }
+
+        # Batch review / analyze receive higher batch/analyze cap (1536)
+        await _call_with(KwargsProvider(), {}, role="review_provider", data={"proposals": [{"id": "p1"}]})
+        assert kw_calls[-1] == {
+            "max_tokens": BATCH_OR_ANALYZE_MAX_TOKENS,
+            "reasoning_effort": DEFAULT_MODEL_REASONING_EFFORT,
+        }
+
+        # Explicit empty string opts out of reasoning_effort while preserving max_tokens override
+        await _call_with(KwargsProvider(), {"model_max_tokens": 2048, "model_reasoning_effort": ""})
+        assert kw_calls[-1] == {"max_tokens": 2048}
 
         # Configured values passed through to **kwargs provider
         await _call_with(KwargsProvider(), {"model_max_tokens": 2048, "model_reasoning_effort": "minimal"})
         assert kw_calls[-1] == {"max_tokens": 2048, "reasoning_effort": "minimal"}
 
-        # 2) Explicit signature provider: max_tokens below 1536 clamped safely to >= 1536
+        # 2) Explicit signature provider: single-review clamps to >= 512, batch/analyze clamps to >= 1024
         explicit_calls = []
 
         class ExplicitProvider:
@@ -1858,10 +1897,31 @@ def test_phase3_model_optional_max_tokens_and_reasoning_effort_passthrough():
                 explicit_calls.append((max_tokens, reasoning_effort))
                 return SimpleNamespace(completion_text='{"verdict":"approve","reason":"ok","risks":[]}')
 
-        await _call_with(ExplicitProvider(), {"model_max_tokens": 512, "model_reasoning_effort": "low"})
+        await _call_with(ExplicitProvider(), {"model_max_tokens": 256, "model_reasoning_effort": "low"})
+        assert explicit_calls[-1] == (MIN_SAFE_SINGLE_REVIEW_MAX_TOKENS, "low")
+        await _call_with(
+            ExplicitProvider(),
+            {"model_max_tokens": 256, "model_reasoning_effort": "low"},
+            role="analysis_provider",
+            data={"events": []},
+        )
         assert explicit_calls[-1] == (MIN_SAFE_MODEL_MAX_TOKENS, "low")
 
-        # 3) Strict provider accepting neither kwarg: safe no-op without TypeError
+        # 3) Provider with extra_body (and no reasoning_effort kwarg) receives reasoning_effort in extra_body
+        extra_body_calls = []
+
+        class ExtraBodyProvider:
+            def meta(self):
+                return SimpleNamespace(model="extra-body-model")
+
+            async def text_chat(self, prompt=None, system_prompt=None, contexts=None, max_tokens=None, extra_body=None):
+                extra_body_calls.append((max_tokens, extra_body))
+                return SimpleNamespace(completion_text='{"verdict":"approve","reason":"ok","risks":[]}')
+
+        await _call_with(ExtraBodyProvider(), {"model_reasoning_effort": "minimal"})
+        assert extra_body_calls[-1] == (SINGLE_REVIEW_MAX_TOKENS, {"reasoning_effort": "minimal"})
+
+        # 4) Strict provider accepting neither kwarg: safe no-op without TypeError
         strict_calls = []
 
         class StrictProvider:
@@ -1876,7 +1936,7 @@ def test_phase3_model_optional_max_tokens_and_reasoning_effort_passthrough():
         assert res["verdict"] == "approve"
         assert len(strict_calls) == 1
 
-        # 4) Provider accepting ONLY max_tokens: omits reasoning_effort cleanly
+        # 5) Provider accepting ONLY max_tokens: omits reasoning_effort cleanly
         partial_calls = []
 
         class MaxOnlyProvider:
@@ -2038,7 +2098,6 @@ def test_phase4_scene_and_expression_learning_include_character_context_in_syste
         expected_char_ctx = {
             "persona_summary": persona_summary,
             "persona": persona,
-            "baseline_threshold": 55.0,
         }
         scene_calls = [ins for r, ins, d in seen if r == "analysis_provider" and "episodes" in d]
         expr_calls = [ins for r, ins, d in seen if r == "analysis_provider" and "sample" in d]

@@ -8,7 +8,7 @@ ensure_current(
     __package__,
     __name__,
     __file__,
-    version="2.0.0-rc.6",
+    version="2.0.0-rc.7",
     checks=[
         ("core.engine", "Engine", "_review_contract_v1"),
         ("core.engine", "Engine", "_automatic_review_contract_v1"),
@@ -35,17 +35,21 @@ from .core.contract import (
     MalformedModelResponse,
     decode_model_object,
     encode,
+    jargon_matches,
     text,
 )
+from . import series_panels
 from .core.engine import Engine
+from .core.model_projection import encode_prompt_payload
 from .core.native import current_persona, group_projection, private_projection, replacement_allowed, role_provider
 from .core.profiles import native_message
-from .core.review_batches import ReviewUnavailable
+from .core.review_batches import ReviewDeferred, ReviewUnavailable
 from .core.review_evidence import provider_model
 from .core.social import Social, character_key, observed_event
 from .core.source_withdrawals import recall_source
 from .core.store import Store
 from .series_panels import (
+    find_provider_silently,
     get_series_defaults,
     inherit_umos,
     is_provider_budget_busy_error,
@@ -56,7 +60,11 @@ from .series_panels import (
 )
 
 PLUGIN = "astrbot_plugin_dynamics_learning"
-MIN_SAFE_MODEL_MAX_TOKENS = 1536
+DEFAULT_MODEL_REASONING_EFFORT = "low"
+SINGLE_REVIEW_MAX_TOKENS = 768
+MIN_SAFE_SINGLE_REVIEW_MAX_TOKENS = 512
+BATCH_OR_ANALYZE_MAX_TOKENS = 1536
+MIN_SAFE_MODEL_MAX_TOKENS = 1024
 REASONING_EFFORT_OPTIONS = frozenset({"none", "minimal", "low", "medium", "high"})
 _CATEGORY_LABELS = {
     "expression_style": "本群表达习惯",
@@ -185,8 +193,13 @@ def _cache_anchor_contexts(instruction):
     ]
 
 
-def _text_chat_extra_kwargs(provider, config):
-    """Build optional max_tokens / reasoning_effort kwargs accepted by provider.text_chat."""
+def _text_chat_extra_kwargs(provider, config, *, role: str = "", is_single_review: bool = False):
+    """Build optional max_tokens / reasoning_effort kwargs accepted by provider.text_chat.
+
+    Defaults reasoning_effort to 'low' (when unset in config) and caps output tokens
+    per task class (768 for single-item review, 1536 for batch review / analyze) to
+    prevent runaway reasoning outputs on structured JSON classification tasks.
+    """
     if not isinstance(config, dict) and not hasattr(config, "get"):
         return {}
     candidates = {}
@@ -197,8 +210,15 @@ def _text_chat_extra_kwargs(provider, config):
         except (TypeError, ValueError):
             parsed_max = 0
         if parsed_max > 0:
-            candidates["max_tokens"] = max(MIN_SAFE_MODEL_MAX_TOKENS, parsed_max)
-    raw_effort = str(config.get("model_reasoning_effort", "") or "").strip().lower()
+            floor = MIN_SAFE_SINGLE_REVIEW_MAX_TOKENS if is_single_review else MIN_SAFE_MODEL_MAX_TOKENS
+            candidates["max_tokens"] = max(floor, parsed_max)
+        elif parsed_max == 0:
+            candidates["max_tokens"] = SINGLE_REVIEW_MAX_TOKENS if is_single_review else BATCH_OR_ANALYZE_MAX_TOKENS
+    if "model_reasoning_effort" in config:
+        raw_val = config.get("model_reasoning_effort")
+        raw_effort = (DEFAULT_MODEL_REASONING_EFFORT if raw_val is None else str(raw_val)).strip().lower()
+    else:
+        raw_effort = DEFAULT_MODEL_REASONING_EFFORT
     if raw_effort in REASONING_EFFORT_OPTIONS:
         candidates["reasoning_effort"] = raw_effort
     if not candidates:
@@ -212,11 +232,18 @@ def _text_chat_extra_kwargs(provider, config):
         return {}
     has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
     allowed_kinds = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-    return {
-        key: val
-        for key, val in candidates.items()
-        if has_varkw or (key in params and params[key].kind in allowed_kinds)
-    }
+    out = {}
+    for key, val in candidates.items():
+        if has_varkw or (key in params and params[key].kind in allowed_kinds):
+            out[key] = val
+    if (
+        "reasoning_effort" in candidates
+        and "reasoning_effort" not in out
+        and "extra_body" in params
+        and params["extra_body"].kind in allowed_kinds
+    ):
+        out["extra_body"] = {"reasoning_effort": candidates["reasoning_effort"]}
+    return out
 
 
 class DynamicsLearning(Star):
@@ -279,8 +306,7 @@ class DynamicsLearning(Star):
             defaults = get_series_defaults(self.context)
             candidate = str(defaults.get("decision_provider") or "").strip()
             if candidate:
-                getter = getattr(self.context, "get_provider_by_id", None)
-                provider = getter(candidate) if callable(getter) else None
+                provider = find_provider_silently(self.context, candidate)
                 if provider is None or not getattr(provider, "is_native_decision_provider", False):
                     return candidate
             return str(defaults.get("reply_provider") or "").strip() or Engine._host_default_provider_id(
@@ -290,13 +316,12 @@ class DynamicsLearning(Star):
 
     def _provider_status(self):
         status = {}
-        get_provider = getattr(self.context, "get_provider_by_id", None)
         for role in ("analysis_provider", "review_provider"):
             pid = self._effective_provider(role)
             if not pid:
                 status[role] = {"configured": False, "ready": False, "provider_id": ""}
                 continue
-            provider = get_provider(pid) if callable(get_provider) else None
+            provider = find_provider_silently(self.context, pid)
             ready = bool(
                 provider is not None
                 and callable(getattr(provider, "text_chat", None))
@@ -350,6 +375,7 @@ class DynamicsLearning(Star):
             ("review_batch_control", self.review_batch_control, ["POST"]),
             ("reply_preview", self.reply_preview, ["POST"]),
             ("governance_action", self.governance_action, ["POST"]),
+            ("archive_stale", self.archive_stale, ["POST"]),
             ("library", self.library, ["POST"]),
             ("material_detail", self.material_detail, ["POST"]),
             ("entries", self.entries, ["POST"]),
@@ -379,32 +405,174 @@ class DynamicsLearning(Star):
             return {
                 "badge": {"count": 0, "tone": "muted", "label": "未就绪"},
                 "pulse": {"headline": "群间学习尚未就绪", "updated_at": updated_at},
+                "ready_count": 0,
+                "stale_count": 0,
+                "waiting_count": 0,
+                "pending_total": 0,
             }
         try:
             counts = self.engine.store.proposal_counts()
-            pending = int(counts.get("pending", 0)) + int(counts.get("reviewed", 0))
+            q = self.engine.queue_counts()
+            ready_count = int(q.get("ready_count", 0))
+            stale_count = int(q.get("stale_count", 0))
+            waiting_count = int(q.get("waiting_count", 0)) + int(q.get("held_count", 0))
+            pending_total = int(q.get("pending_total", 0))
             applied = int(counts.get("applied", 0))
             master_enabled = bool(self.config.get("enabled", True))
-            if not master_enabled:
-                label = f"总开关已关闭 · {pending} 项待审" if pending > 0 else "总开关已关闭"
-                headline = f"学习总开关已关闭 · 待审 {pending} 项 · 已应用 {applied} 条"
-                return {
-                    "badge": {"count": pending, "tone": "muted", "label": label},
-                    "pulse": {"headline": headline, "updated_at": updated_at},
-                }
-            tone = "warm" if pending > 0 else "accent"
-            label = f"{pending} 项待审" if pending > 0 else "队列空闲"
             job_note = f"处理中 {len(self.jobs)} 项" if self.jobs else "队列空闲"
-            headline = f"待审 {pending} 项 · 已应用 {applied} 条 · {job_note}"
+            headline_parts = [f"可审 {ready_count} 项"]
+            if waiting_count > 0:
+                headline_parts.append(f"待初审 {waiting_count} 项")
+            if stale_count > 0:
+                headline_parts.append(f"失效 {stale_count} 项")
+            headline_parts.append(f"已应用 {applied} 条")
+            if not master_enabled:
+                if ready_count > 0:
+                    label = (
+                        f"总开关已关闭 · {ready_count} 可审 · {stale_count} 失效"
+                        if stale_count > 0
+                        else f"总开关已关闭 · {ready_count} 项可审"
+                    )
+                elif stale_count > 0:
+                    label = f"总开关已关闭 · {stale_count} 失效"
+                else:
+                    label = "总开关已关闭"
+                headline = "学习总开关已关闭 · " + " · ".join(headline_parts)
+                return {
+                    "badge": {"count": ready_count, "tone": "muted", "label": label},
+                    "pulse": {"headline": headline, "updated_at": updated_at},
+                    "ready_count": ready_count,
+                    "stale_count": stale_count,
+                    "waiting_count": waiting_count,
+                    "pending_total": pending_total,
+                }
+            if ready_count > 0:
+                tone = "warm"
+                label = (
+                    f"{ready_count} 项待审 · {stale_count} 失效"
+                    if stale_count > 0
+                    else f"{ready_count} 项待审"
+                )
+            elif waiting_count > 0:
+                tone = "info"
+                label = (
+                    f"{waiting_count} 待初审 · {stale_count} 失效"
+                    if stale_count > 0
+                    else f"{waiting_count} 项待初审"
+                )
+            elif stale_count > 0:
+                tone = "muted"
+                label = f"{stale_count} 项已失效"
+            else:
+                tone = "accent"
+                label = "队列空闲"
+            headline_parts.append(job_note)
+            headline = " · ".join(headline_parts)
             return {
-                "badge": {"count": pending, "tone": tone, "label": label},
+                "badge": {"count": ready_count, "tone": tone, "label": label},
                 "pulse": {"headline": headline, "updated_at": updated_at},
+                "ready_count": ready_count,
+                "stale_count": stale_count,
+                "waiting_count": waiting_count,
+                "pending_total": pending_total,
             }
         except Exception:
             return {
                 "badge": {"count": 0, "tone": "muted", "label": "暂不可用"},
                 "pulse": {"headline": "状态读取暂不可用", "updated_at": updated_at},
+                "ready_count": 0,
+                "stale_count": 0,
+                "waiting_count": 0,
+                "pending_total": 0,
             }
+
+    def get_series_health(self) -> dict:
+        """Synchronous, read-only health & provider binding diagnostics for series_panels.read_plugin_health."""
+        providers: list[dict[str, str]] = []
+        issues: list[str] = []
+        for role, slot_name in (("analysis_provider", "analysis"), ("review_provider", "review")):
+            pid = self._effective_provider(role)
+            if not pid:
+                providers.append(
+                    {
+                        "role": slot_name,
+                        "provider_id": "",
+                        "status": "unconfigured",
+                        "detail": "未配置分析模型" if slot_name == "analysis" else "未配置审查模型",
+                    }
+                )
+                issues.append(f"provider_unconfigured:{slot_name}")
+                continue
+            found = find_provider_silently(self.context, pid)
+            if found is None:
+                providers.append(
+                    {
+                        "role": slot_name,
+                        "provider_id": pid,
+                        "status": "missing",
+                        "detail": f"Provider {pid} 未找到",
+                    }
+                )
+                issues.append(f"provider_missing:{slot_name}:{pid}")
+            elif getattr(found, "is_native_decision_provider", False) or not callable(
+                getattr(found, "text_chat", None)
+            ):
+                providers.append(
+                    {
+                        "role": slot_name,
+                        "provider_id": pid,
+                        "status": "incompatible",
+                        "detail": f"Provider {pid} 不是可用的普通聊天模型",
+                    }
+                )
+                issues.append(f"provider_incompatible:{slot_name}:{pid}")
+            else:
+                providers.append(
+                    {
+                        "role": slot_name,
+                        "provider_id": pid,
+                        "status": "ok",
+                        "detail": "ok",
+                    }
+                )
+        ready = bool(self.ready and not self.closed and self.engine is not None)
+        if not ready:
+            issues.append("plugin_not_ready")
+        last_error = str(getattr(self.engine, "last_error", "") or "") if self.engine is not None else ""
+        if last_error:
+            issues.append(f"last_error:{last_error[:120]}")
+        sessions = self._effective_sessions()
+        queue_size = 0
+        dropped = 0
+        ready_count = 0
+        stale_count = 0
+        if self.engine is not None:
+            try:
+                queue_size = int(self.engine.queue.qsize())
+            except Exception:
+                queue_size = 0
+            dropped = int(getattr(self.engine, "dropped", 0) or 0)
+            try:
+                q_counts = self.engine.queue_counts()
+                ready_count = int(q_counts.get("ready_count", 0))
+                stale_count = int(q_counts.get("stale_count", 0))
+            except Exception:
+                pass
+        return {
+            "ready": ready,
+            "degraded": bool(issues) or not ready,
+            "providers": providers,
+            "issues": issues,
+            "metrics": {
+                "enabled": bool(self.config.get("enabled", True)),
+                "sessions": len(sessions),
+                "queue": queue_size,
+                "dropped": dropped,
+                "active_jobs": len(self.jobs),
+                "ready_count": ready_count,
+                "stale_count": stale_count,
+            },
+        }
 
     def get_series_scope_status(self, umo: str) -> dict:
         """Read-only per-scope status for the cross-plugin group control matrix."""
@@ -810,7 +978,7 @@ class DynamicsLearning(Star):
                 or entry["expires"] <= now
             ):
                 continue
-            if query and entry["key"] not in query:
+            if query and not jargon_matches(entry["key"], query):
                 continue
             terms.append({"name": entry["key"], "meaning": entry["value"], "revision": entry["revision"]})
             if len(terms) >= max(1, min(20, int(limit))):
@@ -1112,7 +1280,7 @@ class DynamicsLearning(Star):
         ):
             raise ValueError("所选模型不可用或不是普通聊天模型")
         timeout = max(5, min(180, int(self.config.get("model_timeout", 60))))
-        payload = encode(data)
+        payload = encode_prompt_payload(data)
         if len(payload) > MODEL_INPUT_LIMIT:
             raise ValueError("证据超出单次模型输入预算，请缩小提案引用范围")
         model = provider_model(provider)
@@ -1123,6 +1291,14 @@ class DynamicsLearning(Star):
             or not self.engine.allowed(review_dispatch.scope)
         ):
             raise ReviewUnavailable("模型绑定或会话权限已改变")
+        circuit_probe = getattr(series_panels, "provider_circuit_remaining", lambda _c, _p: 0.0)
+        circuit_remaining = float(circuit_probe(self.context, provider_id) or 0.0)
+        if circuit_remaining > 0.0:
+            raise ReviewDeferred(
+                f"共享模型熔断冷却中 (circuit_open, retry_after={circuit_remaining:.1f}s)",
+                retry_after=circuit_remaining,
+                reason="circuit_open",
+            )
         attributed_call = getattr(provider, "_series_attributed_call_v1", None)
         source = data.get("proposal") or next(iter(data.get("events", [])), {}) or data
         scope = review_dispatch.scope if review_dispatch else source.get("scope", "")
@@ -1134,25 +1310,43 @@ class DynamicsLearning(Star):
             if callable(attributed_call)
             else nullcontext()
         )
-        call_kwargs = dict(_text_chat_extra_kwargs(provider, self.config))
+        is_single_review = (
+            role == "review_provider"
+            and isinstance(data, dict)
+            and "proposal" in data
+            and "proposals" not in data
+        )
+        call_kwargs = dict(
+            _text_chat_extra_kwargs(provider, self.config, role=role, is_single_review=is_single_review)
+        )
         if _accepts_kwarg(provider.text_chat, "contexts"):
             call_kwargs["contexts"] = _cache_anchor_contexts(instruction)
+
+        async def _invoke_provider():
+            if review_dispatch and self.engine is not None:
+                self.engine.store.automatic_reviews.record_dispatch(review_dispatch)
+            return await provider.text_chat(prompt=payload, system_prompt=instruction, **call_kwargs)
+
         try:
             async with asyncio.timeout(timeout):
                 with attribution:
-                    if review_dispatch:
-                        self.engine.store.automatic_reviews.record_dispatch(review_dispatch)
                     response = await series_llm_call(
                         self.context,
                         provider_id,
                         PLUGIN,
                         role.removesuffix("_provider"),
-                        lambda: provider.text_chat(prompt=payload, system_prompt=instruction, **call_kwargs),
+                        _invoke_provider,
                     )
+        except ReviewDeferred:
+            raise
         except Exception as exc:
             if is_provider_budget_busy_error(exc):
-                raise ReviewUnavailable(
-                    f"共享模型并发池繁忙 ({getattr(exc, 'reason', 'busy')})"
+                retry_after = float(getattr(exc, "retry_after", 0.0) or 0.0)
+                reason = str(getattr(exc, "reason", "busy") or "busy")
+                raise ReviewDeferred(
+                    f"共享模型并发池繁忙 ({reason})",
+                    retry_after=retry_after,
+                    reason=reason,
                 ) from exc
             raise
         if (
@@ -1367,7 +1561,9 @@ class DynamicsLearning(Star):
 
         async def operation(body, actor):
             scope = text(body.get("scope"), "scope", 512)
-            action = text(body.get("action"), "action", 16)
+            action = text(body.get("action"), "action", 24)
+            if action == "archive_all_stale":
+                return await self.engine.archive_group_stale(scope, actor)
             async with self.engine.lock:
                 rows = await self.engine.batch_snapshot(scope, body.get("items"), actor)
                 result = await self.engine.review_write(lambda: govern(self.engine, scope, rows, action, actor))
@@ -1375,6 +1571,12 @@ class DynamicsLearning(Star):
             return result
 
         return await self._serve(operation, ("scope", "action", "items"))
+
+    async def archive_stale(self):
+        async def operation(body, actor):
+            return await self.engine.archive_group_stale(text(body.get("scope"), "scope", 512), actor)
+
+        return await self._serve(operation, ("scope",))
 
     async def library(self):
         from .core.workbench import library
@@ -1443,9 +1645,17 @@ class DynamicsLearning(Star):
 
     async def group_batch_action(self):
         async def operation(body, actor):
-            return await self.engine.group_batch_action(text(body.get("scope"), "scope", 512), body.get("items"), actor)
+            partial = body.get("partial", False)
+            if not isinstance(partial, bool):
+                raise ValueError("invalid partial flag")
+            return await self.engine.group_batch_action(
+                text(body.get("scope"), "scope", 512),
+                body.get("items"),
+                actor,
+                partial=partial,
+            )
 
-        return await self._serve(operation, ("scope", "items"))
+        return await self._serve(operation, ("scope", "items", "partial"))
 
     async def group_batch_reject(self):
         async def operation(body, actor):

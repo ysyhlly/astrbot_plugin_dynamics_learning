@@ -40,6 +40,29 @@ def digest(value):
     return hashlib.sha256(encode(value).encode()).hexdigest()
 
 
+_ASCII_ALNUM_RE = re.compile(r"[A-Za-z0-9]")
+
+
+def is_pure_ascii(term: str) -> bool:
+    return bool(term) and all(ord(ch) < 128 for ch in term)
+
+
+def jargon_matches(term: str, query: str) -> bool:
+    """Case-insensitive jargon match with ASCII word-boundary protection."""
+    clean_term = str(term or "").strip()
+    if not clean_term or not isinstance(query, str) or not query:
+        return False
+    if is_pure_ascii(clean_term) and len(clean_term) < 2:
+        return False
+    term_cf = clean_term.casefold()
+    query_cf = query.casefold()
+    prefix = r"(?<![A-Za-z0-9])" if _ASCII_ALNUM_RE.match(term_cf[0]) else ""
+    suffix = r"(?![A-Za-z0-9])" if _ASCII_ALNUM_RE.match(term_cf[-1]) else ""
+    if prefix or suffix:
+        return re.search(prefix + re.escape(term_cf) + suffix, query_cf) is not None
+    return term_cf in query_cf
+
+
 def text(value, name, limit=256, empty=False):
     if not isinstance(value, str) or len(value) > limit or (not empty and not value.strip()):
         raise ValueError("invalid " + name)
@@ -175,8 +198,12 @@ def candidate(raw, events, current):
         value['character_key']=identity
     else:
         value = text(value, "value", 1000)
-        if category == 'jargon' and (member or len(key) > 64):
-            raise ValueError('jargon must be a group term no longer than 64 characters')
+        if category == "jargon":
+            clean_key = key.strip()
+            if member or len(key) > 64:
+                raise ValueError("jargon must be a group term no longer than 64 characters")
+            if is_pure_ascii(clean_key) and len(clean_key) < 2:
+                raise ValueError("pure ASCII jargon term must be at least 2 characters")
     days = number(raw.get("days", 30), "days", 1, 90)
     if category == "state":
         days = min(days, 1)

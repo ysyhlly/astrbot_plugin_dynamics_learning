@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from astrbot_plugin_dynamics_learning.core.engine import Engine
-from astrbot_plugin_dynamics_learning.core.review_batches import ReviewUnavailable
+from astrbot_plugin_dynamics_learning.core.review_batches import ReviewDeferred
 from astrbot_plugin_dynamics_learning.core.store import Store
 from astrbot_plugin_dynamics_learning.main import DynamicsLearning, _date_window
 from astrbot_plugin_dynamics_learning.series_panels import (
@@ -124,8 +124,9 @@ async def test_learning_model_delegates_to_shared_budget_and_degrades_on_busy():
     busy_budget = _FakeBudget(busy=True)
     ctx_busy = _chat_ctx(budget=busy_budget, providers={"shared-reply-p": provider})
     plugin_busy = DynamicsLearning(ctx_busy, {"analysis_provider": "", "review_provider": ""})
-    with pytest.raises(ReviewUnavailable, match="共享模型并发池繁忙"):
+    with pytest.raises(ReviewDeferred, match="共享模型并发池繁忙") as exc_info:
         await plugin_busy._model("analysis_provider", "sys", {"events": []})
+    assert exc_info.value.reason == "queue_full"
 
 
 def test_learning_provider_fallback_chain_and_explicit_override(tmp_path):

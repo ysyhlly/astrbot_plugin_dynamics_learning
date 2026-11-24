@@ -1,10 +1,131 @@
 """Cached, approved member materials for a single reply; never changes persona."""
 from __future__ import annotations
 
+import copy
 import time
 
-from .contract import MEMBER_PROFILES, encode, policy_allowed
+from .contract import MEMBER_PROFILES, PERSONALITY_POLICY, encode, policy_allowed
 from .profiles import relevance
+
+UNIFIED_REPLY_BUDGET = 6000
+MIN_UNIFIED_REPLY_BUDGET = 1200
+MAX_UNIFIED_REPLY_BUDGET = 8400
+MAX_JARGON_PER_TURN = 4
+
+_OTHER_PRIORITY = {
+    "typing_habit": 0,
+    "style": 1,
+    "decision_guidance": 2,
+    "relationship": 3,
+    "state": 4,
+    "participation": 5,
+    "expression_example": 6,
+    "social_snapshot": 7,
+}
+
+
+def item_priority(row: dict) -> tuple[int, int]:
+    """Unified reply projection priority:
+    0: 固定人格红线 (personality_policy)
+    1: 成员边界/喜恶 (preference: boundary > dislike > like)
+    2: 命中黑话 (jargon)
+    3: 场景方法 (scene_pattern)
+    4: 群体表达 (expression_style)
+    5: 其他参考资料 (typing_habit / style / decision_guidance / relationship / state / ...)
+    """
+    cat = str(row.get("category") or "")
+    if cat == "personality_policy":
+        return (0, 0)
+    if cat == "preference":
+        val = row.get("value")
+        stance = str(val.get("stance") or "") if isinstance(val, dict) else ""
+        sub = 0 if stance == "boundary" else 1 if stance == "dislike" else 2
+        return (1, sub)
+    if cat == "jargon":
+        return (2, 0)
+    if cat == "scene_pattern":
+        return (3, 0)
+    if cat == "expression_style":
+        return (4, 0)
+    return (5, _OTHER_PRIORITY.get(cat, 9))
+
+
+def _trim_channel_item(row: dict, remaining: int) -> dict | None:
+    """Try fitting a scene_pattern or expression_style item by dropping optional examples first."""
+    cat = row.get("category")
+    if cat not in {"scene_pattern", "expression_style"}:
+        return None
+    val = row.get("value")
+    if not isinstance(val, dict) or not val.get("examples"):
+        return None
+    trimmed = copy.deepcopy(row)
+    trimmed["value"]["examples"] = []
+    if cat == "expression_style" and isinstance(trimmed.get("selection"), dict):
+        trimmed["selection"]["example_ids"] = []
+    if len(encode(trimmed)) <= remaining:
+        return trimmed
+    return None
+
+
+def prune_unified_channels(
+    *,
+    learning_items: list[dict],
+    scene_items: list[dict] = (),
+    expression_items: list[dict] = (),
+    personality_policy: str = PERSONALITY_POLICY,
+    budget: int = UNIFIED_REPLY_BUDGET,
+) -> dict:
+    """Enforce a single-turn total character budget across all three reply channels.
+
+    Priority order:
+        固定人格红线 > 成员边界/喜恶 > 命中黑话 > 场景方法 > 群体表达 > 其他
+    """
+    policy_text = str(personality_policy or "")
+    policy_len = len(policy_text)
+    effective_budget = max(policy_len, int(budget))
+    used = policy_len
+    tagged: list[tuple[tuple[int, int], int, str, dict]] = []
+    idx = 0
+    for channel, rows in (
+        ("learning", learning_items),
+        ("scene", scene_items),
+        ("expression", expression_items),
+    ):
+        for row in rows or ():
+            if not isinstance(row, dict):
+                continue
+            tagged.append((item_priority(row), idx, channel, row))
+            idx += 1
+    tagged.sort(key=lambda entry: (entry[0], entry[1]))
+
+    kept: dict[str, list[tuple[int, dict]]] = {"learning": [], "scene": [], "expression": []}
+    omitted: dict[str, str] = {}
+    for _prio, orig_idx, channel, row in tagged:
+        size = len(encode(row))
+        sep = 1 if kept[channel] else 0
+        if used + size + sep <= effective_budget:
+            kept[channel].append((orig_idx, row))
+            used += size + sep
+            continue
+        remaining = effective_budget - used - sep
+        trimmed = _trim_channel_item(row, remaining) if remaining > 0 else None
+        if trimmed is not None:
+            kept[channel].append((orig_idx, trimmed))
+            used += len(encode(trimmed)) + sep
+            continue
+        sid = str(row.get("source_id") or "")
+        if sid:
+            omitted[sid] = "统一回复总字符预算"
+
+    return {
+        "personality_policy": policy_text,
+        "learning_items": [r for _, r in sorted(kept["learning"], key=lambda x: x[0])],
+        "scene_items": [r for _, r in sorted(kept["scene"], key=lambda x: x[0])],
+        "expression_items": [r for _, r in sorted(kept["expression"], key=lambda x: x[0])],
+        "budget": effective_budget,
+        "used_chars": used,
+        "omitted": omitted,
+    }
 
 
 def item(entry, source_scope):
@@ -26,7 +147,15 @@ def member_items(engine, scope, persona, member, query='', budget=2600,trace=Non
     rows=[e for e in source_rows if (e['scope'],e['persona'],e['member'])==(scope,persona,member)
           and e['category'] in MEMBER_PROFILES and e['active'] and e['expires']>now and policy_allowed(e)]
     order={'preference':0,'typing_habit':1,'style':2,'expression_example':3}
-    rows.sort(key=lambda e:(order[e['category']],-relevance({'situation':encode(e['value'])},query),-e['revision']))
+    stance_order={'boundary':0,'dislike':1,'like':2}
+    rows.sort(
+        key=lambda e: (
+            order[e['category']],
+            stance_order.get((e.get('value') or {}).get('stance', ''), 9) if e['category'] == 'preference' and isinstance(e.get('value'), dict) else 0,
+            -relevance({'situation': encode(e['value'])}, query),
+            -e['revision'],
+        )
+    )
     result=[]
     total_len = 2  # len('[]')
     examples=0
