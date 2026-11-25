@@ -23,8 +23,11 @@ class Scheduling:
         CREATE INDEX IF NOT EXISTS analysis_pending ON analysis_inbox(scope,persona,processed,seq);
         CREATE INDEX IF NOT EXISTS analysis_unprocessed ON analysis_inbox(scope,persona,created,turn_id,seq) WHERE processed=0;
         CREATE INDEX IF NOT EXISTS analysis_turn ON analysis_inbox(scope,persona,turn_id,seq);
+        CREATE INDEX IF NOT EXISTS analysis_inbox_processed_created ON analysis_inbox(processed,created);
+        CREATE INDEX IF NOT EXISTS analysis_inbox_event_processed ON analysis_inbox(event_id,processed);
         CREATE TABLE IF NOT EXISTS analysis_meta(key TEXT PRIMARY KEY,value TEXT);
         CREATE TABLE IF NOT EXISTS analysis_runs(id TEXT PRIMARY KEY,scope TEXT,persona TEXT,created REAL,body TEXT);
+        CREATE INDEX IF NOT EXISTS analysis_runs_created ON analysis_runs(created);
         CREATE TABLE IF NOT EXISTS analysis_sources(event_id TEXT,scope TEXT,source_id TEXT,PRIMARY KEY(event_id,source_id));
         CREATE INDEX IF NOT EXISTS analysis_source_refs ON analysis_sources(scope,source_id);
         ''')
@@ -57,7 +60,7 @@ class Scheduling:
 
     def pending_with_sources(self, scope):
         return self.store.db.execute(
-            f'SELECT q.seq,coalesce(e.body,p.body) FROM analysis_inbox q {_INBOX_SOURCES} '
+            f"SELECT q.seq,coalesce(e.body,p.body,(SELECT t.body FROM events t WHERE t.scope=q.scope AND t.persona=q.persona AND json_extract(t.body,'$.turn_id')=q.turn_id ORDER BY t.created DESC LIMIT 1)) FROM analysis_inbox q {_INBOX_SOURCES} "
             'WHERE q.scope=? AND q.processed=0',
             (scope,),
         ).fetchall()
@@ -132,7 +135,7 @@ class Scheduling:
             rows_by_seq = {
                 r[0]: r[1]
                 for r in self.store.db.execute(
-                    f'SELECT q.seq,coalesce(e.body,p.body) FROM analysis_inbox q {_INBOX_SOURCES} '
+                    f"SELECT q.seq,coalesce(e.body,p.body,(SELECT t.body FROM events t WHERE t.scope=q.scope AND t.persona=q.persona AND json_extract(t.body,'$.turn_id')=q.turn_id ORDER BY t.created DESC LIMIT 1)) FROM analysis_inbox q {_INBOX_SOURCES} "
                     f'WHERE q.seq IN ({placeholders})',
                     seqs,
                 )

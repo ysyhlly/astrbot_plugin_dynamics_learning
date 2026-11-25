@@ -15,6 +15,7 @@ class ExpressionStore:
         CREATE TABLE IF NOT EXISTS expression_deliveries(scope TEXT,persona TEXT,message_id TEXT,created REAL,markers TEXT,
             PRIMARY KEY(scope,persona,message_id));
         CREATE INDEX IF NOT EXISTS expression_delivery_time ON expression_deliveries(scope,persona,created);
+        CREATE INDEX IF NOT EXISTS expression_deliveries_created ON expression_deliveries(created);
         CREATE TABLE IF NOT EXISTS expression_source_counts(scope TEXT,persona TEXT,counter INTEGER NOT NULL,
             PRIMARY KEY(scope,persona));
         CREATE TRIGGER IF NOT EXISTS expression_source_insert AFTER INSERT ON profile_messages BEGIN

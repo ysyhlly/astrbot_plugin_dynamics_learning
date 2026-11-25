@@ -94,6 +94,11 @@ class SourceWithdrawals:
             "SELECT body FROM events WHERE id=? AND scope=? AND persona=?",
             (row["id"], scope, persona),
         ).fetchone()
+        if direct is None and row.get("turn_id"):
+            direct = db.execute(
+                "SELECT body FROM events WHERE scope=? AND persona=? AND json_extract(body,'$.turn_id')=? ORDER BY created DESC LIMIT 1",
+                (scope, persona, row["turn_id"]),
+            ).fetchone()
         if direct:
             return json.loads(direct[0])
         if not row.get("context", {}).get("source_verified"):

@@ -32,9 +32,71 @@ class Conflict(ValueError):
 
 
 DEFAULT_AUDIT_RETENTION_DAYS = 90
+DEFAULT_EVENTS_RETENTION_DAYS = 7
+DEFAULT_NATIVE_RECEIPTS_RETENTION_DAYS = 7
 JOURNAL_SIZE_LIMIT_BYTES = 67_108_864
-INCREMENTAL_VACUUM_PAGES = 256
+INCREMENTAL_VACUUM_PAGES = 4096
+PRUNE_BATCH_SIZE = 500
 RELATION_RECEIPT_RETENTION_DAYS = 30
+_EVENT_KIND_RANK = {"observed": 1, "decision": 2, "outcome": 3}
+
+
+def _slim_event_for_storage(event):
+    """Strip per-row duplicated persona_summary and unread policy.context without mutating input."""
+    if not isinstance(event, dict):
+        return event, None
+    slim = dict(event)
+    summary = None
+    ctx = slim.get("context")
+    if isinstance(ctx, dict) and "persona_summary" in ctx:
+        raw_summary = ctx.get("persona_summary")
+        if isinstance(raw_summary, str) and raw_summary.strip():
+            summary = raw_summary.strip()
+        new_ctx = {k: v for k, v in ctx.items() if k != "persona_summary"}
+        slim["context"] = new_ctx
+    policy = slim.get("policy")
+    if isinstance(policy, dict) and "context" in policy:
+        new_policy = {k: v for k, v in policy.items() if k != "context"}
+        slim["policy"] = new_policy
+    return slim, summary
+
+
+def _merge_turn_event(earlier, later):
+    """Merge an earlier phase row into a later phase row for the same (scope, persona, turn_id)."""
+    merged = dict(later)
+    if not isinstance(merged.get("decision"), dict) and isinstance(earlier.get("decision"), dict):
+        merged["decision"] = earlier["decision"]
+    if not isinstance(merged.get("outcome"), dict) and isinstance(earlier.get("outcome"), dict):
+        merged["outcome"] = earlier["outcome"]
+    if not isinstance(merged.get("reply"), dict) and isinstance(earlier.get("reply"), dict):
+        merged["reply"] = earlier["reply"]
+
+    old_policy = earlier.get("policy") if isinstance(earlier.get("policy"), dict) else {}
+    new_policy = merged.get("policy") if isinstance(merged.get("policy"), dict) else {}
+    if old_policy or new_policy:
+        pol = {k: v for k, v in old_policy.items() if k != "context"}
+        pol.update({k: v for k, v in new_policy.items() if k != "context"})
+        versions = []
+        for src in (old_policy.get("versions"), new_policy.get("versions")):
+            if isinstance(src, list):
+                for item in src:
+                    if item not in versions:
+                        versions.append(item)
+        if versions:
+            pol["versions"] = versions
+        merged["policy"] = pol
+
+    old_ctx = earlier.get("context") if isinstance(earlier.get("context"), dict) else {}
+    new_ctx = merged.get("context") if isinstance(merged.get("context"), dict) else {}
+    if old_ctx or new_ctx:
+        ctx = {k: v for k, v in old_ctx.items() if k != "persona_summary"}
+        for k, v in new_ctx.items():
+            if k == "persona_summary":
+                continue
+            if v not in (None, "", [], {}) or k not in ctx:
+                ctx[k] = v
+        merged["context"] = ctx
+    return merged
 
 
 def _compact_evidence_list(evidence):
@@ -80,8 +142,16 @@ class Store:
         PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT_BYTES};
         CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, scope TEXT, persona TEXT, created REAL, body TEXT);
         CREATE INDEX IF NOT EXISTS events_scope ON events(scope, persona, created);
+        CREATE INDEX IF NOT EXISTS events_created ON events(created);
+        CREATE INDEX IF NOT EXISTS events_persona_created ON events(persona, created);
         CREATE INDEX IF NOT EXISTS events_scope_kind_created ON events(scope, json_extract(body,'$.kind'), created);
         CREATE INDEX IF NOT EXISTS events_turn ON events(scope, persona, json_extract(body,'$.turn_id'));
+        CREATE TABLE IF NOT EXISTS persona_contexts(scope TEXT NOT NULL, persona TEXT NOT NULL,
+          summary_hash TEXT NOT NULL, summary TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(scope, persona));
+        CREATE INDEX IF NOT EXISTS persona_contexts_persona ON persona_contexts(persona, updated);
+        CREATE TABLE IF NOT EXISTS observed_personas(scope TEXT NOT NULL, persona TEXT NOT NULL,
+          last_observed REAL NOT NULL, PRIMARY KEY(scope, persona));
+        CREATE INDEX IF NOT EXISTS observed_personas_scope ON observed_personas(scope, last_observed);
         CREATE TABLE IF NOT EXISTS proposals(id TEXT PRIMARY KEY, scope TEXT, persona TEXT, state TEXT,
           created REAL, updated REAL, body TEXT);
         CREATE TABLE IF NOT EXISTS entries(id TEXT PRIMARY KEY, body TEXT);
@@ -89,6 +159,7 @@ class Store:
         CREATE INDEX IF NOT EXISTS entries_proposal_id ON entries(json_extract(body,'$.proposal_id'));
         CREATE INDEX IF NOT EXISTS proposals_entry ON proposals(json_extract(body,'$.entry_id'),created);
         CREATE INDEX IF NOT EXISTS proposals_queue ON proposals(state,scope,created,id);
+        CREATE INDEX IF NOT EXISTS proposals_state_updated ON proposals(state,updated);
         CREATE INDEX IF NOT EXISTS proposals_cat_key ON proposals(scope,persona,json_extract(body,'$.category'),created);
         CREATE TABLE IF NOT EXISTS proposal_evidence_sources(proposal TEXT,message_id TEXT,event_id TEXT,
           PRIMARY KEY(proposal,message_id));
@@ -96,6 +167,8 @@ class Store:
         CREATE INDEX IF NOT EXISTS review_claims_scope ON review_claims(scope);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, proposal TEXT, action TEXT, actor TEXT, created REAL, body TEXT);
         CREATE INDEX IF NOT EXISTS audit_created ON audit(created);
+        CREATE INDEX IF NOT EXISTS audit_proposal ON audit(proposal);
+        CREATE INDEX IF NOT EXISTS audit_action_created ON audit(action,created);
         CREATE TABLE IF NOT EXISTS checkpoints(scope TEXT, persona TEXT, cursor REAL, PRIMARY KEY(scope, persona));
         CREATE TABLE IF NOT EXISTS social_bindings(scope TEXT,persona TEXT,legacy_key TEXT,PRIMARY KEY(scope,persona));
         CREATE TABLE IF NOT EXISTS legacy_group_owners(scope TEXT PRIMARY KEY,legacy_key TEXT);
@@ -104,9 +177,12 @@ class Store:
         CREATE TABLE IF NOT EXISTS social_imports(import_key TEXT PRIMARY KEY,created REAL,body TEXT);
         CREATE TABLE IF NOT EXISTS affection_source_claims(scope TEXT,persona TEXT,member TEXT,message_id TEXT,proposal TEXT,
           PRIMARY KEY(scope,persona,member,message_id));
+        CREATE INDEX IF NOT EXISTS affection_source_claims_proposal ON affection_source_claims(proposal);
         """)
-        if current_version < 9:
-            self.db.execute("PRAGMA user_version=9")
+        if current_version < 10:
+            self.db.execute("PRAGMA user_version=10")
+        self.auto_vacuum_mode = int(self.db.execute("PRAGMA auto_vacuum").fetchone()[0])
+        self.needs_auto_vacuum_migration = self.auto_vacuum_mode != 2
         from .profiles import Profiles
 
         self.profiles = Profiles(self)
@@ -147,6 +223,39 @@ class Store:
                     self.db.rollback()
                 raise
 
+    def auto_vacuum_status(self):
+        with self.lock:
+            mode = int(self.db.execute("PRAGMA auto_vacuum").fetchone()[0])
+            freelist = int(self.db.execute("PRAGMA freelist_count").fetchone()[0])
+            pages = int(self.db.execute("PRAGMA page_count").fetchone()[0])
+            self.auto_vacuum_mode = mode
+            self.needs_auto_vacuum_migration = mode != 2
+            return {
+                "mode": mode,
+                "incremental": mode == 2,
+                "needs_migration": mode != 2,
+                "freelist_count": freelist,
+                "page_count": pages,
+            }
+
+    def enable_incremental_vacuum(self, *, vacuum: bool = True):
+        """Safely migrate legacy auto_vacuum=NONE DBs to INCREMENTAL (requires VACUUM)."""
+        with self.lock:
+            if self.db.in_transaction:
+                self.db.commit()
+            before = int(self.db.execute("PRAGMA auto_vacuum").fetchone()[0])
+            if before == 2:
+                self.auto_vacuum_mode = 2
+                self.needs_auto_vacuum_migration = False
+                return {"migrated": False, "before": before, "mode": 2}
+            self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            if vacuum:
+                self.db.execute("VACUUM")
+            after = int(self.db.execute("PRAGMA auto_vacuum").fetchone()[0])
+            self.auto_vacuum_mode = after
+            self.needs_auto_vacuum_migration = after != 2
+            return {"migrated": after == 2, "before": before, "mode": after}
+
     def close(self):
         with self.lock:
             self.db.close()
@@ -181,11 +290,74 @@ class Store:
                     changed["proposals"] += 1
         return changed
 
-    def _ingest_one(self, event):
+    def _upsert_persona_context(self, scope, persona, summary, stamp):
+        if not scope or not persona or not summary:
+            return
+        summary_hash = digest(summary)
         self.db.execute(
-            "INSERT OR IGNORE INTO events VALUES(?,?,?,?,?)",
-            (event["id"], event["scope"], event["persona"], event["received_at"], encode(event)),
+            """INSERT INTO persona_contexts(scope,persona,summary_hash,summary,updated) VALUES(?,?,?,?,?)
+            ON CONFLICT(scope,persona) DO UPDATE SET
+              summary_hash=excluded.summary_hash,
+              summary=excluded.summary,
+              updated=CASE WHEN excluded.updated > persona_contexts.updated THEN excluded.updated ELSE persona_contexts.updated END""",
+            (scope, persona, summary_hash, summary, float(stamp)),
         )
+
+    def _record_observed_persona(self, scope, persona, stamp):
+        if not scope or not persona:
+            return
+        self.db.execute(
+            """INSERT INTO observed_personas(scope,persona,last_observed) VALUES(?,?,?)
+            ON CONFLICT(scope,persona) DO UPDATE SET
+              last_observed=CASE WHEN excluded.last_observed > observed_personas.last_observed THEN excluded.last_observed ELSE observed_personas.last_observed END""",
+            (scope, persona, float(stamp)),
+        )
+
+    def _ingest_one(self, event):
+        slim, summary = _slim_event_for_storage(event)
+        stamp = float(event["received_at"])
+        if summary:
+            self._upsert_persona_context(event["scope"], event["persona"], summary, stamp)
+        if event.get("kind") == "observed":
+            self._record_observed_persona(event["scope"], event["persona"], stamp)
+
+        turn_id = event.get("turn_id")
+        if turn_id:
+            existing_rows = self.db.execute(
+                "SELECT id, created, body FROM events WHERE scope=? AND persona=? AND json_extract(body,'$.turn_id')=? ORDER BY created DESC, rowid DESC",
+                (event["scope"], event["persona"], turn_id),
+            ).fetchall()
+        else:
+            existing_rows = []
+
+        if any(row[0] == event["id"] for row in existing_rows):
+            pass  # Exact idempotent event already persisted.
+        elif existing_rows:
+            latest_id, latest_created, latest_body = existing_rows[0]
+            try:
+                old_event = json.loads(latest_body)
+            except (TypeError, ValueError):
+                old_event = {}
+            old_rank = _EVENT_KIND_RANK.get(old_event.get("kind", ""), 0)
+            new_rank = _EVENT_KIND_RANK.get(slim.get("kind", ""), 0)
+            if new_rank >= old_rank:
+                merged = _merge_turn_event(old_event, slim)
+                for row in existing_rows:
+                    self.db.execute("DELETE FROM events WHERE id=?", (row[0],))
+                self.db.execute(
+                    "INSERT OR REPLACE INTO events VALUES(?,?,?,?,?)",
+                    (merged["id"], merged["scope"], merged["persona"], max(float(latest_created), stamp), encode(merged)),
+                )
+            else:
+                merged = _merge_turn_event(slim, old_event)
+                self.db.execute("UPDATE events SET body=? WHERE id=?", (encode(merged), latest_id))
+                for row in existing_rows[1:]:
+                    self.db.execute("DELETE FROM events WHERE id=?", (row[0],))
+        else:
+            self.db.execute(
+                "INSERT OR IGNORE INTO events VALUES(?,?,?,?,?)",
+                (slim["id"], slim["scope"], slim["persona"], stamp, encode(slim)),
+            )
         if self.source_withdrawals.has_withdrawn(event["scope"], [event]):
             return
         self.profiles.bind(event)
@@ -266,13 +438,40 @@ class Store:
 
     def latest_personas(self):
         with self.lock:
-            rows = self.db.execute("""SELECT e.scope,e.persona FROM events e JOIN
-                (SELECT scope,max(created) AS stamp FROM events WHERE json_extract(body,'$.kind')='observed' GROUP BY scope) q
-                ON e.scope=q.scope AND e.created=q.stamp WHERE json_extract(e.body,'$.kind')='observed'""").fetchall()
-            return dict(rows)
+            combined = {}
+            for scope, persona, stamp in self.db.execute(
+                """SELECT o.scope, o.persona, o.last_observed FROM observed_personas o JOIN
+                (SELECT scope, max(last_observed) AS stamp FROM observed_personas GROUP BY scope) q
+                ON o.scope=q.scope AND o.last_observed=q.stamp"""
+            ).fetchall():
+                combined[scope] = (float(stamp), persona)
+            for scope, persona, stamp in self.db.execute(
+                """SELECT e.scope, e.persona, e.created FROM events e JOIN
+                (SELECT scope, max(created) AS stamp FROM events WHERE json_extract(body,'$.kind')='observed' GROUP BY scope) q
+                ON e.scope=q.scope AND e.created=q.stamp WHERE json_extract(e.body,'$.kind')='observed'"""
+            ).fetchall():
+                prev = combined.get(scope)
+                if prev is None or float(stamp) > prev[0]:
+                    combined[scope] = (float(stamp), persona)
+            return {scope: persona for scope, (_stamp, persona) in combined.items()}
 
     def latest_character_context(self, scope, persona):
         with self.lock:
+            ctx_row = self.db.execute(
+                "SELECT scope, persona, summary FROM persona_contexts WHERE scope=? AND persona=?",
+                (scope, persona),
+            ).fetchone()
+            if ctx_row is None and persona:
+                ctx_row = self.db.execute(
+                    "SELECT scope, persona, summary FROM persona_contexts WHERE persona=? ORDER BY updated DESC LIMIT 1",
+                    (persona,),
+                ).fetchone()
+            if ctx_row is not None and isinstance(ctx_row[2], str) and ctx_row[2].strip():
+                return {
+                    "scope": ctx_row[0],
+                    "persona": ctx_row[1],
+                    "context": {"persona_summary": ctx_row[2].strip()},
+                }
             row = self.db.execute(
                 """SELECT body FROM events
                 WHERE scope=? AND persona=?
@@ -741,11 +940,23 @@ class Store:
             if not policy_allowed(restored):
                 restored["active"] = False
             self.db.execute("UPDATE entries SET body=? WHERE id=?", (encode(restored), p["entry_id"]))
-            # Re-link the prior version so stacked rollbacks remain possible.
-            if p["before"] and not p["before"]["proposal_id"].startswith("legacy:"):
-                previous = self.get(p["before"]["proposal_id"])
-                previous["applied_revision"] = restored["revision"]
-                self._save(previous)
+            # Re-link the prior active applied version so stacked rollbacks remain possible;
+            # never mutate terminal/rolled-back predecessors or abort rollback if pruned (>32 hops).
+            if (
+                isinstance(p.get("before"), dict)
+                and restored.get("active")
+                and isinstance(p["before"].get("proposal_id"), str)
+                and p["before"]["proposal_id"]
+                and not p["before"]["proposal_id"].startswith("legacy:")
+            ):
+                prev_row = self.db.execute(
+                    "SELECT body FROM proposals WHERE id=?", (p["before"]["proposal_id"],)
+                ).fetchone()
+                if prev_row is not None:
+                    previous = json.loads(prev_row[0])
+                    if previous.get("state") == "applied":
+                        previous["applied_revision"] = restored["revision"]
+                        self._save(previous)
             p["state"] = "rolled_back"
             self.db.execute("DELETE FROM affection_source_claims WHERE proposal=?", (p["id"],))
             p["rolled_back_by"], p["rolled_back_at"] = actor, time.time()
@@ -758,13 +969,25 @@ class Store:
             self.automatic_reviews.purge(scope)
             self.scenes.purge(scope)
             self.expressions.purge(scope)
-            ids = [r[0] for r in self.db.execute("SELECT id FROM proposals WHERE scope=?", (scope,))]
-            for pid in ids:
+            entry_ids = [
+                r[0]
+                for r in self.db.execute(
+                    "SELECT id FROM entries WHERE json_extract(body,'$.scope')=?", (scope,)
+                ).fetchall()
+            ]
+            proposal_ids = [
+                r[0]
+                for r in self.db.execute("SELECT id FROM proposals WHERE scope=?", (scope,)).fetchall()
+            ]
+            for pid in proposal_ids:
                 self.db.execute("DELETE FROM audit WHERE proposal=?", (pid,))
                 self.db.execute("DELETE FROM proposal_evidence_sources WHERE proposal=?", (pid,))
-            for e in self.entries():
-                if e["scope"] == scope:
-                    self.db.execute("DELETE FROM entries WHERE id=?", (e["id"],))
+            for eid in entry_ids:
+                self.db.execute("DELETE FROM audit WHERE proposal=?", (eid,))
+            self.db.execute("DELETE FROM entries WHERE json_extract(body,'$.scope')=?", (scope,))
+            self.db.execute("DELETE FROM affection_source_claims WHERE scope=?", (scope,))
+            self.db.execute("DELETE FROM persona_contexts WHERE scope=?", (scope,))
+            self.db.execute("DELETE FROM observed_personas WHERE scope=?", (scope,))
             for table in (
                 "events",
                 "proposals",
@@ -924,6 +1147,22 @@ class Store:
             frontier = next_frontier
         return protected
 
+    def _prune_batched(self, table, where_sql, params, *, batch_size=PRUNE_BATCH_SIZE):
+        """Delete matching rows in small transactions so store.lock is released between chunks."""
+        total = 0
+        limit = max(1, int(batch_size))
+        while True:
+            with self.transaction():
+                cur = self.db.execute(
+                    f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {where_sql} LIMIT ?)",
+                    (*params, limit),
+                )
+                deleted = int(cur.rowcount or 0)
+            total += deleted
+            if deleted < limit:
+                break
+        return total
+
     def prune(
         self,
         days,
@@ -933,6 +1172,9 @@ class Store:
         audit_retention_days=None,
         allowed_scopes=None,
         inbox_expire_days=None,
+        event_retention_days=None,
+        native_receipt_retention_days=None,
+        batch_size=PRUNE_BATCH_SIZE,
     ):
         archived = self.archive_stale_proposals(
             current_personas=current_personas,
@@ -946,19 +1188,36 @@ class Store:
         self.console.prune(days)
         self.scenes.prune(days)
         self.expressions.prune(days)
+        base_days = max(1, int(days))
         audit_days = (
             max(1, int(audit_retention_days))
             if audit_retention_days is not None
-            else max(DEFAULT_AUDIT_RETENTION_DAYS, max(1, int(days)))
+            else max(DEFAULT_AUDIT_RETENTION_DAYS, base_days)
         )
+        event_days = min(
+            base_days,
+            max(1, int(event_retention_days)) if event_retention_days is not None else DEFAULT_EVENTS_RETENTION_DAYS,
+        )
+        receipt_days = min(
+            base_days,
+            max(1, int(native_receipt_retention_days))
+            if native_receipt_retention_days is not None
+            else DEFAULT_NATIVE_RECEIPTS_RETENTION_DAYS,
+        )
+        chunk = max(1, int(batch_size))
+        now = time.time()
+        cutoff = now - base_days * 86400
+        event_cutoff = now - event_days * 86400
+        native_receipt_cutoff = now - receipt_days * 86400
+        audit_cutoff = now - audit_days * 86400
+
         proposals_compacted = 0
         proposals_pruned = 0
         inbox_expired = 0
         receipts_pruned = 0
-        with self.lock, self.db:
-            now = time.time()
-            cutoff = now - days * 86400
-            audit_cutoff = now - audit_days * 86400
+
+        # 1) Unpin stale analysis_inbox rows in short transaction
+        with self.transaction():
             if allowed_scopes is not None:
                 inbox_expired += self.db.execute(
                     "UPDATE analysis_inbox SET processed=1 WHERE processed=0 AND scope NOT IN (SELECT value FROM json_each(?))",
@@ -976,62 +1235,85 @@ class Store:
                     "UPDATE analysis_inbox SET processed=1 WHERE processed=0 AND created<?",
                     (inbox_cutoff,),
                 ).rowcount
-            self.db.execute(
-                "DELETE FROM events WHERE created<? AND NOT EXISTS (SELECT 1 FROM analysis_inbox q WHERE q.event_id=events.id AND q.processed=0)",
-                (cutoff,),
-            )
-            self.db.execute("DELETE FROM analysis_inbox WHERE processed=1 AND created<?", (cutoff,))
-            self.db.execute("DELETE FROM analysis_runs WHERE created<?", (cutoff,))
-            self.db.execute(
-                "DELETE FROM analysis_sources WHERE NOT EXISTS (SELECT 1 FROM analysis_inbox q WHERE q.event_id=analysis_sources.event_id AND q.processed=0)"
-            )
-            for table in ("profile_raw", "profile_targets", "profile_messages"):
-                self.db.execute(
-                    "DELETE FROM "
-                    + table
-                    + " WHERE created<? AND NOT EXISTS (SELECT 1 FROM analysis_sources s WHERE s.scope="
-                    + table
-                    + ".scope AND s.source_id="
-                    + table
-                    + ".source_id)",
-                    (cutoff,),
-                )
-            self.db.execute("DELETE FROM native_receipts WHERE created<?", (cutoff,))
 
+        # 2) Indexed batched pruning of high-volume tables (releases self.lock between chunks)
+        self._prune_batched(
+            "events",
+            "created<? AND NOT EXISTS (SELECT 1 FROM analysis_inbox q WHERE q.event_id=events.id AND q.processed=0)",
+            (event_cutoff,),
+            batch_size=chunk,
+        )
+        self._prune_batched("analysis_inbox", "processed=1 AND created<?", (event_cutoff,), batch_size=chunk)
+        self._prune_batched("analysis_runs", "created<?", (cutoff,), batch_size=chunk)
+        self._prune_batched(
+            "analysis_sources",
+            "NOT EXISTS (SELECT 1 FROM analysis_inbox q WHERE q.event_id=analysis_sources.event_id AND q.processed=0)",
+            (),
+            batch_size=chunk,
+        )
+        for table in ("profile_raw", "profile_targets", "profile_messages"):
+            self._prune_batched(
+                table,
+                f"created<? AND NOT EXISTS (SELECT 1 FROM analysis_sources s WHERE s.scope={table}.scope AND s.source_id={table}.source_id)",
+                (cutoff,),
+                batch_size=chunk,
+            )
+        self._prune_batched("native_receipts", "created<?", (native_receipt_cutoff,), batch_size=chunk)
+        # Strip any legacy non-empty native_receipts.body payloads in small batches
+        while True:
+            with self.transaction():
+                cleared = self.db.execute(
+                    "UPDATE native_receipts SET body='' WHERE rowid IN (SELECT rowid FROM native_receipts WHERE body!='' LIMIT ?)",
+                    (chunk,),
+                ).rowcount
+            if cleared < chunk:
+                break
+
+        # 3) Proposal compaction & ancient terminal proposal pruning in bounded chunks
+        with self.lock:
             protected_applied = self._protected_applied_proposal_ids()
-            for row in self.db.execute(
-                "SELECT id, state, updated, body FROM proposals WHERE state IN ('rejected','archived','rolled_back','applied') AND updated<?",
+            candidate_rows = self.db.execute(
+                "SELECT id, state, updated FROM proposals WHERE state IN ('rejected','archived','rolled_back','applied') AND updated<?",
                 (cutoff,),
-            ).fetchall():
-                pid, state, updated, raw_body = row[0], row[1], row[2], row[3]
-                if pid in protected_applied:
-                    continue
-                if state in {"rejected", "archived", "rolled_back"} and updated < audit_cutoff:
-                    self.db.execute("DELETE FROM proposals WHERE id=?", (pid,))
-                    proposals_pruned += 1
-                    continue
-                try:
-                    p = json.loads(raw_body)
-                except (TypeError, ValueError):
-                    continue
-                changed = False
-                compacted_ev, ev_changed = _compact_evidence_list(p.get("evidence"))
-                if ev_changed:
-                    p["evidence"] = compacted_ev
-                    changed = True
-                if state in {"rejected", "archived", "rolled_back"} and isinstance(p.get("before"), dict):
-                    slim_before = {
-                        k: p["before"][k]
-                        for k in ("id", "revision", "active", "proposal_id")
-                        if k in p["before"]
-                    }
-                    if slim_before != p["before"]:
-                        p["before"] = slim_before
+            ).fetchall()
+        prop_chunk = max(1, min(200, chunk))
+        for offset in range(0, len(candidate_rows), prop_chunk):
+            batch_rows = candidate_rows[offset : offset + prop_chunk]
+            with self.transaction():
+                for pid, state, updated in batch_rows:
+                    if pid in protected_applied:
+                        continue
+                    if state in {"rejected", "archived", "rolled_back"} and updated < audit_cutoff:
+                        self.db.execute("DELETE FROM proposals WHERE id=?", (pid,))
+                        proposals_pruned += 1
+                        continue
+                    body_row = self.db.execute("SELECT body FROM proposals WHERE id=?", (pid,)).fetchone()
+                    if not body_row:
+                        continue
+                    try:
+                        p = json.loads(body_row[0])
+                    except (TypeError, ValueError):
+                        continue
+                    changed = False
+                    compacted_ev, ev_changed = _compact_evidence_list(p.get("evidence"))
+                    if ev_changed:
+                        p["evidence"] = compacted_ev
                         changed = True
-                if changed:
-                    self.db.execute("UPDATE proposals SET body=? WHERE id=?", (encode(p), pid))
-                    proposals_compacted += 1
+                    if state in {"rejected", "archived", "rolled_back"} and isinstance(p.get("before"), dict):
+                        slim_before = {
+                            k: p["before"][k]
+                            for k in ("id", "revision", "active", "proposal_id")
+                            if k in p["before"]
+                        }
+                        if slim_before != p["before"]:
+                            p["before"] = slim_before
+                            changed = True
+                    if changed:
+                        self.db.execute("UPDATE proposals SET body=? WHERE id=?", (encode(p), pid))
+                        proposals_compacted += 1
 
+        # 4) Legacy audit compaction (indexed by audit_action_created) & orphan cleanup
+        with self.transaction():
             for row in self.db.execute(
                 "SELECT id, body FROM audit WHERE action='evidence_updated' AND instr(body,'\"superseded\":[{')>0"
             ).fetchall():
@@ -1044,29 +1326,40 @@ class Store:
                     abody["superseded"] = [item.get("id", "") if isinstance(item, dict) else item for item in sup]
                     self.db.execute("UPDATE audit SET body=? WHERE id=?", (encode(abody), row[0]))
 
-            self.db.execute(
-                "DELETE FROM proposal_evidence_sources WHERE proposal NOT IN (SELECT id FROM proposals WHERE state IN ('pending','reviewed'))"
-            )
-            self.db.execute(
-                "DELETE FROM affection_source_claims WHERE proposal NOT IN (SELECT id FROM proposals WHERE state='applied')"
-            )
+        self._prune_batched(
+            "proposal_evidence_sources",
+            "proposal NOT IN (SELECT id FROM proposals WHERE state IN ('pending','reviewed'))",
+            (),
+            batch_size=chunk,
+        )
+        self._prune_batched(
+            "affection_source_claims",
+            "proposal NOT IN (SELECT id FROM proposals WHERE state='applied')",
+            (),
+            batch_size=chunk,
+        )
+        has_rel_receipts = False
+        with self.lock:
             if self.db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='relation_source_receipts'"
             ).fetchone():
                 cols = {r[1] for r in self.db.execute("PRAGMA table_info(relation_source_receipts)").fetchall()}
-                if "created" in cols:
-                    receipt_cutoff = int(now - RELATION_RECEIPT_RETENTION_DAYS * 86400)
-                    receipts_pruned = self.db.execute(
-                        "DELETE FROM relation_source_receipts WHERE created<?",
-                        (receipt_cutoff,),
-                    ).rowcount
+                has_rel_receipts = "created" in cols
+        if has_rel_receipts:
+            receipt_cutoff = int(now - RELATION_RECEIPT_RETENTION_DAYS * 86400)
+            receipts_pruned = self._prune_batched(
+                "relation_source_receipts", "created<?", (receipt_cutoff,), batch_size=chunk
+            )
 
-            audit_pruned = self.db.execute("DELETE FROM audit WHERE created<?", (audit_cutoff,)).rowcount
+        audit_pruned = self._prune_batched("audit", "created<?", (audit_cutoff,), batch_size=chunk)
 
         with self.lock:
             self.db.execute(f"PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT_BYTES}")
-            self.db.execute(f"PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES})")
-            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.auto_vacuum_mode = int(self.db.execute("PRAGMA auto_vacuum").fetchone()[0])
+            self.needs_auto_vacuum_migration = self.auto_vacuum_mode != 2
+            if self.auto_vacuum_mode == 2:
+                self.db.execute(f"PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES})")
+            self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
         return {
             "archived": archived["count"],
             "archived_ids": archived["archived"],
@@ -1075,6 +1368,7 @@ class Store:
             "proposals_pruned": proposals_pruned,
             "inbox_expired": inbox_expired,
             "receipts_pruned": receipts_pruned,
+            "auto_vacuum_needs_migration": self.needs_auto_vacuum_migration,
         }
 
     def observations(self, proposal):

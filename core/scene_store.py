@@ -16,10 +16,14 @@ class SceneStore:
         store.db.executescript('''
         CREATE TABLE IF NOT EXISTS scene_receipts(id TEXT PRIMARY KEY,scope TEXT,persona TEXT,turn_id TEXT,stage TEXT,created REAL,body TEXT);
         CREATE INDEX IF NOT EXISTS scene_receipts_turn ON scene_receipts(scope,persona,turn_id,stage);
+        CREATE INDEX IF NOT EXISTS scene_receipts_created ON scene_receipts(created);
+        CREATE INDEX IF NOT EXISTS scene_receipts_stage_created ON scene_receipts(stage,created);
         CREATE TABLE IF NOT EXISTS scene_deliveries(scope TEXT,persona TEXT,message_id TEXT,turn_id TEXT,member TEXT,created REAL,
             PRIMARY KEY(scope,persona,message_id));
+        CREATE INDEX IF NOT EXISTS scene_deliveries_created ON scene_deliveries(created);
         CREATE TABLE IF NOT EXISTS scene_feedback(id TEXT PRIMARY KEY,scope TEXT,persona TEXT,reply_id TEXT,created REAL,body TEXT);
         CREATE INDEX IF NOT EXISTS scene_feedback_scope ON scene_feedback(scope,persona,created);
+        CREATE INDEX IF NOT EXISTS scene_feedback_created ON scene_feedback(created);
         CREATE TABLE IF NOT EXISTS scene_analysis(scope TEXT,persona TEXT,fingerprint TEXT,PRIMARY KEY(scope,persona));
         ''')
 
@@ -125,6 +129,11 @@ class SceneStore:
                                                      (scope, persona, fact['reply_turn'])):
                     targets.extend([x['source_id'], x['revision']] for x in json.loads(receipt[0])['refs'])
                 source = self.store.db.execute('SELECT body FROM events WHERE id=?', (fact['event_id'],)).fetchone()
+                if source is None and fact.get('message_id'):
+                    source = self.store.db.execute(
+                        "SELECT body FROM events WHERE scope=? AND persona=? AND json_extract(body,'$.message_id')=? ORDER BY created DESC LIMIT 1",
+                        (scope, persona, fact['message_id']),
+                    ).fetchone()
                 if source and targets:
                     event = json.loads(source[0])
                     if self.store.source_withdrawals.has_withdrawn(scope, [event]):

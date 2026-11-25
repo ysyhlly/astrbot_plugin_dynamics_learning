@@ -18,10 +18,12 @@ class Console:
         CREATE INDEX IF NOT EXISTS console_tasks_time ON console_tasks(queued);
         CREATE TABLE IF NOT EXISTS reply_usage(id TEXT PRIMARY KEY,scope TEXT,member TEXT,turn_id TEXT,created REAL,body TEXT);
         CREATE INDEX IF NOT EXISTS reply_usage_scope ON reply_usage(scope,created);
+        CREATE INDEX IF NOT EXISTS reply_usage_created ON reply_usage(created);
         CREATE TABLE IF NOT EXISTS reply_usage_refs(receipt TEXT,source_id TEXT,PRIMARY KEY(receipt,source_id));
         CREATE INDEX IF NOT EXISTS reply_usage_refs_source ON reply_usage_refs(source_id,receipt);
         CREATE TABLE IF NOT EXISTS review_batches(id TEXT PRIMARY KEY,scope TEXT,status TEXT,created REAL,body TEXT);
         CREATE INDEX IF NOT EXISTS review_batches_scope ON review_batches(scope,created);
+        CREATE INDEX IF NOT EXISTS review_batches_status_created ON review_batches(status,created);
         CREATE TABLE IF NOT EXISTS analysis_meta(key TEXT PRIMARY KEY,value TEXT);
         """)
         with store.transaction():

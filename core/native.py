@@ -44,6 +44,7 @@ class NativeStore:
         CREATE TABLE IF NOT EXISTS native_scope_registry(scope TEXT,persona TEXT,body TEXT,PRIMARY KEY(scope,persona));
         CREATE TABLE IF NOT EXISTS native_receipts(event_id TEXT PRIMARY KEY,scope TEXT,created REAL,fingerprint TEXT,body TEXT);
         CREATE INDEX IF NOT EXISTS native_receipts_scope ON native_receipts(scope,created);
+        CREATE INDEX IF NOT EXISTS native_receipts_created ON native_receipts(created);
         CREATE TABLE IF NOT EXISTS legacy_archive(id TEXT PRIMARY KEY,scope TEXT,category TEXT,source_table TEXT,source_id TEXT,body TEXT);
         CREATE INDEX IF NOT EXISTS legacy_archive_scope ON legacy_archive(scope,category);
         CREATE TABLE IF NOT EXISTS replacement_imports(id TEXT PRIMARY KEY,created REAL,body TEXT);
@@ -87,7 +88,7 @@ class NativeStore:
                         raise ValueError('native event identity changed')
                     continue
                 self.store.db.execute('INSERT INTO native_receipts VALUES(?,?,?,?,?)',
-                    (event_id,scope['umo'],time.time(),fingerprint,encode(e)))
+                    (event_id,scope['umo'],time.time(),fingerprint,''))
                 accepted += 1
         return accepted
 

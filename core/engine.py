@@ -2674,11 +2674,19 @@ class Engine:
                         await self.refresh()
                 if self.social:
                     await self.social.write(self.social.graph.apply_daily_decay(self.social.settings["daily_decay"]))
+                    if hasattr(self.social.graph, "prune_history"):
+                        await self.social.write(self.social.graph.prune_history())
                 retention_days = max(1, int(self.config.get("retention_days", 30)))
                 raw_audit_days = self.config.get("audit_retention_days")
                 audit_days = (
                     max(1, int(raw_audit_days))
                     if raw_audit_days is not None and not isinstance(raw_audit_days, bool)
+                    else None
+                )
+                raw_event_days = self.config.get("event_retention_days")
+                event_days = (
+                    max(1, int(raw_event_days))
+                    if raw_event_days is not None and not isinstance(raw_event_days, bool)
                     else None
                 )
                 prune_result = await asyncio.to_thread(
@@ -2689,6 +2697,7 @@ class Engine:
                     audit_retention_days=audit_days,
                     allowed_scopes=self.effective_sessions(),
                     inbox_expire_days=max(retention_days, 14),
+                    event_retention_days=event_days,
                 )
                 if isinstance(prune_result, dict) and prune_result.get("archived"):
                     invalidate_presence_cache(context=self._host_context)
@@ -2967,10 +2976,15 @@ class Engine:
                     if not allowed:
                         raise ValueError(reason)
                     prepared.append((p["id"], p["updated"], False))
-                results = await asyncio.to_thread(self.store.apply_batch, prepared, actor)
-                await self.refresh()
-                invalidate_presence_cache(context=self._host_context)
-                return {"applied": [p["id"] for p in results], "count": len(results)}
+
+                async def commit_and_refresh():
+                    results = await asyncio.to_thread(self.store.apply_batch, prepared, actor)
+                    self.cache_refresh_pending = True
+                    await self.refresh()
+                    invalidate_presence_cache(context=self._host_context)
+                    return {"applied": [p["id"] for p in results], "count": len(results)}
+
+                return await self.finish_operation(commit_and_refresh())
 
             skipped = []
             seen_ids = set()
@@ -3014,22 +3028,29 @@ class Engine:
                     skipped.append({"id": p["id"], "reason": "同一个学习项存在更新版本，已跳过旧项"})
 
             selected = sorted(best_by_entry.values(), key=lambda entry: entry[1])
-            applied_ids = []
-            for _rank, _idx, p in selected:
-                try:
-                    await asyncio.to_thread(self.store.apply, p["id"], actor, p["updated"], automatic_affection=False)
-                    applied_ids.append(p["id"])
-                except (Conflict, ValueError) as exc:
-                    skipped.append({"id": p["id"], "reason": str(exc)})
-            if applied_ids:
-                await self.refresh()
-                invalidate_presence_cache(context=self._host_context)
-            return {
-                "applied": applied_ids,
-                "count": len(applied_ids),
-                "skipped": skipped,
-                "skipped_count": len(skipped),
-            }
+
+            async def commit_and_refresh_partial():
+                applied_ids = []
+                for _rank, _idx, p in selected:
+                    try:
+                        await asyncio.to_thread(
+                            self.store.apply, p["id"], actor, p["updated"], automatic_affection=False
+                        )
+                        applied_ids.append(p["id"])
+                        self.cache_refresh_pending = True
+                    except (Conflict, ValueError) as exc:
+                        skipped.append({"id": p["id"], "reason": str(exc)})
+                if applied_ids:
+                    await self.refresh()
+                    invalidate_presence_cache(context=self._host_context)
+                return {
+                    "applied": applied_ids,
+                    "count": len(applied_ids),
+                    "skipped": skipped,
+                    "skipped_count": len(skipped),
+                }
+
+            return await self.finish_operation(commit_and_refresh_partial())
 
     async def batch_action(self, scope, persona, member, items, actor):
         if not actor.startswith("human:") or not isinstance(items, list) or not 1 <= len(items) <= 20:
@@ -3049,9 +3070,14 @@ class Engine:
                     raise ValueError("同一个学习项有多个版本，请分别处理")
                 targets.add(p["entry_id"])
                 prepared.append((p["id"], p["updated"], self.validate_apply(p, actor)))
-            results = await asyncio.to_thread(self.store.apply_batch, prepared, actor)
-            await self.refresh()
-            return {"applied": [p["id"] for p in results], "count": len(results)}
+
+            async def commit_and_refresh():
+                results = await asyncio.to_thread(self.store.apply_batch, prepared, actor)
+                self.cache_refresh_pending = True
+                await self.refresh()
+                return {"applied": [p["id"] for p in results], "count": len(results)}
+
+            return await self.finish_operation(commit_and_refresh())
 
     async def overview(self):
         proposals = await asyncio.to_thread(self.store.console.proposals, "", 20)

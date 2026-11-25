@@ -104,10 +104,13 @@ class Profiles:
         store.db.executescript('''
         CREATE TABLE IF NOT EXISTS profile_raw(scope TEXT,source_id TEXT,created REAL,body TEXT,PRIMARY KEY(scope,source_id));
         CREATE INDEX IF NOT EXISTS profile_raw_time ON profile_raw(scope,created);
+        CREATE INDEX IF NOT EXISTS profile_raw_created ON profile_raw(created);
         CREATE TABLE IF NOT EXISTS profile_targets(scope TEXT,source_id TEXT,created REAL,body TEXT,PRIMARY KEY(scope,source_id));
+        CREATE INDEX IF NOT EXISTS profile_targets_created ON profile_targets(created);
         CREATE TABLE IF NOT EXISTS profile_messages(scope TEXT,persona TEXT,source_id TEXT,member TEXT,created REAL,body TEXT,
             PRIMARY KEY(scope,persona,source_id));
         CREATE INDEX IF NOT EXISTS profile_messages_scope ON profile_messages(scope,persona,created);
+        CREATE INDEX IF NOT EXISTS profile_messages_created ON profile_messages(created);
         ''')
 
     def _join(self, raw, target):

@@ -52,25 +52,30 @@ class _ClosingConnection(sqlite3.Connection):
 class _SharedConnection:
     def __init__(self, store: Any) -> None:
         self._store = store
+        self._nested_stack: list[bool] = []
 
     def __enter__(self) -> sqlite3.Connection:
         self._store.lock.acquire()
         try:
-            if not self._store.db.in_transaction:
+            nested = bool(self._store.db.in_transaction)
+            if not nested:
                 self._store.db.execute("BEGIN")
+            self._nested_stack.append(nested)
             return self._store.db
         except BaseException:
             self._store.lock.release()
             raise
 
     def __exit__(self, *args: Any) -> bool:
+        nested = self._nested_stack.pop() if self._nested_stack else False
         try:
-            if args[0] is None:
-                if self._store.db.in_transaction:
-                    self._store.db.commit()
-            else:
-                if self._store.db.in_transaction:
-                    self._store.db.rollback()
+            if not nested:
+                if args[0] is None:
+                    if self._store.db.in_transaction:
+                        self._store.db.commit()
+                else:
+                    if self._store.db.in_transaction:
+                        self._store.db.rollback()
         finally:
             self._store.lock.release()
         return False
@@ -113,6 +118,8 @@ class RelationStore:
         self.relation_growth_scale = max(1.0, relation_growth_scale)
         self.pair_daily_budget = max(1.0, pair_daily_budget)
         self.activity_daily_cap = max(1, activity_daily_cap)
+        self._last_history_prune_ts: int | None = None
+        self._history_prune_interval_seconds: int = 3600
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection | _SharedConnection:
@@ -214,6 +221,15 @@ class RelationStore:
                     pass
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_relation_source_receipts_created ON relation_source_receipts(created)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_directed_events_ts ON directed_events(ts)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_relation_daily_day ON relation_daily(day)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_member_daily_day ON member_daily(day)"
             )
             # Backfill directed history exactly once. Historical tone is unknown.
             if not conn.execute(
@@ -645,14 +661,15 @@ class RelationStore:
                     today=today,
                 )
 
-            self._prune_directed_events_sync(conn, directed_event_retain_days)
-            self._prune_source_receipts_sync(conn, ts, retain_days=30)
-            conn.execute(
-                "DELETE FROM relation_daily WHERE day<?", (window_start(ts, 90),)
-            )
-            conn.execute(
-                "DELETE FROM member_daily WHERE day<?", (window_start(ts, 90),)
-            )
+            if (
+                self._last_history_prune_ts is None
+                or abs(ts - self._last_history_prune_ts) >= self._history_prune_interval_seconds
+            ):
+                self._last_history_prune_ts = ts
+                self._prune_directed_events_sync(conn, directed_event_retain_days, batch_size=500)
+                self._prune_source_receipts_sync(conn, ts, retain_days=30, batch_size=500)
+                self._prune_daily_table_sync(conn, "relation_daily", window_start(ts, 90), batch_size=500)
+                self._prune_daily_table_sync(conn, "member_daily", window_start(ts, 90), batch_size=500)
 
             conn.execute(
                 "INSERT INTO messages(group_id, user_id, name, text, tokens, ts) VALUES(?, ?, ?, ?, ?, ?)",
@@ -1895,8 +1912,81 @@ class RelationStore:
             conn.execute("DELETE FROM messages WHERE group_id=?", (group_id,))
             conn.execute("DELETE FROM users WHERE group_id=?", (group_id,))
 
+    async def prune_history(
+        self,
+        *,
+        directed_event_retain_days: int = 90,
+        receipt_retain_days: int = 30,
+        daily_retain_days: int = 90,
+        batch_size: int = 500,
+        now_ts: int | None = None,
+    ) -> dict[str, int]:
+        """Batched, indexed history pruning releasing shared lock between chunks."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._prune_history_batched_sync,
+                directed_event_retain_days,
+                receipt_retain_days,
+                daily_retain_days,
+                batch_size,
+                now_ts,
+            )
+
+    def _prune_history_batched_sync(
+        self,
+        directed_event_retain_days: int,
+        receipt_retain_days: int,
+        daily_retain_days: int,
+        batch_size: int,
+        now_ts: int | None,
+    ) -> dict[str, int]:
+        stamp = _now() if now_ts is None else int(now_ts)
+        limit = max(1, int(batch_size))
+        day_cutoff = window_start(stamp, max(1, int(daily_retain_days)))
+        totals = {
+            "directed_events": 0,
+            "relation_source_receipts": 0,
+            "relation_daily": 0,
+            "member_daily": 0,
+        }
+        for key, fn in (
+            ("directed_events", lambda c: self._prune_directed_events_sync(c, directed_event_retain_days, batch_size=limit, now_ts=stamp)),
+            ("relation_source_receipts", lambda c: self._prune_source_receipts_sync(c, stamp, retain_days=receipt_retain_days, batch_size=limit)),
+            ("relation_daily", lambda c: self._prune_daily_table_sync(c, "relation_daily", day_cutoff, batch_size=limit)),
+            ("member_daily", lambda c: self._prune_daily_table_sync(c, "member_daily", day_cutoff, batch_size=limit)),
+        ):
+            while True:
+                with self._connect() as conn:
+                    deleted = fn(conn)
+                totals[key] += deleted
+                if deleted < limit:
+                    break
+        self._last_history_prune_ts = stamp
+        return totals
+
     @staticmethod
-    def _prune_directed_events_sync(conn: sqlite3.Connection, retain_days: int) -> int:
+    def _prune_daily_table_sync(
+        conn: sqlite3.Connection, table: str, cutoff_day: str, *, batch_size: int | None = None
+    ) -> int:
+        if table not in {"relation_daily", "member_daily"}:
+            return 0
+        if batch_size is not None and batch_size > 0:
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE day < ? LIMIT ?)",
+                (cutoff_day, int(batch_size)),
+            )
+        else:
+            cur = conn.execute(f"DELETE FROM {table} WHERE day < ?", (cutoff_day,))
+        return int(cur.rowcount or 0)
+
+    @staticmethod
+    def _prune_directed_events_sync(
+        conn: sqlite3.Connection,
+        retain_days: int,
+        *,
+        batch_size: int | None = None,
+        now_ts: int | None = None,
+    ) -> int:
         """Delete directed_events older than retain_days natural days.
 
         Caller owns the connection (same transaction as the write path).
@@ -1908,13 +1998,24 @@ class RelationStore:
             return 0
         if retain_days <= 0:
             return 0
-        cutoff = _now() - retain_days * 86400
-        cur = conn.execute("DELETE FROM directed_events WHERE ts < ?", (cutoff,))
+        stamp = _now() if now_ts is None else int(now_ts)
+        cutoff = stamp - retain_days * 86400
+        if batch_size is not None and batch_size > 0:
+            cur = conn.execute(
+                "DELETE FROM directed_events WHERE rowid IN (SELECT rowid FROM directed_events WHERE ts < ? LIMIT ?)",
+                (cutoff, int(batch_size)),
+            )
+        else:
+            cur = conn.execute("DELETE FROM directed_events WHERE ts < ?", (cutoff,))
         return int(cur.rowcount or 0)
 
     @staticmethod
     def _prune_source_receipts_sync(
-        conn: sqlite3.Connection, now_ts: int | float | None = None, *, retain_days: int = 30
+        conn: sqlite3.Connection,
+        now_ts: int | float | None = None,
+        *,
+        retain_days: int = 30,
+        batch_size: int | None = None,
     ) -> int:
         try:
             days = int(retain_days)
@@ -1924,5 +2025,11 @@ class RelationStore:
             return 0
         stamp = int(now_ts) if now_ts is not None else _now()
         cutoff = stamp - days * 86400
-        cur = conn.execute("DELETE FROM relation_source_receipts WHERE created < ?", (cutoff,))
+        if batch_size is not None and batch_size > 0:
+            cur = conn.execute(
+                "DELETE FROM relation_source_receipts WHERE rowid IN (SELECT rowid FROM relation_source_receipts WHERE created < ? LIMIT ?)",
+                (cutoff, int(batch_size)),
+            )
+        else:
+            cur = conn.execute("DELETE FROM relation_source_receipts WHERE created < ?", (cutoff,))
         return int(cur.rowcount or 0)

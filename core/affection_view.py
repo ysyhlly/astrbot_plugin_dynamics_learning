@@ -31,8 +31,15 @@ def current_records(store, scope='', current_personas=None):
     def observed(umo, persona):
         key = (umo, persona)
         if key not in seen:
-            row = store.db.execute("SELECT created FROM events WHERE scope=? AND persona=? AND json_extract(body,'$.kind')='observed' ORDER BY created DESC LIMIT 1", key).fetchone()
-            seen[key] = row[0] if row else 0
+            row = store.db.execute(
+                "SELECT last_observed FROM observed_personas WHERE scope=? AND persona=?",
+                key,
+            ).fetchone()
+            ev_row = store.db.execute(
+                "SELECT created FROM events WHERE scope=? AND persona=? AND json_extract(body,'$.kind')='observed' ORDER BY created DESC LIMIT 1",
+                key,
+            ).fetchone()
+            seen[key] = max(row[0] if row else 0, ev_row[0] if ev_row else 0)
         return seen[key]
     current = {} if current_personas is None else dict(current_personas)
     aliases = defaultdict(set)
