@@ -1,5 +1,12 @@
 # 更新日志
 
+## v2.0.0-rc.8 — 2026-11-25
+
+- 安全加固（Batch 1）：强制社交接口鉴权、补齐 `typing_habit` 防护、限制自动好感度变更并接入统一管理鉴权。
+- 数据与存储修复（Batch 2）：精简 `learning` 事件载荷、补齐时间索引，修复清理与回滚逻辑。
+- 性能与稳定性优化（Batch 3）：缩小乐观锁粒度、拆分 Provider 退避状态、新增只读钩子并清理死代码。
+- 工程与发布治理（Batch 4）：增强 `theme.js` 空值安全、补齐离线 CI/打包门禁并同步系列共享资产。
+
 ## v2.0.0-rc.7 — 2026-11-24
 
 - 根治熔断器风暴：区分瞬态 `ReviewDeferred(retry_after)` 与永久 `ReviewUnavailable`，`AutomaticReviews` 增加全局 `_budget_backoff_until` 与指数退避（60s->120s->300s）并跳过熔断期垃圾审计写入，批量审查遇熔断立即暂停保留队列。
