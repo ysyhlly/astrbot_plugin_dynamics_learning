@@ -4,13 +4,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-import sys
 import time
-from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from astrbot_plugin_dynamics_learning.core.contract import candidate, encode, event_record
 from astrbot_plugin_dynamics_learning.core.engine import Engine

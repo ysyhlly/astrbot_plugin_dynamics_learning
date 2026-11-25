@@ -11,8 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from astrbot_plugin_dynamics_learning.core.contract import candidate, event_record
 from astrbot_plugin_dynamics_learning.core.engine import Engine
 from astrbot_plugin_dynamics_learning.core.profiles import statistics

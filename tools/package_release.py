@@ -12,6 +12,35 @@ from pathlib import Path
 SKIP_DIRS = {'.git', '.omo', '.agents', '.codex', 'node_modules', '__pycache__', '.pytest_cache', '.ruff_cache', '.mypy_cache', '.venv', 'venv', 'data', 'backups', 'dist', 'output', 'htmlcov'}
 SOURCE_ONLY = {'tests', 'integration', 'integration_tests', '.github', 'docs', 'tools', 'scripts', 'frontend'}
 SKIP_FILES = {'validation.json', 'cmd_config.json', 'requirements-dev.txt', 'nul'}
+INSTALL_BLACKLIST_FILES = {
+    'package.json',
+    'package-lock.json',
+    'yarn.lock',
+    'pnpm-lock.yaml',
+    'pyproject.toml',
+    'pytest.ini',
+    'ruff.toml',
+    '.ruff.toml',
+    '.coveragerc',
+    '.gitignore',
+    '.gitattributes',
+    '.editorconfig',
+    '.pre-commit-config.yaml',
+    'build_release.py',
+    'package_release.py',
+    'Makefile',
+    'Dockerfile',
+    '.dockerignore',
+}
+INSTALL_REQUIRED_FILES = {
+    'main.py',
+    'metadata.yaml',
+    '_conf_schema.json',
+    'requirements.txt',
+    'LICENSE',
+    'CHANGELOG.md',
+    'RELEASE_NOTES.md',
+}
 STATE_SUFFIXES = {'.db', '.sqlite', '.sqlite3', '.pyc', '.pyo', '.log', '.zip', '.tar', '.tgz', '.pem', '.key'}
 
 def release_metadata(root):
@@ -44,6 +73,64 @@ def files(root: Path):
                 continue
             yield path
 
+def verify_install_archive(target: Path, expected_plugin_name: str) -> dict:
+    """Verify single top-level plugin directory, required files, and zero dev/CI blacklist leaks."""
+    if not target.is_file():
+        raise ValueError(f'Install archive not found: {target}')
+    if target.stat().st_size > 16_000_000:
+        raise ValueError('Install archive exceeds 16 MB')
+    with zipfile.ZipFile(target) as archive:
+        bad_member = archive.testzip()
+        if bad_member is not None:
+            raise ValueError(f'Corrupt archive member: {bad_member}')
+        names = [info.filename for info in archive.infolist() if not info.is_dir()]
+        if not names:
+            raise ValueError('Install archive is empty')
+        top_levels = set()
+        rel_paths = set()
+        for entry in names:
+            if entry.startswith('/') or '\\' in entry:
+                raise ValueError(f'Unsafe archive path: {entry}')
+            parts = entry.split('/')
+            if any(part in ('', '.', '..') for part in parts):
+                raise ValueError(f'Invalid archive path segment: {entry}')
+            if len(parts) < 2:
+                raise ValueError(f'Stray top-level file outside plugin directory: {entry}')
+            top = parts[0]
+            top_levels.add(top)
+            if top != expected_plugin_name:
+                raise ValueError(f'Unexpected top-level directory {top!r} (expected {expected_plugin_name!r})')
+            rel_parts = parts[1:]
+            rel = '/'.join(rel_parts)
+            rel_paths.add(rel)
+            if rel_parts[0] in SOURCE_ONLY or any(seg in SKIP_DIRS for seg in rel_parts[:-1]):
+                raise ValueError(f'Blacklisted dev/source directory in install archive: {entry}')
+            fname = rel_parts[-1]
+            suffix = Path(fname).suffix.lower()
+            if (
+                fname in SKIP_FILES
+                or fname in INSTALL_BLACKLIST_FILES
+                or suffix in STATE_SUFFIXES
+                or (fname.startswith(('.env', '.coverage')) and fname != '.coveragerc')
+                or re.search(r'\.bak(?:[._-]|$)', fname, re.I)
+                or fname.endswith(('-wal', '-shm'))
+            ):
+                raise ValueError(f'Blacklisted dev/state file in install archive: {entry}')
+        if top_levels != {expected_plugin_name}:
+            raise ValueError(f'Archive must have single top-level dir {expected_plugin_name!r}, got {sorted(top_levels)}')
+        missing = sorted(INSTALL_REQUIRED_FILES - rel_paths)
+        if missing:
+            raise ValueError(f'Install archive missing required files: {missing}')
+        schema_raw = archive.read(f'{expected_plugin_name}/_conf_schema.json').decode('utf-8')
+        if not isinstance(json.loads(schema_raw), dict):
+            raise ValueError('_conf_schema.json must be a JSON object')
+        meta_raw = archive.read(f'{expected_plugin_name}/metadata.yaml').decode('utf-8-sig')
+        match = re.search(r'^name:\s*[\"\']?([^\s\"\']+)', meta_raw, re.M)
+        if not match or match.group(1) != expected_plugin_name:
+            raise ValueError('metadata.yaml name does not match archive top-level directory')
+    return {'plugin': expected_plugin_name, 'file': target.name, 'files': len(rel_paths), 'bytes': target.stat().st_size}
+
+
 def build(root: Path, output: Path):
     metadata_raw = release_metadata(root)
     metadata = metadata_raw.decode('utf-8-sig')
@@ -57,13 +144,17 @@ def build(root: Path, output: Path):
         contents = {}
         for path in selected:
             rel = path.relative_to(root)
-            if kind == 'install' and (rel.parts[0] in SOURCE_ONLY or rel.name in SKIP_FILES or rel.name in {'package.json', 'package-lock.json', 'pyproject.toml', 'pytest.ini', '.coveragerc', '.gitignore', '.gitattributes'}):
+            if kind == 'install' and (
+                rel.parts[0] in SOURCE_ONLY
+                or rel.name in SKIP_FILES
+                or rel.name in INSTALL_BLACKLIST_FILES
+            ):
                 continue
             raw = metadata_raw if rel.as_posix() == 'metadata.yaml' else path.read_bytes()
             if path.suffix == '.py':
                 compile(raw, rel.as_posix(), 'exec')
             contents[rel.as_posix()] = raw
-        assert {'main.py', 'metadata.yaml', 'LICENSE', 'CHANGELOG.md', 'RELEASE_NOTES.md'} <= contents.keys()
+        assert INSTALL_REQUIRED_FILES <= contents.keys()
         manifest = {key: hashlib.sha256(raw).hexdigest() for key, raw in contents.items()}
         target = output / f'{name}-{version}-{kind}.zip'
         with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
@@ -76,8 +167,8 @@ def build(root: Path, output: Path):
         with zipfile.ZipFile(target) as archive:
             assert archive.testzip() is None
             assert all(hashlib.sha256(archive.read(name + '/' + rel)).hexdigest() == sha for rel, sha in manifest.items())
-        if kind == 'install' and target.stat().st_size > 16_000_000:
-            raise ValueError('Install archive exceeds 16 MB')
+        if kind == 'install':
+            verify_install_archive(target, name)
         record = {'plugin': name, 'version': version, 'kind': kind, 'file': target.name, 'sha256': hashlib.sha256(target.read_bytes()).hexdigest(), 'bytes': target.stat().st_size, 'files': len(manifest)}
         target.with_suffix('.zip.manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
         target.with_suffix('.zip.sha256').write_text(record['sha256'] + '  ' + target.name + '\n', encoding='ascii')

@@ -3,15 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from astrbot_plugin_dynamics_learning.core import automatic_reviews as ar_mod
 from astrbot_plugin_dynamics_learning.core.contract import candidate, event_record

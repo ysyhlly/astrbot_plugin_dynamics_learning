@@ -15,6 +15,76 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  offline-and-packaging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v5
+        with:
+          path: astrbot_plugin_dynamics_learning
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install offline test tools
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f astrbot_plugin_dynamics_learning/requirements.txt ]; then
+            python -m pip install -r astrbot_plugin_dynamics_learning/requirements.txt
+          fi
+          python -m pip install ruff pytest pyyaml
+
+      - name: Ruff check
+        working-directory: astrbot_plugin_dynamics_learning
+        run: python -m ruff check .
+
+      - name: Frontend JS syntax check
+        working-directory: astrbot_plugin_dynamics_learning
+        run: |
+          for f in pages/review/*.js; do
+            node --check "$f"
+          done
+
+      - name: Offline unit tests (no AstrBot host)
+        working-directory: astrbot_plugin_dynamics_learning
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -c "from astrbot_plugin_dynamics_learning import series_panels; assert hasattr(series_panels, 'presence')"
+          python -m pytest tests -q \
+            --ignore-glob="*browser*" \
+            --ignore=tests/test_p1_p2_hardening.py \
+            --ignore=tests/test_r1_r2_r3_optimizations.py \
+            --ignore=tests/test_round2_learning.py \
+            --ignore=tests/test_series_shared_coordination.py \
+            --ignore=tests/test_series_v2_hooks.py \
+            -k "not test_phase3_model_optional_max_tokens_and_reasoning_effort_passthrough and not test_phase4_model_passes_deterministic_static_contexts_anchor and not test_phase5_cross_group_same_persona_produces_identical_system_prompt_and_contexts_anchor and not test_status_requires_admin_and_owned_routes_unregister"
+
+      - name: Build and verify install archive
+        working-directory: astrbot_plugin_dynamics_learning
+        env:
+          PYTHONPATH: .
+        run: |
+          out_dir="${{ runner.temp }}/dist"
+          python tools/package_release.py --output "$out_dir"
+          python -c "
+          from pathlib import Path
+          from tools.package_release import verify_install_archive
+          zips = sorted(Path('$out_dir').glob('*-install.zip'))
+          assert len(zips) == 1, f'expected 1 install zip, got {zips}'
+          info = verify_install_archive(zips[0], 'astrbot_plugin_dynamics_learning')
+          print('Verified install archive:', info)
+          "
+
   lint-and-unit:
     runs-on: ubuntu-latest
     timeout-minutes: 15
