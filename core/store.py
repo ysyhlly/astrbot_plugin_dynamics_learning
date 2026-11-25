@@ -256,6 +256,22 @@ class Store:
             self.needs_auto_vacuum_migration = after != 2
             return {"migrated": after == 2, "before": before, "mode": after}
 
+    @contextmanager
+    def readonly_connection(self):
+        """Independent read-only WAL connection for event-loop hooks; never contends on self.lock."""
+        if self.path.exists():
+            db = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)
+            db.row_factory = sqlite3.Row
+            try:
+                db.execute("PRAGMA busy_timeout=200")
+                db.execute("PRAGMA query_only=ON")
+                yield db
+            finally:
+                db.close()
+        else:
+            with self.lock:
+                yield self.db
+
     def close(self):
         with self.lock:
             self.db.close()
@@ -406,6 +422,37 @@ class Store:
                 result.append(entry)
             return result
 
+    def entries_for_scope(self, scope):
+        with self.lock:
+            result = []
+            for row in self.db.execute(
+                """SELECT e.body,p.body AS proposal FROM entries e
+                LEFT JOIN proposals p ON p.id=json_extract(e.body,'$.proposal_id')
+                WHERE json_extract(e.body,'$.scope')=?""",
+                (scope,),
+            ):
+                entry = json.loads(row[0])
+                if "source_uids" not in entry and row[1]:
+                    entry.update(self.provenance(json.loads(row[1])))
+                result.append(entry)
+            return result
+
+    def pending_proposals_by_categories(self, scope, persona, categories, limit=64):
+        cats = sorted(str(c) for c in categories if c)
+        if not cats:
+            return []
+        placeholders = ",".join("?" for _ in cats)
+        with self.lock:
+            rows = self.db.execute(
+                f"""SELECT p.body FROM proposals p
+                WHERE p.scope=? AND p.persona=? AND p.state IN ('pending','reviewed')
+                  AND json_extract(p.body,'$.category') IN ({placeholders})
+                  AND NOT EXISTS (SELECT 1 FROM review_claims c WHERE c.proposal=p.id)
+                ORDER BY p.created DESC LIMIT ?""",
+                (scope, persona, *cats, max(1, int(limit))),
+            ).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
     @staticmethod
     def provenance(proposal):
         evidence = proposal.get("evidence", [])
@@ -516,7 +563,10 @@ class Store:
                 FROM proposals WHERE state IN ('pending','reviewed') GROUP BY scope,persona,member ORDER BY oldest""")
             ]
 
-    def proposal_counts(self):
+    def proposal_counts(self, *, readonly=False):
+        if readonly:
+            with self.readonly_connection() as db:
+                return dict(db.execute("SELECT state,count(*) FROM proposals GROUP BY state").fetchall())
         with self.lock:
             return dict(self.db.execute("SELECT state,count(*) FROM proposals GROUP BY state").fetchall())
 

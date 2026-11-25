@@ -347,6 +347,7 @@ class Engine:
         self._cache = ()
         self._cache_by_pair = {}
         self._cache_by_scope = {}
+        self._cache_initialized = False
         self.closed = False
         self.generation = 0
         self.scope_generations = {}
@@ -610,19 +611,42 @@ class Engine:
             )
         return {k: tuple(sorted(v)) for k, v in sigs.items()}
 
-    async def refresh(self):
+    async def _refresh_scope(self, scope: str | None = None):
+        if scope and getattr(self.refresh, "__func__", None) is Engine.refresh:
+            await self.refresh(scope=scope)
+        else:
+            await self.refresh()
+
+    async def refresh(self, *, scope: str | None = None):
+        if scope and self._cache_initialized:
+            old_scope_entries = self._entries_for_scope(scope)
+            old_sig = self._scope_entry_signatures(old_scope_entries).get(scope)
+            scope_entries = tuple(await asyncio.to_thread(self.store.entries_for_scope, scope))
+            retained = [e for e in self._cache if e["scope"] != scope]
+            self.cache = (*retained, *scope_entries)
+            new_sig = self._scope_entry_signatures(scope_entries).get(scope)
+            self.scenes.recent = await asyncio.to_thread(self.store.scenes.recent)
+            self.expressions.recent = await asyncio.to_thread(self.store.expressions.recent)
+            self.current_personas = {**await asyncio.to_thread(self.store.latest_personas), **self.current_personas}
+            self.character_scopes = {**await asyncio.to_thread(self.store.native.scopes), **self.character_scopes}
+            self.projection_generation += 1
+            if old_sig != new_sig:
+                self.scope_projection_generations[scope] = self.scope_projection_generations.get(scope, 0) + 1
+            self.cache_refresh_pending = False
+            return
         old_sigs = self._scope_entry_signatures(self._cache)
         new_cache = tuple(await asyncio.to_thread(self.store.entries))
         self.cache = new_cache
+        self._cache_initialized = True
         new_sigs = self._scope_entry_signatures(new_cache)
         self.scenes.recent = await asyncio.to_thread(self.store.scenes.recent)
         self.expressions.recent = await asyncio.to_thread(self.store.expressions.recent)
         self.current_personas = {**await asyncio.to_thread(self.store.latest_personas), **self.current_personas}
         self.character_scopes = {**await asyncio.to_thread(self.store.native.scopes), **self.character_scopes}
         self.projection_generation += 1
-        for scope in set(old_sigs) | set(new_sigs):
-            if old_sigs.get(scope) != new_sigs.get(scope):
-                self.scope_projection_generations[scope] = self.scope_projection_generations.get(scope, 0) + 1
+        for sc in set(old_sigs) | set(new_sigs):
+            if old_sigs.get(sc) != new_sigs.get(sc):
+                self.scope_projection_generations[sc] = self.scope_projection_generations.get(sc, 0) + 1
         self.cache_refresh_pending = False
 
     def member_profile(self, scope, member):
@@ -1009,85 +1033,6 @@ class Engine:
             result["candidates"] = candidates
         return result
 
-    def unified_reply_context(
-        self,
-        *,
-        scope,
-        persona,
-        member,
-        baseline="",
-        host_version="",
-        query="",
-        scene=None,
-        action="",
-        character_scope=None,
-        trace=False,
-        budget=None,
-    ):
-        """Collect all three reply channels and prune globally under a single character budget."""
-        from .reply_projection import prune_unified_channels
-
-        effective_budget = self.reply_projection_budget() if budget is None else max(len(PERSONALITY_POLICY), int(budget))
-        learning = self.context(
-            scope=scope,
-            persona=persona,
-            member=member,
-            baseline=baseline,
-            host_version=host_version,
-            query=query,
-            character_scope=character_scope,
-            trace=trace,
-        )
-        scene_raw = self.scenes.context(
-            scope=scope,
-            persona=persona,
-            member=member,
-            scene=scene,
-            query=query,
-        )
-        # Collect expression candidate without sequential starvation so global priority decides.
-        self._record_turn_budget(scope, persona, member, query, learning=len(PERSONALITY_POLICY), scene=0)
-        scene_full = (
-            scene_raw
-            if scene_raw.get("items")
-            else self.scenes.context(scope=scope, persona=persona, member=member, scene=scene, query=query)
-        )
-        expr_full = self.expressions.context(
-            scope=scope,
-            persona=persona,
-            member=member,
-            scene=scene,
-            action=action,
-            query=query,
-        )
-        pruned = prune_unified_channels(
-            learning_items=learning.get("reply_projection", {}).get("items", []),
-            scene_items=scene_full.get("items", []),
-            expression_items=expr_full.get("items", []),
-            personality_policy=PERSONALITY_POLICY,
-            budget=effective_budget,
-        )
-        learning_proj = {**learning.get("reply_projection", {}), "items": pruned["learning_items"]}
-        scene_out = {
-            **scene_full,
-            "items": pruned["scene_items"],
-            "versions": [r["source_id"] for r in pruned["scene_items"]],
-        }
-        expr_out = {
-            **expr_full,
-            "items": pruned["expression_items"],
-            "versions": [r["source_id"] for r in pruned["expression_items"]],
-        }
-        return {
-            "personality_policy": pruned["personality_policy"],
-            "learning": {**learning, "reply_projection": learning_proj},
-            "scene": scene_out,
-            "expression": expr_out,
-            "budget": pruned["budget"],
-            "used_chars": pruned["used_chars"],
-            "omitted": pruned["omitted"],
-        }
-
     @asynccontextmanager
     async def operation(self, kind, key):
         identity = (kind, key)
@@ -1265,7 +1210,7 @@ class Engine:
                             or e.get("category") in GROUP_ANALYZE_CATEGORIES
                         )
                     ]
-                    relevant.sort(key=lambda e: (e.get("created_at", 0), e["id"]))
+                    relevant.sort(key=lambda e: e["id"])
                     cur = []
                     cur_bytes = 2
                     for entry in relevant:
@@ -1305,7 +1250,10 @@ class Engine:
                 analyze_instruction = format_system_prompt(ANALYZE, char_context)
                 token = self.scope_token(scope)
                 persona_at_start = self.current_personas.get(scope)
-                versions = self.entry_versions(scope, persona)
+                versions_by_id = {
+                    e["id"]: (e["revision"], e["active"])
+                    for e in self._entries_for(scope, persona)
+                }
                 provider_id = self.provider_for("analysis_provider")
                 should_invoke_llm = has_substantive_analysis_signal(selected, supplied)
             # Model work never owns the ingress/database lock.
@@ -1329,7 +1277,6 @@ class Engine:
                     or token != self.scope_token(scope)
                     or not self.allowed(scope)
                     or self.current_personas.get(scope) != persona_at_start
-                    or self.entry_versions(scope, persona) != versions
                     or self.provider_for("analysis_provider") != provider_id
                 ):
                     self.stale_results += 1
@@ -1341,6 +1288,10 @@ class Engine:
                     or len(output["proposals"]) > 5
                 ):
                     raise ValueError("invalid analysis response")
+                current_versions_by_id = {
+                    e["id"]: (e["revision"], e["active"])
+                    for e in self._entries_for(scope, persona)
+                }
                 automatic = await asyncio.to_thread(self.store.profiles.proposals, scope, persona)
                 candidates = []
                 rejected = 0
@@ -1355,6 +1306,10 @@ class Engine:
                         }:
                             raise ValueError("scene proposals require the dedicated opt-in analysis path")
                         key = entry_key(scope, persona, raw.get("member", ""), raw.get("category"), raw.get("key"))
+                        if current_versions_by_id.get(key) != versions_by_id.get(key):
+                            self.stale_results += 1
+                            rejected += 1
+                            continue
                         previous = next((e for e in active if e["id"] == key), None)
                         staged_prev = (
                             staged_affection[key]["entry"]
@@ -2413,7 +2368,7 @@ class Engine:
             result = await asyncio.to_thread(commit)
             self.cache_refresh_pending = True
             if refresh:
-                await self.refresh()
+                await self._refresh_scope(p["scope"])
             return result
 
         return await self.finish_operation(commit_and_refresh())
@@ -2441,7 +2396,7 @@ class Engine:
                     self.cache = tuple(e for e in self.cache if e["id"] != p["entry_id"])
                     self.bump_projection_generation(p["scope"])
                     try:
-                        await self.refresh()
+                        await self._refresh_scope(p["scope"])
                     except Exception as exc:
                         self.cache_refresh_pending = True
                         self.last_error = "rollback_refresh:" + type(exc).__name__
@@ -2539,7 +2494,7 @@ class Engine:
         if self.social:
             await self.social.purge(scope)
         await asyncio.to_thread(self.store.purge, scope)
-        await self.refresh()
+        await self._refresh_scope(scope)
         self.automatic_reviews.notify_context_change()
 
     async def analysis_cycle(self):
@@ -2582,10 +2537,11 @@ class Engine:
                 try:
                     await self.analyze(*pair)
                     visited.add(pair)
+                    self.automatic_reviews.reset_budget_backoff(role="analysis_provider")
                 except ReviewDeferred as exc:
                     deferred = True
                     failed.add(pair)
-                    self.automatic_reviews.note_budget_busy(exc)
+                    self.automatic_reviews.note_budget_busy(exc, role="analysis_provider")
                 except Exception as exc:
                     failed.add(pair)
                     self.last_error = type(exc).__name__
@@ -2595,7 +2551,7 @@ class Engine:
                 break
 
     async def review_pending_proposals(self):
-        if self.automatic_reviews.is_budget_backed_off():
+        if self.automatic_reviews.is_budget_backed_off(role="review_provider"):
             return
         pending_by_scope = {}
         apply_only_by_scope = {}
@@ -2705,16 +2661,18 @@ class Engine:
                 await self.apply_approved_profiles()
                 await self.review_pending_profiles()
                 await self.review_pending_proposals()
-                if self.config.get("auto_analyze", True) and not self.automatic_reviews.is_budget_backed_off():
+                if self.config.get("auto_analyze", True) and not self.automatic_reviews.is_budget_backed_off(
+                    role="analysis_provider"
+                ):
                     await self.analysis_cycle()
                     for scope, persona in list(self.current_personas.items()):
-                        if self.automatic_reviews.is_budget_backed_off():
+                        if self.automatic_reviews.is_budget_backed_off(role="analysis_provider"):
                             break
                         if self.expressions.enabled(scope, persona):
                             try:
                                 await self.expressions.analyze(scope, persona)
                             except ReviewDeferred as exc:
-                                self.automatic_reviews.note_budget_busy(exc)
+                                self.automatic_reviews.note_budget_busy(exc, role="analysis_provider")
                                 break
                             except Exception as exc:
                                 self.last_error = type(exc).__name__
@@ -2722,7 +2680,7 @@ class Engine:
                             try:
                                 await self.scenes.analyze(scope, persona)
                             except ReviewDeferred as exc:
-                                self.automatic_reviews.note_budget_busy(exc)
+                                self.automatic_reviews.note_budget_busy(exc, role="analysis_provider")
                                 break
                             except Exception as exc:
                                 self.last_error = type(exc).__name__
@@ -2841,7 +2799,7 @@ class Engine:
             query_queue, self.store, scopes, modes, names, dict(self.current_personas), latest, **filters
         )
 
-    def queue_counts(self, *, scopes=None) -> dict[str, int]:
+    def queue_counts(self, *, scopes=None, readonly=False) -> dict[str, int]:
         """Synchronous, read-only queue summary separating ready_count from stale_count."""
         if scopes is None:
             raw_scopes = self.effective_sessions()
@@ -2929,8 +2887,12 @@ class Engine:
                coalesce(sum(stale_reason='' AND claim IS NOT NULL),0) AS held_count,
                coalesce(sum(stale_reason='' AND claim IS NULL AND reason!='ready'),0) AS waiting_count
         FROM flags"""
-        with self.store.lock:
-            row = self.store.db.execute(sql, args).fetchone()
+        if readonly:
+            with self.store.readonly_connection() as db:
+                row = db.execute(sql, args).fetchone()
+        else:
+            with self.store.lock:
+                row = self.store.db.execute(sql, args).fetchone()
         return {
             "pending_total": int(row["pending_total"]) if row else 0,
             "ready_count": int(row["ready_count"]) if row else 0,
@@ -2980,7 +2942,7 @@ class Engine:
                 async def commit_and_refresh():
                     results = await asyncio.to_thread(self.store.apply_batch, prepared, actor)
                     self.cache_refresh_pending = True
-                    await self.refresh()
+                    await self._refresh_scope(scope)
                     invalidate_presence_cache(context=self._host_context)
                     return {"applied": [p["id"] for p in results], "count": len(results)}
 
@@ -3041,7 +3003,7 @@ class Engine:
                     except (Conflict, ValueError) as exc:
                         skipped.append({"id": p["id"], "reason": str(exc)})
                 if applied_ids:
-                    await self.refresh()
+                    await self._refresh_scope(scope)
                     invalidate_presence_cache(context=self._host_context)
                 return {
                     "applied": applied_ids,
@@ -3074,7 +3036,7 @@ class Engine:
             async def commit_and_refresh():
                 results = await asyncio.to_thread(self.store.apply_batch, prepared, actor)
                 self.cache_refresh_pending = True
-                await self.refresh()
+                await self._refresh_scope(scope)
                 return {"applied": [p["id"] for p in results], "count": len(results)}
 
             return await self.finish_operation(commit_and_refresh())

@@ -412,8 +412,8 @@ class DynamicsLearning(Star):
                 "pending_total": 0,
             }
         try:
-            counts = self.engine.store.proposal_counts()
-            q = self.engine.queue_counts()
+            counts = self.engine.store.proposal_counts(readonly=True)
+            q = self.engine.queue_counts(readonly=True)
             ready_count = int(q.get("ready_count", 0))
             stale_count = int(q.get("stale_count", 0))
             waiting_count = int(q.get("waiting_count", 0)) + int(q.get("held_count", 0))
@@ -554,7 +554,7 @@ class DynamicsLearning(Star):
                 queue_size = 0
             dropped = int(getattr(self.engine, "dropped", 0) or 0)
             try:
-                q_counts = self.engine.queue_counts()
+                q_counts = self.engine.queue_counts(readonly=True)
                 ready_count = int(q_counts.get("ready_count", 0))
                 stale_count = int(q_counts.get("stale_count", 0))
             except Exception:
@@ -619,18 +619,18 @@ class DynamicsLearning(Star):
             today_bounds = _date_window("today", tz=tz)
             day_start, day_end = today_bounds if today_bounds is not None else (0.0, now + 1.0)
             store = self.engine.store
-            with store.lock:
-                pending_row = store.db.execute(
+            with store.readonly_connection() as db:
+                pending_row = db.execute(
                     "SELECT count(*) FROM proposals WHERE scope=? AND state IN ('pending','reviewed')",
                     (scope,),
                 ).fetchone()
-                active_row = store.db.execute(
+                active_row = db.execute(
                     "SELECT count(*) FROM entries WHERE json_extract(body,'$.scope')=? "
                     "AND json_extract(body,'$.active')=1 "
                     "AND (json_extract(body,'$.category')='affection' OR json_extract(body,'$.expires')>?)",
                     (scope, now),
                 ).fetchone()
-                today_row = store.db.execute(
+                today_row = db.execute(
                     "SELECT count(*) FROM proposals WHERE scope=? AND updated>=? AND updated<?",
                     (scope, day_start, day_end),
                 ).fetchone()
@@ -694,8 +694,8 @@ class DynamicsLearning(Star):
             seen_ids: set[str] = set()
             store = self.engine.store
             allowed_json = encode(list(allowed))
-            with store.lock:
-                prop_rows = store.db.execute(
+            with store.readonly_connection() as db:
+                prop_rows = db.execute(
                     """SELECT body FROM proposals
                     WHERE state IN ('pending','reviewed')
                     AND (?='' OR scope=?)
@@ -730,7 +730,7 @@ class DynamicsLearning(Star):
                 remaining = max_items - len(results)
                 if remaining > 0:
                     now = time.time()
-                    entry_rows = store.db.execute(
+                    entry_rows = db.execute(
                         """SELECT body FROM entries
                         WHERE json_extract(body,'$.active')=1
                         AND (json_extract(body,'$.category')='affection' OR json_extract(body,'$.expires')>?)
@@ -801,7 +801,7 @@ class DynamicsLearning(Star):
                 return []
             allowed_json = encode(list(allowed))
             store = self.engine.store
-            with store.lock:
+            with store.readonly_connection() as db:
                 sql = (
                     "SELECT body FROM proposals "
                     "WHERE state IN ('pending','reviewed','applied') "
@@ -826,7 +826,7 @@ class DynamicsLearning(Star):
                         max_items,
                     )
                 )
-                rows = store.db.execute(sql, params).fetchall()
+                rows = db.execute(sql, params).fetchall()
             events: list[dict] = []
             for row in rows:
                 p = json.loads(row[0])
@@ -1342,7 +1342,7 @@ class DynamicsLearning(Star):
 
         async def _invoke_provider():
             if review_dispatch and self.engine is not None:
-                self.engine.store.automatic_reviews.record_dispatch(review_dispatch)
+                await asyncio.to_thread(self.engine.store.automatic_reviews.record_dispatch, review_dispatch)
             return await provider.text_chat(prompt=payload, system_prompt=instruction, **call_kwargs)
 
         try:
@@ -1354,6 +1354,8 @@ class DynamicsLearning(Star):
                         PLUGIN,
                         role.removesuffix("_provider"),
                         _invoke_provider,
+                        model=model,
+                        group_id=scope,
                     )
         except ReviewDeferred:
             raise

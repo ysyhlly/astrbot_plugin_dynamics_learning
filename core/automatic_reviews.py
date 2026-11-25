@@ -18,12 +18,6 @@ MAX_ITEMS = 4
 WAIT_SECONDS = 300
 DEFAULT_COALESCE_SECONDS = 15.0
 BUDGET_BACKOFF_STEPS = (60.0, 120.0, 300.0)
-BATCH_OUTPUT = """
-逐项独立审查 proposals 数组。每项只能使用自己 proposal 的信息、引用证据、before
-及自己的 target_material，禁止以其它提案的内容、结论或证据互相佐证。
-逐项返回对应 proposal.id，所有编号必须原样保留，每项仅一条结论。只输出一个 JSON 对象：
-{"verdicts":[{"proposal_id":"实际 proposal.id","verdict":"approve|reject|defer","reason":"审查理由","risks":["待观察项"]}]}。
-"""
 
 
 @dataclass(frozen=True)
@@ -116,12 +110,24 @@ class AutomaticReviews:
         self.wait_seconds = WAIT_SECONDS
         self._budget_backoff_until = 0.0
         self._budget_backoff_streak = 0
+        self._provider_backoff_until: dict[str, float] = {}
+        self._provider_backoff_streak: dict[str, int] = {}
 
-    def _provider_circuit_remaining(self) -> float:
+    def _resolve_provider_key(self, *, role: str = "review_provider", provider_id: str | None = None) -> str:
+        if provider_id is not None and str(provider_id).strip():
+            return str(provider_id).strip()
+        pid = self.engine.provider_for(role) if hasattr(self.engine, "provider_for") else ""
+        return str(pid or "").strip() or role
+
+    def _provider_circuit_remaining(self, *, role: str = "review_provider", provider_id: str | None = None) -> float:
         ctx = getattr(self.engine, "_host_context", None)
         if ctx is None:
             return 0.0
-        pid = self.engine.provider_for("review_provider") if hasattr(self.engine, "provider_for") else ""
+        pid = (
+            str(provider_id).strip()
+            if provider_id is not None and str(provider_id).strip()
+            else (self.engine.provider_for(role) if hasattr(self.engine, "provider_for") else "")
+        )
         if not pid:
             return 0.0
         probe = getattr(series_panels, "provider_circuit_remaining", lambda _c, _p: 0.0)
@@ -130,32 +136,73 @@ class AutomaticReviews:
         except Exception:
             return 0.0
 
-    def note_budget_busy(self, exc_or_retry_after=None, *, now: float | None = None) -> float:
+    def note_budget_busy(
+        self,
+        exc_or_retry_after=None,
+        *,
+        now: float | None = None,
+        role: str = "review_provider",
+        provider_id: str | None = None,
+    ) -> float:
         stamp = time.time() if now is None else float(now)
         if isinstance(exc_or_retry_after, BaseException):
             retry_after = max(0.0, float(getattr(exc_or_retry_after, "retry_after", 0.0) or 0.0))
         else:
             retry_after = max(0.0, float(exc_or_retry_after or 0.0))
-        step = BUDGET_BACKOFF_STEPS[min(self._budget_backoff_streak, len(BUDGET_BACKOFF_STEPS) - 1)]
+        key = self._resolve_provider_key(role=role, provider_id=provider_id)
+        streak = self._provider_backoff_streak.get(key, 0)
+        step = BUDGET_BACKOFF_STEPS[min(streak, len(BUDGET_BACKOFF_STEPS) - 1)]
         wait = max(step, retry_after)
-        self._budget_backoff_streak += 1
-        until = stamp + wait
-        self._budget_backoff_until = max(self._budget_backoff_until, until)
-        return self._budget_backoff_until
+        self._provider_backoff_streak[key] = streak + 1
+        until = max(self._provider_backoff_until.get(key, 0.0), stamp + wait)
+        self._provider_backoff_until[key] = until
+        if key == self._resolve_provider_key(role="review_provider"):
+            self._budget_backoff_streak = self._provider_backoff_streak[key]
+            self._budget_backoff_until = max(self._budget_backoff_until, until)
+        return until
 
-    def reset_budget_backoff(self) -> None:
-        self._budget_backoff_streak = 0
-        self._budget_backoff_until = 0.0
+    def reset_budget_backoff(self, *, role: str | None = None, provider_id: str | None = None) -> None:
+        if role is None and provider_id is None:
+            self._provider_backoff_streak.clear()
+            self._provider_backoff_until.clear()
+            self._budget_backoff_streak = 0
+            self._budget_backoff_until = 0.0
+            return
+        key = self._resolve_provider_key(role=role or "review_provider", provider_id=provider_id)
+        self._provider_backoff_streak.pop(key, None)
+        self._provider_backoff_until.pop(key, None)
+        if key == self._resolve_provider_key(role="review_provider"):
+            self._budget_backoff_streak = 0
+            self._budget_backoff_until = 0.0
 
-    def budget_backoff_remaining(self, *, now: float | None = None) -> float:
+    def budget_backoff_remaining(
+        self,
+        *,
+        now: float | None = None,
+        role: str = "review_provider",
+        provider_id: str | None = None,
+    ) -> float:
         stamp = time.time() if now is None else float(now)
-        circuit_rem = self._provider_circuit_remaining()
+        key = self._resolve_provider_key(role=role, provider_id=provider_id)
+        until = self._provider_backoff_until.get(key, 0.0)
+        if provider_id is None and key == self._resolve_provider_key(role="review_provider"):
+            until = max(until, self._budget_backoff_until)
+        circuit_rem = self._provider_circuit_remaining(role=role, provider_id=provider_id)
         if circuit_rem > 0:
-            self._budget_backoff_until = max(self._budget_backoff_until, stamp + circuit_rem)
-        return max(0.0, self._budget_backoff_until - stamp)
+            until = max(until, stamp + circuit_rem)
+            self._provider_backoff_until[key] = until
+            if key == self._resolve_provider_key(role="review_provider"):
+                self._budget_backoff_until = max(self._budget_backoff_until, until)
+        return max(0.0, until - stamp)
 
-    def is_budget_backed_off(self, *, now: float | None = None) -> bool:
-        return self.budget_backoff_remaining(now=now) > 0.0
+    def is_budget_backed_off(
+        self,
+        *,
+        now: float | None = None,
+        role: str = "review_provider",
+        provider_id: str | None = None,
+    ) -> bool:
+        return self.budget_backoff_remaining(now=now, role=role, provider_id=provider_id) > 0.0
 
     @property
     def enabled(self):

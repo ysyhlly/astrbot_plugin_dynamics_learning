@@ -28,14 +28,27 @@ def scene_labels(raw):
     return result
 
 
+def _valid_identity_token(raw):
+    token = str(raw or '').strip()
+    if len(token) < 2:
+        return ''
+    if token.isascii() and len(token) < 3:
+        return ''
+    return token
+
+
 def sanitize(value, identities=()):
     """A derived example, explicitly NOT an exact source quotation."""
     value = re.sub(r'\[CQ:[^\]]*\]', '[消息组件]', str(value))
     value = re.sub(r'@[^\s@]*', '[成员]', value)
     value = re.sub(r'https?://\S+|[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}', '[链接]', value)
     value = re.sub(r'(?<!\d)\d{5,}(?!\d)', '[号码]', value)
-    for identity in sorted(set(str(x) for x in identities if x), key=len, reverse=True):
-        value = value.replace(identity, '[成员]')
+    tokens = {_valid_identity_token(x) for x in identities} - {''}
+    for identity in sorted(tokens, key=len, reverse=True):
+        if identity.isascii():
+            value = re.sub(r'(?<![A-Za-z0-9])' + re.escape(identity) + r'(?![A-Za-z0-9])', '[成员]', value)
+        else:
+            value = value.replace(identity, '[成员]')
     return value.strip()[:400]
 
 

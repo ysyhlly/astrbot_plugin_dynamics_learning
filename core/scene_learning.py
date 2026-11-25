@@ -95,11 +95,23 @@ class SceneLearning:
                 break
             found.update(additions)
         group = self.engine.social.groups.get(scope, {}) if self.engine.social else {}
-        names = [str(u.get('name', ''))[:128] for u in group.get('users', {}).values() if isinstance(u, dict) and u.get('name')][:2000]
+        names = [
+            clean
+            for u in group.get('users', {}).values()
+            if isinstance(u, dict) and u.get('name')
+            for clean in (str(u.get('name', '')).strip()[:128],)
+            if len(clean) >= 2 and (not clean.isascii() or len(clean) >= 3)
+        ][:2000]
         for row in found.values():
             # Keep only names actually present; never copy the whole group directory into each piece of evidence.
             present = [name for name in names if name in row['text']]
-            row['context']['identity_tokens'] = list(dict.fromkeys([*row['context'].get('identity_tokens', []), *present]))
+            existing_tokens = [
+                clean
+                for t in row['context'].get('identity_tokens', [])
+                for clean in (str(t or '').strip()[:128],)
+                if len(clean) >= 2 and (not clean.isascii() or len(clean) >= 3)
+            ]
+            row['context']['identity_tokens'] = list(dict.fromkeys([*existing_tokens, *present]))
         return list(found.values())
 
     async def analyze(self, scope, persona):
@@ -159,9 +171,9 @@ class SceneLearning:
                     await e.review_write(commit)
             await self.propose_adjustments(scope, persona, token)
             # Retry deferred/failed scene reviews on subsequent cycles, without bypassing claims.
-            proposals = await asyncio.to_thread(e.store.proposals, scope, 2000)
-            pending = [p for p in proposals if p['persona'] == persona and p['category'] in SCENE_CATEGORIES
-                       and p['state'] in {'pending', 'reviewed'} and not e.store.review_claim(p['id'])]
+            pending = await asyncio.to_thread(
+                e.store.pending_proposals_by_categories, scope, persona, SCENE_CATEGORIES, 64
+            )
             managed = await e.automatic_reviews.enqueue(pending)
             pending_ids = []
             for p in [p for p in pending if p['id'] not in managed

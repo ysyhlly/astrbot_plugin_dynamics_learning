@@ -374,5 +374,23 @@
       "llm",
       "llm_then_human"
     ]
+  },
+  "reply_projection_budget": {
+    "description": "回复学习材料注入总字符预算",
+    "type": "int",
+    "default": 6000,
+    "hint": "单轮回复可注入的学习资料总字符上限（范围 1200-8400）。"
+  },
+  "max_jargon_per_turn": {
+    "description": "单轮回复最多注入黑话条数",
+    "type": "int",
+    "default": 4,
+    "hint": "单轮命中群聊黑话时最多附带的词条数量（范围 1-12）。"
+  },
+  "audit_retention_days": {
+    "description": "审计与终态提案保留天数",
+    "type": "int",
+    "default": 90,
+    "hint": "审计日志与已拒绝/归档/回滚提案的留存天数（默认 90 天）。"
   }
 }

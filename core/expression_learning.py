@@ -204,10 +204,11 @@ class ExpressionLearning:
     async def review_pending(self, scope, persona, token):
         e = self.engine
         await e.scenes.propose_adjustments(scope, persona, token, expression=True)
-        rows = await asyncio.to_thread(e.store.proposals, scope, 2000)
+        rows = await asyncio.to_thread(
+            e.store.pending_proposals_by_categories, scope, persona, EXPRESSION_CATEGORIES, 64
+        )
         pending_ids = []
-        for p in [p for p in rows if p['persona'] == persona and p['category'] in EXPRESSION_CATEGORIES
-                  and p['state'] in {'pending', 'reviewed'} and not e.store.review_claim(p['id'])][:8]:
+        for p in rows[:8]:
             if not self.enabled(scope, persona) or token != e.scope_token(scope):
                 break
             current = next((r for r in e.cache if r['id'] == p['entry_id']), None)

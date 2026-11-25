@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import math
 import time
@@ -101,6 +102,11 @@ class Social:
         await asyncio.gather(*tasks,return_exceptions=True)
         if self.owned_tasks:
             await asyncio.gather(*tuple(self.owned_tasks),return_exceptions=True)
+        close = getattr(self.sentiment, 'close', None)
+        if callable(close):
+            res = close()
+            if inspect.isawaitable(res):
+                await res
 
     async def initialize(self):
         await self.write(self.graph.apply_daily_decay(self.settings['daily_decay']))
@@ -163,6 +169,12 @@ class Social:
                 if not self.engine.allowed(scope) or token != self.engine.scope_token(scope):
                     return
                 overview['interaction_circles'] = self.circles(overview)
+                by_member = defaultdict(list)
+                for edge in overview.get('all_relations', []):
+                    by_member[edge['a']].append(edge)
+                    if edge['b'] != edge['a']:
+                        by_member[edge['b']].append(edge)
+                overview['relations_by_member'] = dict(by_member)
                 self.groups[scope] = overview
                 self.refreshed[scope] = time.monotonic()
                 self.updated_at[scope]=time.time()
@@ -196,7 +208,7 @@ class Social:
             return
         await asyncio.to_thread(self.store.bind_legacy_social, scope, persona, key)
         self.bindings[binding] = key
-        await self.engine.refresh()
+        await self.engine._refresh_scope(scope)
 
     def current_affection(self, scope, persona, member):
         if not self.engine.config.get('affection_enabled', True):
@@ -237,7 +249,12 @@ class Social:
         if self.engine.config.get('group_relations_enabled', True) and scope in self.groups:
             graph = self.groups[scope]
             users = graph.get('users', {})
-            relevant = [r for r in graph.get('all_relations', []) if member in (r['a'], r['b'])]
+            by_member = graph.get('relations_by_member')
+            relevant = (
+                by_member.get(member, [])
+                if isinstance(by_member, dict)
+                else [r for r in graph.get('all_relations', []) if member in (r['a'], r['b'])]
+            )
             pairs = relevant[:5]
             data['observed_group'] = {
                 'window_days': self.settings['window_days'], 'observed_members': len(users), 'recent_active': graph.get('active_member_count', 0),
@@ -342,7 +359,13 @@ class Social:
             raise ValueError('scope not enabled')
         graph=self.groups.get(scope,{})
         user=graph.get('users',{}).get(member,{})
-        pairs=[self.edge(e) for e in graph.get('all_relations',[]) if member in (e['a'],e['b'])][:12]
+        by_member = graph.get('relations_by_member')
+        raw_edges = (
+            by_member.get(member, [])
+            if isinstance(by_member, dict)
+            else [e for e in graph.get('all_relations', []) if member in (e['a'], e['b'])]
+        )
+        pairs=[self.edge(e) for e in raw_edges[:12]]
         return {'member':member,'name':user.get('name',member),'messages':user.get('count',0),'relations':pairs}
 
     def query(self, scope, member, kind='overview', term=''):
@@ -381,7 +404,13 @@ class Social:
             return {'available': bool(entries), 'source': 'dynamics_learning', 'scope': scope,
                     'terms': [{'term': e['key'], 'meaning': e['value'], 'provenance': e.get('provenance', {})} for e in entries]}
         if kind=='relations':
-            edges=[self.edge(r) for r in graph.get('all_relations',[]) if member in (r['a'],r['b'])][:10]
+            by_member = graph.get('relations_by_member')
+            raw_edges = (
+                by_member.get(member, [])
+                if isinstance(by_member, dict)
+                else [r for r in graph.get('all_relations', []) if member in (r['a'], r['b'])]
+            )
+            edges=[self.edge(r) for r in raw_edges[:10]]
             return {'available':member in graph.get('users',{}),'scope':scope,'member':member,'edges':edges,
                     'note':'群聊互动证据，不是确定的现实关系。'}
         content,_=self.context(scope,persona,member)

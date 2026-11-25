@@ -198,10 +198,7 @@ def project_event_for_model(event, *, include_scope=True):
 
 def project_current_entry_for_model(entry):
     """Project an active entry into a stable, timestamp-free view for ANALYZE."""
-    out = {k: entry[k] for k in ("id", "category", "key", "member", "value", "revision") if k in entry}
-    if "created_at" in entry:
-        out["created_at"] = entry["created_at"]
-    return out
+    return {k: entry[k] for k in ("id", "category", "key", "member", "value", "revision") if k in entry}
 
 
 def project_before_for_review(before):
