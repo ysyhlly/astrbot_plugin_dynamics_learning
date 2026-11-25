@@ -20,6 +20,10 @@ MEMBER_PROFILES = {"expression_example", "style", "typing_habit", "preference"}
 PERSONALITY_POLICY = "Bot 原始性格、身份、价值观和自身喜恶固定。成员资料只描述对应群友；可在原有人设内调整措辞和交流方式，不模仿或继承群友的性格、立场和喜恶。好感、短期状态和接话策略也不能改写自身性格。"
 
 
+def is_free_text_typing_habit(category, value):
+    return category == "typing_habit" and not isinstance(value, dict)
+
+
 def policy_allowed(row):
     if row.get('category') in {'expression_style', 'expression_adjustment'}:
         return row.get('expression_policy') == 1 and row.get('member') == '' and ':GroupMessage:' in row.get('scope', '')
@@ -148,14 +152,19 @@ def candidate(raw, events, current):
             raise ValueError('original quotes cannot be edited or invented')
         value = expected
         key = digest([member, context['text'], expression['text']])[:32]
-    elif category == 'typing_habit' and isinstance(value, dict):
+    elif category == 'typing_habit':
         from .profiles import statistics
         expected = statistics(evidence)
         if expected['sample_count'] < 10 or any(not e.get('context', {}).get('source_verified') for e in evidence):
             raise ValueError('statistics require ten distinct native messages')
-        if any(k not in expected or v != expected[k] for k, v in value.items()):
-            raise ValueError('statistics must match source messages')
-        value, key = expected, 'observed_typing'
+        if isinstance(value, dict):
+            if any(k not in expected or v != expected[k] for k, v in value.items()):
+                raise ValueError('statistics must match source messages')
+            value, key = expected, 'observed_typing'
+        else:
+            if key == 'observed_typing':
+                raise ValueError('observed_typing key is reserved for verified statistics')
+            value = text(value, "value", 1000)
     elif category == 'preference':
         if not isinstance(value, dict) or set(value) != {'topic', 'stance', 'condition', 'quote', 'source_id'}:
             raise ValueError('preference requires topic, stance, condition, quote and source_id')

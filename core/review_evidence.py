@@ -167,7 +167,7 @@ def review_context(engine, proposal, instruction):
     allowed = engine.allowed(scope)
     feature_enabled = bool(engine.config.get(flag, default))
     live_persona = engine.current_personas.get(scope, persona)
-    mode = engine.mode(category)
+    mode = engine.proposal_mode(proposal) if hasattr(engine, "proposal_mode") else engine.mode(category)
     policy = policy_allowed(proposal)
     expired = proposal["created"] + proposal["days"] * 86400 <= now
     base_valid = (current["revision"] if current else 0) == proposal["base_revision"]

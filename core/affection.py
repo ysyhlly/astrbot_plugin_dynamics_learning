@@ -5,6 +5,10 @@ with localcontext() as _ctx:
     _ctx.prec = 64
     _LN2 = Decimal(2).ln()
 
+AUTO_AFFECTION_REVIEW_THRESHOLD = Decimal("10")
+AUTO_AFFECTION_DAILY_ABS_LIMIT = Decimal("25")
+AUTO_AFFECTION_DAILY_MAX_COUNT = 6
+
 
 def decimal(value):
     if isinstance(value, bool):

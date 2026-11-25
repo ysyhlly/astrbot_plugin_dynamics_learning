@@ -54,6 +54,7 @@ from .series_panels import (
     inherit_umos,
     is_provider_budget_busy_error,
     is_series_group_excluded,
+    require_series_admin,
     resolve_series_provider,
     resolve_series_timezone,
     series_llm_call,
@@ -1253,19 +1254,36 @@ class DynamicsLearning(Star):
         """查询当前群的群友习惯与喜恶、互动分布、角色好感度或已确认黑话。
 
         Args:
-            kind(str): profile 为群友表达方式、打字习惯与喜恶，overview 为群聊分布，affection 为角色对成员的好感，relations 为成员往来，jargon 为具体黑话。
-            member_id(str): 当前群成员的账号，留空使用当前发言者。不能查询其他群。
+            kind(str): profile 为群友表达方式、打字习惯与喜恶，overview 为全群社交分布（仅管理员），affection 为角色对成员的好感，relations 为成员往来，jargon 为具体黑话。
+            member_id(str): 当前群成员的账号，留空使用当前发言者；指定其他成员仅管理员。不能查询其他群。
             term(str): kind 为 jargon 时填写需要解释的完整词语。
         """
         if self.closed or not self.ready or not self.engine or not self.engine.social:
             return encode({"available": False, "reason": "群间学习尚未就绪"})
         scope = str(getattr(event, "unified_msg_origin", "") or "")
-        member = str(member_id or event.get_sender_id())
-        if kind == "profile":
-            if ":GroupMessage:" not in scope or len(member) > 128:
+        sender = str(event.get_sender_id() or "").strip()
+        requested_member = str(member_id or "").strip()
+        member = requested_member or sender
+        kind_clean = str(kind or "overview").strip()
+        check = getattr(event, "is_admin", None)
+        admin = bool(check()) if callable(check) else False
+        if kind_clean not in {"overview", "affection", "profile", "relations", "jargon"}:
+            return encode({"available": False, "reason": "未知查询类型"})
+        if kind_clean == "overview" and not admin:
+            return encode({"available": False, "reason": "查询全群社交状态需要管理员权限"})
+        if kind_clean in {"affection", "profile", "relations"}:
+            if not member or len(member) > 128:
+                return encode({"available": False, "reason": "仅支持当前群成员"})
+            if (not sender or member != sender) and not admin:
+                return encode({"available": False, "reason": "查询其他成员的社交状态、好感度或画像需要管理员权限"})
+        if kind_clean == "profile":
+            if ":GroupMessage:" not in scope:
                 return encode({"available": False, "reason": "仅支持当前群成员"})
             return encode(self.engine.member_profile(scope, member))
-        return encode(self.engine.social.query(scope, member, kind, str(term or "").strip()))
+        try:
+            return encode(self.engine.social.query(scope, member, kind_clean, str(term or "").strip()))
+        except ValueError as exc:
+            return encode({"available": False, "reason": str(exc)})
 
     async def _model(self, role, instruction, data, *, review_dispatch=None):
         provider_id = self._effective_provider(role)
@@ -1362,17 +1380,9 @@ class DynamicsLearning(Star):
         except ValueError as exc:
             raise MalformedModelResponse(str(exc)) from exc
 
-    async def _authorized(self):
-        from astrbot.dashboard.api.auth import require_dashboard_user
-
-        raw = getattr(request, "_request", None)
-        if raw is None:
-            raise PermissionError("需要 Dashboard 管理员登录")
-        username = await require_dashboard_user(raw)
-        expected = self.context.get_config().get("dashboard", {}).get("username")
-        if not username or (expected and username != expected):
-            raise PermissionError("需要 Dashboard 管理员登录")
-        return "human:" + str(username)
+    async def _authorized(self, *, check_csrf: bool = True):
+        username = await require_series_admin(self.context, request, check_csrf=check_csrf)
+        return "human:" + username
 
     async def _body(self, allowed):
         raw = await request._request.body()
@@ -1391,8 +1401,11 @@ class DynamicsLearning(Star):
             body = await self._body(fields) if fields else {}
             data = await operation(body, actor)
             return json_response({"status": "ok", "data": data})
-        except PermissionError:
-            return json_response({"status": "error", "message": "需要 Dashboard 管理员登录"}, status_code=403)
+        except PermissionError as exc:
+            return json_response(
+                {"status": "error", "message": str(exc) or "需要 Dashboard 管理员登录"},
+                status_code=403,
+            )
         except (ValueError, KeyError) as exc:
             return json_response({"status": "error", "message": str(exc)[:300]}, status_code=400)
         except Exception as exc:

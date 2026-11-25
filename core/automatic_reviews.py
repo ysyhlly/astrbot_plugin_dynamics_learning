@@ -167,7 +167,7 @@ class AutomaticReviews:
 
     def candidate(self, p):
         try:
-            mode = self.engine.mode(p["category"])
+            mode = self.engine.proposal_mode(p) if hasattr(self.engine, "proposal_mode") else self.engine.mode(p["category"])
         except ValueError:
             return False
         return (

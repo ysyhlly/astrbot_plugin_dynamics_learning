@@ -7,13 +7,20 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from decimal import Decimal
 from pathlib import Path
 
+from .affection import (
+    AUTO_AFFECTION_DAILY_ABS_LIMIT,
+    AUTO_AFFECTION_DAILY_MAX_COUNT,
+    AUTO_AFFECTION_REVIEW_THRESHOLD,
+)
 from .contract import (
     MEMBER_PROFILES,
     digest,
     encode,
     entry_key,
+    is_free_text_typing_habit,
     llm_approved,
     policy_allowed,
 )
@@ -413,7 +420,7 @@ class Store:
             ):
                 old = json.loads(record[0])
                 if (
-                    mode == "auto"
+                    (mode == "auto" or bool(data.get("auto_guard_reason")))
                     and data["category"] == "affection"
                     and old["entry_id"] == key
                     and old["state"] in {"rejected", "rolled_back", "archived"}
@@ -538,6 +545,53 @@ class Store:
                 )
             ]
 
+    def affection_daily_usage(self, scope, identity, member, *, window_seconds=86400, now=None):
+        cutoff = (time.time() if now is None else float(now)) - max(1.0, float(window_seconds))
+        total_abs = Decimal(0)
+        count = 0
+        with self.lock:
+            rows = self.db.execute(
+                """SELECT json_extract(body,'$.value.experience_delta'),
+                          json_extract(body,'$.value.character_key'),
+                          persona
+                   FROM proposals
+                   WHERE scope=? AND state='applied'
+                     AND json_extract(body,'$.category')='affection'
+                     AND json_extract(body,'$.member')=?
+                     AND coalesce(json_extract(body,'$.applied_at'), updated) >= ?""",
+                (scope, member, cutoff),
+            ).fetchall()
+        for raw_delta, char_key, persona in rows:
+            row_identity = char_key or persona
+            if row_identity != identity:
+                continue
+            if raw_delta is None:
+                continue
+            try:
+                total_abs += abs(Decimal(str(raw_delta)))
+            except Exception:
+                continue
+            count += 1
+        return total_abs, count
+
+    def escalate_affection_review(self, proposal_id, expected_updated, reason):
+        with self.transaction():
+            p = self.get(proposal_id)
+            if p["category"] != "affection" or p["state"] not in {"pending", "reviewed"} or p["updated"] != expected_updated:
+                raise Conflict("affection proposal changed")
+            changed = False
+            if p.get("auto_guard_reason") != reason:
+                p["auto_guard_reason"] = reason
+                changed = True
+            if p["mode"] == "auto":
+                p["previous_mode"] = p["mode"]
+                p["mode"] = "llm_then_human"
+                changed = True
+            if changed:
+                self._save(p)
+                self._audit(p, "auto_guard_escalated", "system:affection-guard", {"reason": reason, "mode": p["mode"]})
+            return p
+
     def adopt_profile_llm_mode(self, proposal_id, expected_updated):
         with self.transaction():
             p = self.get(proposal_id)
@@ -547,6 +601,18 @@ class Store:
                 or p["updated"] != expected_updated
             ):
                 raise Conflict("member proposal changed")
+            if is_free_text_typing_habit(p["category"], p.get("value")):
+                if p["mode"] == "llm":
+                    previous = p["mode"]
+                    p["mode"] = "llm_then_human"
+                    self._save(p)
+                    self._audit(
+                        p,
+                        "review_mode_changed",
+                        "system:member-review-policy",
+                        {"before": previous, "after": "llm_then_human"},
+                    )
+                return p
             if p["mode"] != "llm":
                 previous = p["mode"]
                 p["mode"] = "llm"
@@ -556,7 +622,18 @@ class Store:
                 )
             return p
 
-    def apply(self, proposal_id, actor, expected_updated, *, automatic_affection=False, owner=None):
+    def apply(
+        self,
+        proposal_id,
+        actor,
+        expected_updated,
+        *,
+        automatic_affection=False,
+        owner=None,
+        auto_review_threshold=AUTO_AFFECTION_REVIEW_THRESHOLD,
+        auto_daily_limit=AUTO_AFFECTION_DAILY_ABS_LIMIT,
+        auto_daily_max_count=AUTO_AFFECTION_DAILY_MAX_COUNT,
+    ):
         with self.transaction():
             p = self.get(proposal_id)
             claim = self.review_claim(proposal_id)
@@ -573,6 +650,8 @@ class Store:
             if self.source_withdrawals.has_withdrawn(p["scope"], p["evidence"]):
                 raise Conflict("proposal cites a withdrawn source")
             approved = llm_approved(p)
+            if is_free_text_typing_habit(p["category"], p.get("value")) and not actor.startswith("human:"):
+                raise Conflict("human approval required")
             if not automatic_affection and p["mode"] in {"llm", "llm_then_human"} and not approved:
                 raise Conflict("LLM approval required")
             if not automatic_affection and p["mode"] != "llm" and not actor.startswith("human:"):
@@ -584,6 +663,18 @@ class Store:
             if p["category"] == "affection":
                 sources = sorted({e["message_id"] for e in p["evidence"]})
                 affection_identity = p["value"].get("character_key") or p["persona"]
+                if automatic_affection:
+                    if p.get("auto_guard_reason"):
+                        raise Conflict("affection proposal requires review")
+                    try:
+                        delta_abs = abs(Decimal(str(p["value"].get("experience_delta", 0))))
+                    except Exception:
+                        raise Conflict("invalid affection delta") from None
+                    if delta_abs >= Decimal(str(auto_review_threshold)):
+                        raise Conflict("large affection delta requires review")
+                    used_abs, used_count = self.affection_daily_usage(p["scope"], affection_identity, p["member"])
+                    if used_abs + delta_abs > Decimal(str(auto_daily_limit)) or used_count >= int(auto_daily_max_count):
+                        raise Conflict("daily automatic affection limit reached")
                 for message_id in sources:
                     if self.db.execute(
                         "SELECT 1 FROM affection_source_claims WHERE scope=? AND persona=? AND member=? AND message_id=?",

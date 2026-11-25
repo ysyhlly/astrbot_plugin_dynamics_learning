@@ -15,14 +15,32 @@ def test_profile_member_evidence_and_scoped_context(tmp_path, category):
     async def run():
         store = Store(tmp_path / 'learning.sqlite3')
         e = event()
+        evidence_list = [e]
         r = {**raw(), 'category': category, 'value': '该成员明确说不喜欢剧透。'}
         if category == 'preference':
             e.update(text='我不喜欢剧透', context={'source_verified':True})
             r['value'] = dict(topic='剧透', stance='dislike', condition='', quote=e['text'], source_id=e['id'])
+        elif category == 'typing_habit':
+            from astrbot_plugin_dynamics_learning.core.contract import event_record
+            evidence_list = []
+            for idx in range(10):
+                base = event()
+                base.pop('id', None)
+                base.pop('received_at', None)
+                base.update(
+                    turn_id=f'0:th{idx}',
+                    message_id=f'th{idx}',
+                    text=f'习惯消息{idx}',
+                    timestamp=1000.0 + idx,
+                    context={'source_verified': True},
+                )
+                evidence_list.append(event_record(base))
+            e = evidence_list[0]
+            r['evidence_ids'] = [ev['id'] for ev in evidence_list]
         for member in ['', 'bob']:
             with pytest.raises(ValueError):
-                candidate({**r, 'member': member}, [e], None)
-        p = store.propose(candidate(r, [e], None), 'llm_then_human', 'test')
+                candidate({**r, 'member': member}, evidence_list, None)
+        p = store.propose(candidate(r, evidence_list, None), 'llm_then_human', 'test')
         with pytest.raises(ValueError, match='LLM approval'):
             store.apply(p['id'], 'human:admin', p['updated'])
         p = store.review(p['id'], dict(verdict='approve', reason='明确自述', risks=[]), 'llm:test', p['updated'])

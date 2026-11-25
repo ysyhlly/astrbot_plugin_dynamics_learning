@@ -9,7 +9,12 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 
-from .affection import state as affection_state
+from .affection import (
+    AUTO_AFFECTION_DAILY_ABS_LIMIT,
+    AUTO_AFFECTION_DAILY_MAX_COUNT,
+    AUTO_AFFECTION_REVIEW_THRESHOLD,
+    state as affection_state,
+)
 from .automatic_reviews import AutomaticReviews, ReviewDispatch, first_review, urgent_review
 
 from .contract import (
@@ -21,6 +26,7 @@ from .contract import (
     encode,
     entry_key,
     event_record,
+    is_free_text_typing_habit,
     jargon_matches,
     llm_approved,
     policy_allowed,
@@ -457,6 +463,79 @@ class Engine:
         )
         if mode not in MODES or mode == "auto" and category != "affection":
             raise ValueError("invalid review mode")
+        return mode
+
+    def affection_auto_review_threshold(self) -> Decimal:
+        raw = self.config.get("affection_auto_review_threshold", AUTO_AFFECTION_REVIEW_THRESHOLD)
+        if isinstance(raw, bool):
+            return AUTO_AFFECTION_REVIEW_THRESHOLD
+        try:
+            val = Decimal(str(raw))
+        except Exception:
+            return AUTO_AFFECTION_REVIEW_THRESHOLD
+        if not val.is_finite():
+            return AUTO_AFFECTION_REVIEW_THRESHOLD
+        return max(Decimal("1"), min(Decimal("20"), val))
+
+    def affection_auto_daily_limit(self) -> Decimal:
+        raw = self.config.get("affection_auto_daily_limit", AUTO_AFFECTION_DAILY_ABS_LIMIT)
+        if isinstance(raw, bool):
+            return AUTO_AFFECTION_DAILY_ABS_LIMIT
+        try:
+            val = Decimal(str(raw))
+        except Exception:
+            return AUTO_AFFECTION_DAILY_ABS_LIMIT
+        if not val.is_finite():
+            return AUTO_AFFECTION_DAILY_ABS_LIMIT
+        return max(Decimal("1"), min(Decimal("100"), val))
+
+    def affection_auto_daily_max_count(self) -> int:
+        raw = self.config.get("affection_auto_daily_max_count", AUTO_AFFECTION_DAILY_MAX_COUNT)
+        if isinstance(raw, bool):
+            return AUTO_AFFECTION_DAILY_MAX_COUNT
+        try:
+            val = int(raw)
+        except Exception:
+            return AUTO_AFFECTION_DAILY_MAX_COUNT
+        return max(1, min(50, val))
+
+    def affection_guard_reason(self, proposal, *, pending_abs_delta=Decimal(0), pending_count=0) -> str:
+        if not isinstance(proposal, dict) or proposal.get("category") != "affection":
+            return ""
+        existing = proposal.get("auto_guard_reason")
+        if existing:
+            return str(existing)
+        value = proposal.get("value")
+        if not isinstance(value, dict) or value.get("experience_delta") is None:
+            return ""
+        try:
+            delta_abs = abs(Decimal(str(value["experience_delta"])))
+        except Exception:
+            return "invalid_delta"
+        threshold = self.affection_auto_review_threshold()
+        if delta_abs >= threshold:
+            return f"spike:{delta_abs}>={threshold}"
+        daily_limit = self.affection_auto_daily_limit()
+        max_count = self.affection_auto_daily_max_count()
+        scope = proposal.get("scope", "")
+        member = proposal.get("member", "")
+        identity = value.get("character_key") or proposal.get("persona", "")
+        if scope and member and identity:
+            used_abs, used_count = self.store.affection_daily_usage(scope, identity, member)
+            if used_abs + pending_abs_delta + delta_abs > daily_limit:
+                return f"daily_limit:{used_abs + pending_abs_delta + delta_abs}>{daily_limit}"
+            if used_count + pending_count >= max_count:
+                return f"daily_count:{used_count + pending_count + 1}>{max_count}"
+        return ""
+
+    def proposal_mode(self, proposal):
+        category = proposal["category"]
+        mode = self.mode(category)
+        if is_free_text_typing_habit(category, proposal.get("value")):
+            return "llm_then_human" if mode == "llm" else mode
+        if category == "affection" and mode == "auto":
+            if proposal.get("auto_guard_reason") or self.affection_guard_reason(proposal):
+                return "llm_then_human"
         return mode
 
     def ingest(self, raw):
@@ -1311,12 +1390,18 @@ class Engine:
                                 if data["reason"] not in bucket["reasons"]:
                                     bucket["reasons"].append(data["reason"])
                         else:
-                            candidates.append((data, self.mode(data["category"])))
+                            candidates.append((data, self.proposal_mode(data)))
                     except (ValueError, TypeError, AttributeError):
                         rejected += 1
+                affection_mode = self.mode("affection")
                 for bucket in staged_affection.values():
                     if bucket["count"] == 1:
-                        candidates.append((bucket["first_data"], self.mode("affection")))
+                        data = bucket["first_data"]
+                        if affection_mode == "auto":
+                            guard = self.affection_guard_reason(data)
+                            if guard:
+                                data = {**data, "auto_guard_reason": guard}
+                        candidates.append((data, self.proposal_mode(data)))
                         continue
                     try:
                         initial = bucket["initial"]
@@ -1336,7 +1421,11 @@ class Engine:
                             "evidence_ids": [e["id"] for e in bucket["evidence"]],
                         }
                         data = candidate(merged_raw, bucket["evidence"], initial)
-                        candidates.append((data, self.mode("affection")))
+                        if affection_mode == "auto":
+                            guard = self.affection_guard_reason(data)
+                            if guard:
+                                data = {**data, "auto_guard_reason": guard}
+                        candidates.append((data, self.proposal_mode(data)))
                     except (ValueError, TypeError, AttributeError):
                         rejected += 1
                 created, rejected, callbacks = await self.review_write(
@@ -1351,7 +1440,7 @@ class Engine:
             if proposal["id"] not in managed
             and proposal["state"] == "pending"
             and not self.store.review_claim(proposal["id"])
-            and not (proposal["category"] == "affection" and self.mode("affection") == "auto")
+            and self.proposal_mode(proposal) not in {"human", "auto"}
             and proposal["mode"] not in {"human", "auto"}
         ]
         if pending_ids:
@@ -1373,6 +1462,16 @@ class Engine:
             try:
                 for p in await asyncio.to_thread(self.store.pending_affection):
                     if not self.allowed(p["scope"]) or p["scope"] not in self.current_personas:
+                        continue
+                    guard = self.affection_guard_reason(p)
+                    if guard:
+                        if p.get("auto_guard_reason") != guard or p["mode"] == "auto":
+                            def escalate(proposal=p, reason=guard):
+                                try:
+                                    self.store.escalate_affection_review(proposal["id"], proposal["updated"], reason)
+                                except Conflict:
+                                    pass
+                            await self.review_write(escalate)
                         continue
                     try:
                         if p["entry_id"] in applied_entries:
@@ -1470,7 +1569,7 @@ class Engine:
             review_context(self, p, instruction),
             self.scope_token(p["scope"]),
             self.current_personas.get(p["scope"]),
-            self.mode(category),
+            self.proposal_mode(p),
         )
 
     def review_retry_interval(self):
@@ -1553,7 +1652,7 @@ class Engine:
             if (
                 result["verdict"] == "approve"
                 and p["mode"] == "llm"
-                and self.mode(p["category"]) == "llm"
+                and self.proposal_mode(p) == "llm"
                 and not defer_apply
             ):
                 return await self._apply(
@@ -1592,10 +1691,11 @@ class Engine:
                     raise ValueError("proposal unavailable")
                 if not policy_allowed(p):
                     raise ValueError("fixed personality policy rejects proposal")
-                if p["category"] == "affection" and self.mode("affection") == "auto":
+                effective_mode = self.proposal_mode(p)
+                if p["category"] == "affection" and effective_mode == "auto":
                     return await self._apply(p, "system:auto-affection")
                 start_recorded = False
-                if p["category"] in MEMBER_PROFILES and self.mode(p["category"]) == "llm":
+                if p["category"] in MEMBER_PROFILES and effective_mode == "llm":
 
                     def adopt():
                         with self.store.transaction():
@@ -1607,7 +1707,7 @@ class Engine:
                     p = await self.review_write(adopt)
                     start_recorded = True
                 if p["state"] == "reviewed" and llm_approved(p):
-                    if not defer_apply and p["mode"] == "llm" and self.mode(p["category"]) == "llm":
+                    if not defer_apply and p["mode"] == "llm" and effective_mode == "llm":
                         approval = next(r for r in reversed(p["reviews"]) if r["actor"].startswith("llm:"))
                         actor = (
                             "system:llm-approved-profile"
@@ -1795,11 +1895,12 @@ class Engine:
                     if not policy_allowed(p):
                         unavailable[pid] = ValueError("fixed personality policy rejects proposal")
                         continue
-                    if p["category"] == "affection" and self.mode("affection") == "auto":
+                    effective_mode = self.proposal_mode(p)
+                    if p["category"] == "affection" and effective_mode == "auto":
                         fallback.append(pid)
                         continue
                     start_recorded = False
-                    if p["category"] in MEMBER_PROFILES and self.mode(p["category"]) == "llm":
+                    if p["category"] in MEMBER_PROFILES and effective_mode == "llm":
 
                         def adopt(proposal=p):
                             with self.store.transaction():
@@ -2042,7 +2143,7 @@ class Engine:
                 continue
             if not self.allowed(p["scope"]) or p["state"] not in {"pending", "reviewed"}:
                 continue
-            if p["category"] == "affection" and self.mode("affection") == "auto":
+            if p["category"] == "affection" and self.proposal_mode(p) == "auto":
                 single_only.append(pid)
                 continue
             if p["state"] == "reviewed":
@@ -2165,7 +2266,7 @@ class Engine:
                     if self.store.review_claim(p["id"]):
                         continue
                     if (
-                        self.mode(p["category"]) != "llm"
+                        self.proposal_mode(p) != "llm"
                         or not self.allowed(p["scope"])
                         or p["scope"] not in self.current_personas
                     ):
@@ -2260,7 +2361,7 @@ class Engine:
             raise ValueError("scope disabled")
         if p["created"] + p["days"] * 86400 <= time.time():
             raise ValueError("成员资料已过期，请按新证据重新提案")
-        mode = self.mode(p["category"])
+        mode = self.proposal_mode(p)
         automatic = mode == "auto" and p["category"] == "affection"
         if self.current_personas.get(p["scope"], p["persona"]) != p["persona"]:
             raise ValueError("角色资料已更新，请基于新回合重新生成提案")
@@ -2294,7 +2395,16 @@ class Engine:
 
         def commit():
             with self.store.transaction():
-                row = self.store.apply(p["id"], actor, p["updated"], automatic_affection=automatic, owner=owner)
+                row = self.store.apply(
+                    p["id"],
+                    actor,
+                    p["updated"],
+                    automatic_affection=automatic,
+                    owner=owner,
+                    auto_review_threshold=self.affection_auto_review_threshold(),
+                    auto_daily_limit=self.affection_auto_daily_limit(),
+                    auto_daily_max_count=self.affection_auto_daily_max_count(),
+                )
                 if applied:
                     applied(row)
                 return row
@@ -2352,7 +2462,11 @@ class Engine:
             raw = {k: p[k] for k in ("category", "key", "member", "days")}
             raw.update(value=value, reason=reason, evidence_ids=[e["id"] for e in p["evidence"]])
             data = candidate(raw, p["evidence"], current)
-            mode = self.mode(p["category"])
+            if data["category"] == "affection" and self.mode("affection") == "auto":
+                guard = self.affection_guard_reason(data)
+                if guard:
+                    data = {**data, "auto_guard_reason": guard}
+            mode = self.proposal_mode(data)
 
             def replace():
                 with self.store.transaction():
@@ -2368,7 +2482,7 @@ class Engine:
                     return new
 
             new = await self.review_write(replace)
-            if new["category"] == "affection" and self.mode("affection") == "auto":
+            if new["category"] == "affection" and self.proposal_mode(new) == "auto":
                 return await self._apply(new, "system:auto-affection")
             return new
 
@@ -2499,7 +2613,7 @@ class Engine:
                 if self.automatic_review_waiting(p, now):
                     continue
                 try:
-                    mode = self.mode(p["category"])
+                    mode = self.proposal_mode(p)
                 except ValueError:
                     continue
                 if mode not in {"llm", "llm_then_human"} or not self.allowed(p["scope"]):
@@ -2612,7 +2726,7 @@ class Engine:
     def manual_review_status(self, proposal):
         if self.store.review_claim(proposal["id"]):
             return False, "由批量任务保留，请恢复任务或明确交回自动审查"
-        mode = self.mode(proposal["category"])
+        mode = self.proposal_mode(proposal)
         if mode == "auto" or (mode == "llm" and proposal["category"] in MEMBER_PROFILES):
             return False, "由系统审查或自动生效，无需人工批准"
         if proposal["mode"] == "auto":
@@ -2633,7 +2747,7 @@ class Engine:
             not self.allowed(p["scope"])
             or p["state"] not in {"pending", "reviewed"}
             or not policy_allowed(p)
-            or self.mode(p["category"]) not in {"llm", "llm_then_human"}
+            or self.proposal_mode(p) not in {"llm", "llm_then_human"}
             or p["mode"] == "auto"
             or llm_approved(p)
             or self.current_personas.get(p["scope"], p["persona"]) != p["persona"]
@@ -2650,7 +2764,7 @@ class Engine:
         if (
             p["state"] != "reviewed"
             or p["mode"] != "llm"
-            or self.mode(p["category"]) != "llm"
+            or self.proposal_mode(p) != "llm"
             or self.store.review_claim(p["id"]) not in (None, owner)
         ):
             return False

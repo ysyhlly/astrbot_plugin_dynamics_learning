@@ -108,7 +108,7 @@ class Console:
         result["evidence_count"] = len(p.get("evidence", []))
         result["evidence"] = []
         result["details_lazy"] = True
-        for key in ("applied_by", "rolled_back_by"):
+        for key in ("applied_by", "rolled_back_by", "auto_guard_reason"):
             if key in p:
                 result[key] = p[key]
         return result

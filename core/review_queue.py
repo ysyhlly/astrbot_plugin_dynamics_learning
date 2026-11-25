@@ -16,8 +16,14 @@ SQL='''WITH base AS (
  json_extract(p.body,'$.baseline') AS baseline,json_extract(p.body,'$.host_version') AS host_version,
  json_extract(p.body,'$.category') AS category,json_extract(p.body,'$.member') AS member,
  json_extract(p.body,'$.mode') AS original_mode,json_extract(p.body,'$.entry_id') AS entry_id,
+ json_extract(p.body,'$.auto_guard_reason') AS auto_guard_reason,
+ json_type(p.body,'$.value') AS value_type,
  json_extract(p.body,'$.base_revision') AS base_revision,coalesce(json_extract(e.body,'$.revision'),0) AS current_revision,
- m.value AS mode,c.job AS claim,j.status AS job_status,s.value AS current_persona,
+ CASE
+  WHEN json_extract(p.body,'$.category')='typing_habit' AND json_type(p.body,'$.value')!='object' AND m.value='llm' THEN 'llm_then_human'
+  WHEN json_extract(p.body,'$.category')='affection' AND m.value='auto' AND coalesce(json_extract(p.body,'$.auto_guard_reason'),'')!='' THEN 'llm_then_human'
+  ELSE m.value
+ END AS mode,c.job AS claim,j.status AS job_status,s.value AS current_persona,
  b.baseline AS current_baseline,b.host AS current_host,
  coalesce((SELECT json_extract(r.value,'$.verdict')='approve' FROM json_each(p.body,'$.reviews') r
  WHERE json_extract(r.value,'$.actor') LIKE 'llm:%' ORDER BY CAST(r.key AS INTEGER) DESC LIMIT 1),0) AS approved

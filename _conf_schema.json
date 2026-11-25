@@ -187,7 +187,19 @@
       "llm",
       "llm_then_human"
     ],
-    "hint": "auto：无需LLM或人工审查，分析得到增减后自动生效；仍保留来源校验、重复证据去重、角色隔离、变化记录和回滚。"
+    "hint": "auto：无需LLM或人工审查，分析得到增减后自动生效；仍保留来源校验、重复证据去重、角色隔离、单日上限与突变复审、变化记录和回滚。"
+  },
+  "affection_auto_review_threshold": {
+    "description": "自动好感突变复审阈值",
+    "type": "int",
+    "default": 10,
+    "hint": "affection_review=auto 时，单次经验变化绝对值达到或超过该阈值将自动转入 LLM+人工复审（范围 1-20）。"
+  },
+  "affection_auto_daily_limit": {
+    "description": "自动好感单成员每日累计变化上限",
+    "type": "int",
+    "default": 25,
+    "hint": "affection_review=auto 时，单成员 24 小时内累计经验变动绝对值超出上限的提案将自动转入 LLM+人工复审（范围 1-100）。"
   },
   "relation_window_days": {
     "description": "群关系：观察窗口（天）",
