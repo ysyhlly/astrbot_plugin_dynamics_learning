@@ -1,4 +1,8 @@
-# astrbot_plugin_dynamics_learning v2.0.0-rc.8
+# astrbot_plugin_dynamics_learning v2.0.0
+
+## v2.0.0 — 2026-11-26
+
+- **正式版发布（GA）**：整合全部 `v2.0.0-rc.x` 安全鉴权加固、事件存储与索引优化、乐观锁与 Provider 退避拆分及系列面板 v2 协同。
 
 ## v2.0.0-rc.8 — 2026-11-25
 

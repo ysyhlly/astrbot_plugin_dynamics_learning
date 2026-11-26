@@ -1,7 +1,7 @@
 name: astrbot_plugin_dynamics_learning
 display_name: 群间学习 · Dynamics Learning
 desc: 群间系列社交与表达适应插件：严守固定性格红线，从真实回合中学习群友表达、打字习惯、喜恶、黑话与互动关系，经独立审查后生效并支持版本回滚。
-version: v2.0.0-rc.8
+version: v2.0.0
 author: ysyhlly
 astrbot_version: ">=4.29.4,<5"
 tags:
