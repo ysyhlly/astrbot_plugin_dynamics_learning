@@ -414,7 +414,7 @@ class AutomaticReviews:
             while not self.engine.closed:
                 self.wake.clear()
                 interval = self.engine.review_retry_interval()
-                delay = interval if self.enabled else 5
+                delay = interval if self.enabled else 60
                 slots = 2 - len(self.active)
                 backoff_rem = self.budget_backoff_remaining() if self.enabled else 0.0
                 if backoff_rem > 0.0:

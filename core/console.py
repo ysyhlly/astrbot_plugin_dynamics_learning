@@ -405,12 +405,19 @@ class Console:
             "by_phase": phases,
         }
 
-    def prune(self, days):
-        with self.store.transaction():
-            self.store.db.execute(
-                "DELETE FROM review_batches WHERE status NOT IN ('queued','running','pausing','paused','cancelling','interrupted') AND coalesce(json_extract(body,'$.updated'),created)<?",
-                (time.time() - days * 86400,),
-            )
-            for table, column in [("console_tasks", "queued"), ("reply_usage", "created"), ("llm_usage_stats", "created")]:
-                self.store.db.execute("DELETE FROM " + table + " WHERE " + column + "<?", (time.time() - days * 86400,))
-            self.store.db.execute("DELETE FROM reply_usage_refs WHERE receipt NOT IN (SELECT id FROM reply_usage)")
+    def prune(self, days, *, batch_size=500):
+        cutoff = time.time() - max(1, int(days)) * 86400
+        self.store._prune_batched(
+            "review_batches",
+            "status NOT IN ('queued','running','pausing','paused','cancelling','interrupted') AND coalesce(json_extract(body,'$.updated'),created)<?",
+            (cutoff,),
+            batch_size=batch_size,
+        )
+        for table, column in [("console_tasks", "queued"), ("reply_usage", "created"), ("llm_usage_stats", "created")]:
+            self.store._prune_batched(table, f"{column}<?", (cutoff,), batch_size=batch_size)
+        self.store._prune_batched(
+            "reply_usage_refs",
+            "receipt NOT IN (SELECT id FROM reply_usage)",
+            (),
+            batch_size=batch_size,
+        )

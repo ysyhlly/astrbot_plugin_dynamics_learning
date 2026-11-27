@@ -178,10 +178,10 @@ class SceneStore:
             self._summary_cache = (cache_key, result)
             return dict(result)
 
-    def prune(self, days):
-        with self.store.transaction():
-            for table in ('scene_receipts', 'scene_deliveries', 'scene_feedback'):
-                self.store.db.execute('DELETE FROM ' + table + ' WHERE created<?', (time.time() - days * 86400,))
+    def prune(self, days, *, batch_size=500):
+        cutoff = time.time() - max(1, int(days)) * 86400
+        for table in ('scene_receipts', 'scene_deliveries', 'scene_feedback'):
+            self.store._prune_batched(table, 'created<?', (cutoff,), batch_size=batch_size)
 
     def purge(self, scope):
         for table in ('scene_receipts', 'scene_deliveries', 'scene_feedback', 'scene_analysis'):

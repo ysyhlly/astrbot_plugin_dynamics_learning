@@ -24,14 +24,19 @@ class ExpressionStore:
         END;
         ''')
 
+    def _sample_limit(self):
+        limits = self.store._resource_limits() if hasattr(self.store, '_resource_limits') else {}
+        return max(100, int(limits.get('learning_expression_sample_limit', 4000)))
+
     def sample(self, scope, persona):
+        sample_limit = self._sample_limit()
         with self.store.lock:
             rows = self.store.db.execute('''SELECT body FROM (SELECT body,created,
                 row_number() OVER(PARTITION BY member,cast(created/86400 AS INTEGER) ORDER BY created DESC,rowid DESC) AS n
                 FROM profile_messages p WHERE scope=? AND persona=? AND created>? AND NOT EXISTS (
                 SELECT 1 FROM withdrawn_review_sources w WHERE w.scope=p.scope AND w.member=p.member AND w.message_id=p.source_id
-                )) WHERE n<=10 ORDER BY created DESC LIMIT 8000''',
-                (scope, persona, time.time() - 30 * 86400)).fetchall()
+                )) WHERE n<=10 ORDER BY created DESC LIMIT ?''',
+                (scope, persona, time.time() - 30 * 86400, sample_limit)).fetchall()
             selected = balanced_sample([json.loads(r[0]) for r in rows])
             parents = {e.get('context', {}).get('reply_to') for e in selected} - {None, ''} - {e['message_id'] for e in selected}
             linked = self.store.profiles.sources_for_events(scope, persona, [{'message_id': i} for i in sorted(parents)[:20]])
@@ -91,6 +96,6 @@ class ExpressionStore:
         for table in ('expression_analysis', 'expression_deliveries', 'expression_source_counts'):
             self.store.db.execute('DELETE FROM ' + table + ' WHERE scope=?', (scope,))
 
-    def prune(self, days):
-        with self.store.transaction():
-            self.store.db.execute('DELETE FROM expression_deliveries WHERE created<?', (time.time() - days * 86400,))
+    def prune(self, days, *, batch_size=500):
+        cutoff = time.time() - max(1, int(days)) * 86400
+        self.store._prune_batched('expression_deliveries', 'created<?', (cutoff,), batch_size=batch_size)

@@ -29,7 +29,7 @@ from astrbot_plugin_dynamics_learning.core.series_bridge import (
     normalize_str_list,
     read_extended_shared_config,
 )
-from astrbot_plugin_dynamics_learning.core.social import Social, character_key
+from astrbot_plugin_dynamics_learning.core.social import Social
 from astrbot_plugin_dynamics_learning.core.store import Store
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -6,7 +6,7 @@ import inspect
 import json
 import math
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from copy import deepcopy
 
 from .affection import state as affection_state
@@ -15,6 +15,20 @@ from ..vendor.group_relations.store import RelationStore
 from ..vendor.group_relations.relation_model import SharedSentiment
 from ..vendor.group_relations.relation_signals import extract_directed_targets
 from ..vendor.group_relations.relation_presentation import relation_explanations,representative_relations
+
+
+def _load_series_panels():
+    try:
+        from .. import series_panels as _sp
+
+        return _sp
+    except Exception:
+        try:
+            import series_panels as _sp
+
+            return _sp
+        except Exception:
+            return None
 
 
 def character_key(scope):
@@ -60,8 +74,11 @@ def observed_event(event, *, reply_weight=8.0, at_weight=5.0):
 class Social:
     """One embedded graph, one owner for reviewed scores, and cached reply projections."""
 
+    CONSUME_BATCH_MAX = 32
+
     def __init__(self, engine, context=None, logger=None):
         self.engine, self.store = engine, engine.store
+        self._context = context if context is not None else getattr(engine, "_host_context", None)
         defaults={'window_days':30,'growth_scale':120.0,'pair_daily_budget':80.0,'activity_daily_cap':80,
                   'context_window_seconds':300,'max_recent':80,'pair_base_weight':1.0,'mention_weight':5.0,
                   'same_topic_weight':.8,'reply_weight':8.0,'at_weight':5.0,'adjacency_weight':1.5,
@@ -73,10 +90,10 @@ class Social:
         self.settings['window_days']=max(1,min(90,int(self.settings['window_days'])))
         self.graph = RelationStore(self.store.path, analysis_window_days=self.settings['window_days'],
             relation_growth_scale=self.settings['growth_scale'],pair_daily_budget=self.settings['pair_daily_budget'],
-            activity_daily_cap=int(self.settings['activity_daily_cap']),shared_store=self.store)
+            activity_daily_cap=int(self.settings['activity_daily_cap']),shared_store=self.store,context=self._context)
         self.sentiment = SharedSentiment(context, logger) if context is not None else None
         self.queue = asyncio.Queue(maxsize=2048)
-        self.groups = {}
+        self.groups = OrderedDict()
         self.imported = set()
         self.bindings = {}
         self.dropped = 0
@@ -86,6 +103,44 @@ class Social:
         self.refresh_tasks={}
         self.refresh_slots=asyncio.Semaphore(1)
         self.updated_at={}
+
+    def _resource_limits(self):
+        sp = _load_series_panels()
+        if sp is not None:
+            try:
+                ctx = self._context if self._context is not None else getattr(self.engine, "_host_context", None)
+                return sp.get_series_resource_limits(ctx)
+            except Exception:
+                pass
+        return {}
+
+    def _max_groups(self) -> int:
+        return max(1, int(self._resource_limits().get("learning_social_max_groups", 32)))
+
+    def _top_limit(self) -> int:
+        return max(50, int(self._resource_limits().get("learning_social_top_limit", 1000)))
+
+    def _refresh_interval_seconds(self) -> float:
+        return max(15.0, float(self._resource_limits().get("learning_social_refresh_s", 60.0)))
+
+    def _effective_max_recent(self) -> int:
+        cap = max(1, int(self._resource_limits().get("learning_relation_max_recent", 80)))
+        return min(max(1, int(self.settings["max_recent"])), cap)
+
+    def _get_group(self, scope: str):
+        overview = self.groups.get(scope)
+        if overview is not None and isinstance(self.groups, OrderedDict):
+            self.groups.move_to_end(scope)
+        return overview
+
+    def _set_group(self, scope: str, overview: dict) -> None:
+        self.groups[scope] = overview
+        cap = self._max_groups()
+        if isinstance(self.groups, OrderedDict):
+            self.groups.move_to_end(scope)
+            while len(self.groups) > cap:
+                evicted_scope, _ = self.groups.popitem(last=False)
+                self.refreshed.pop(evicted_scope, None)
 
     async def write(self, coroutine):
         task=asyncio.create_task(coroutine)
@@ -129,45 +184,121 @@ class Social:
             self.dropped += 1
             return False
 
+    def _build_record_payload(self, event, probabilities):
+        return {
+            "group_id": event["scope"],
+            "user_id": event["member"],
+            "name": event["name"],
+            "text": event["text"],
+            "window_seconds": int(self.settings["context_window_seconds"]),
+            "max_recent": self._effective_max_recent(),
+            "pair_weight": self.settings["pair_base_weight"],
+            "mention_weight": self.settings["mention_weight"],
+            "same_topic_weight": self.settings["same_topic_weight"],
+            "directed": event["directed"],
+            "source_id": event["source_id"],
+            "reply_weight": self.settings["reply_weight"],
+            "at_weight": self.settings["at_weight"],
+            "adjacency_weight": self.settings["adjacency_weight"],
+            "adjacency_window_seconds": int(self.settings["adjacency_window_seconds"]),
+            "ambient_tone_scale": self.settings["ambient_tone_scale"],
+            "sentiment_probabilities": probabilities,
+        }
+
+    def _record_one_coro(self, payload: dict):
+        return self.graph.record_message(
+            payload["group_id"],
+            payload["user_id"],
+            payload["name"],
+            payload["text"],
+            window_seconds=payload["window_seconds"],
+            max_recent=payload["max_recent"],
+            pair_weight=payload["pair_weight"],
+            mention_weight=payload["mention_weight"],
+            same_topic_weight=payload["same_topic_weight"],
+            directed=payload["directed"],
+            source_id=payload["source_id"],
+            reply_weight=payload["reply_weight"],
+            at_weight=payload["at_weight"],
+            adjacency_weight=payload["adjacency_weight"],
+            adjacency_window_seconds=payload["adjacency_window_seconds"],
+            ambient_tone_scale=payload["ambient_tone_scale"],
+            sentiment_probabilities=payload["sentiment_probabilities"],
+        )
+
     async def consume(self):
         while not self.engine.closed:
-            token, event = await self.queue.get()
+            first = await self.queue.get()
+            drained = [first]
+            while len(drained) < self.CONSUME_BATCH_MAX:
+                try:
+                    drained.append(self.queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
             try:
-                scope = event['scope']
-                if token != self.engine.scope_token(scope) or not self.engine.allowed(scope):
-                    continue
-                probabilities = None
-                if self.sentiment and self.engine.config.get('shared_sentiment_enabled', False) and len(event['directed']) == 1:
-                    probabilities = await self.sentiment.classify(event['text'])
-                async with self.engine.operation('social_storage', scope):
+                by_scope: dict[str, list[tuple[object, dict]]] = defaultdict(list)
+                for token, event in drained:
+                    scope = event["scope"]
                     if token != self.engine.scope_token(scope) or not self.engine.allowed(scope):
                         continue
-                    await self.write(self.graph.record_message(scope, event['member'], event['name'], event['text'],
-                        window_seconds=int(self.settings['context_window_seconds']),max_recent=int(self.settings['max_recent']),
-                        pair_weight=self.settings['pair_base_weight'],mention_weight=self.settings['mention_weight'],
-                        same_topic_weight=self.settings['same_topic_weight'],directed=event['directed'],source_id=event['source_id'],
-                        reply_weight=self.settings['reply_weight'],at_weight=self.settings['at_weight'],
-                        adjacency_weight=self.settings['adjacency_weight'],adjacency_window_seconds=int(self.settings['adjacency_window_seconds']),
-                        ambient_tone_scale=self.settings['ambient_tone_scale'],
-                        sentiment_probabilities=probabilities))
-                    if token == self.engine.scope_token(scope):
-                        self.request_refresh(scope)
+                    probabilities = None
+                    if (
+                        self.sentiment
+                        and self.engine.config.get("shared_sentiment_enabled", False)
+                        and len(event["directed"]) == 1
+                    ):
+                        probabilities = await self.sentiment.classify(event["text"])
+                    by_scope[scope].append((token, self._build_record_payload(event, probabilities)))
+
+                for scope, items in by_scope.items():
+                    async with self.engine.operation("social_storage", scope):
+                        valid = [
+                            payload
+                            for token, payload in items
+                            if token == self.engine.scope_token(scope) and self.engine.allowed(scope)
+                        ]
+                        if not valid:
+                            continue
+                        if len(valid) == 1:
+                            try:
+                                await self.write(self._record_one_coro(valid[0]))
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                self.last_error = type(exc).__name__
+                        else:
+                            try:
+                                await self.write(self.graph.record_messages_batch(valid))
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                self.last_error = type(exc).__name__
+                                for one in valid:
+                                    try:
+                                        await self.write(self._record_one_coro(one))
+                                    except asyncio.CancelledError:
+                                        raise
+                                    except Exception as item_exc:
+                                        self.last_error = type(item_exc).__name__
+                        if self.engine.allowed(scope):
+                            self.request_refresh(scope)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.last_error = type(exc).__name__
             finally:
-                self.queue.task_done()
+                for _ in drained:
+                    self.queue.task_done()
 
     async def refresh_group(self, scope, *, force=False):
-        if not force and time.monotonic()-self.refreshed.get(scope, -1e10) < 15:
+        if not force and time.monotonic()-self.refreshed.get(scope, -1e10) < self._refresh_interval_seconds():
             return
         token = self.engine.scope_token(scope)
         async with self.refresh_slots:
             async with self.engine.operation('social_storage', scope):
                 if not self.engine.allowed(scope) or token != self.engine.scope_token(scope):
                     return
-                overview = await self.graph.overview(scope, top_limit=10000, daily_decay=self.settings['daily_decay'])
+                overview = await self.graph.overview(scope, top_limit=self._top_limit(), daily_decay=self.settings['daily_decay'])
                 if not self.engine.allowed(scope) or token != self.engine.scope_token(scope):
                     return
                 overview['interaction_circles'] = self.circles(overview)
@@ -177,7 +308,7 @@ class Social:
                     if edge['b'] != edge['a']:
                         by_member[edge['b']].append(edge)
                 overview['relations_by_member'] = dict(by_member)
-                self.groups[scope] = overview
+                self._set_group(scope, overview)
                 self.refreshed[scope] = time.monotonic()
                 self.updated_at[scope]=time.time()
                 if hasattr(self.engine, 'bump_projection_generation'):
@@ -187,7 +318,7 @@ class Social:
         return 'social-epoch:' + str(self.engine.scope_token(scope)[1])
 
     def request_refresh(self,scope):
-        if self.engine.closed or scope in self.refresh_tasks or time.monotonic()-self.refreshed.get(scope,-1e10)<15:
+        if self.engine.closed or scope in self.refresh_tasks or time.monotonic()-self.refreshed.get(scope,-1e10)<self._refresh_interval_seconds():
             return
         async def run():
             try:
@@ -250,7 +381,7 @@ class Social:
                 'note': '仅表示角色对当前成员的亲近倾向。对方的感受、信任与亲密许可须另看实际表达。无需向群友报数。'}
             versions.append(affection['proposal_id'])
         if self.engine.config.get('group_relations_enabled', True) and scope in self.groups:
-            graph = self.groups[scope]
+            graph = self._get_group(scope) or {}
             users = graph.get('users', {})
             by_member = graph.get('relations_by_member')
             if muted:
@@ -342,7 +473,7 @@ class Social:
         if not self.engine.allowed(scope):
             raise ValueError('scope not enabled')
         self.request_refresh(scope)
-        full=self.groups.get(scope,{})
+        full=self._get_group(scope) or {}
         users=full.get('users',{})
         limit=max(1,min(60,int(limit)))
         ordered=sorted(users,key=lambda uid:users[uid].get('count',0),reverse=True)
@@ -370,7 +501,7 @@ class Social:
         if not self.engine.allowed(scope):
             raise ValueError('scope not enabled')
         self.request_refresh(scope)
-        users=dict(self.groups.get(scope,{}).get('users',{}))
+        users=dict((self._get_group(scope) or {}).get('users',{}))
         observed=set(users)
         for entry in self.engine.cache:
             if entry['scope']==scope and entry.get('member'):
@@ -385,7 +516,7 @@ class Social:
     def member_detail(self,scope,member):
         if not self.engine.allowed(scope):
             raise ValueError('scope not enabled')
-        graph=self.groups.get(scope,{})
+        graph=self._get_group(scope) or {}
         user=graph.get('users',{}).get(member,{})
         by_member = graph.get('relations_by_member')
         raw_edges = (
@@ -410,7 +541,7 @@ class Social:
         persona=self.engine.current_personas.get(scope)
         if not persona:
             return {'available':False,'reason':'尚未取得当前角色的有效快照'}
-        graph=self.groups.get(scope,{})
+        graph=self._get_group(scope) or {}
         if kind=='affection':
             entry=self.current_affection(scope,persona,member)
             return {'available':entry is not None,'source':'dynamics_learning','scope':scope,'member':member,

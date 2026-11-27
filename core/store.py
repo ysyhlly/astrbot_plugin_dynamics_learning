@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import sqlite3
 import threading
 import time
@@ -34,11 +35,26 @@ class Conflict(ValueError):
 DEFAULT_AUDIT_RETENTION_DAYS = 90
 DEFAULT_EVENTS_RETENTION_DAYS = 7
 DEFAULT_NATIVE_RECEIPTS_RETENTION_DAYS = 7
-JOURNAL_SIZE_LIMIT_BYTES = 67_108_864
+JOURNAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024
 INCREMENTAL_VACUUM_PAGES = 4096
 PRUNE_BATCH_SIZE = 500
 RELATION_RECEIPT_RETENTION_DAYS = 30
+WAL_TRUNCATE_INTERVAL_SECONDS = 1800.0
 _EVENT_KIND_RANK = {"observed": 1, "decision": 2, "outcome": 3}
+
+
+def _load_series_panels():
+    try:
+        from .. import series_panels as _sp
+
+        return _sp
+    except Exception:
+        try:
+            import series_panels as _sp
+
+            return _sp
+        except Exception:
+            return None
 
 
 def _slim_event_for_storage(event):
@@ -127,9 +143,11 @@ def _compact_evidence_list(evidence):
 class Store:
     """All state transitions are SQLite transactions with compare-and-swap revisions."""
 
-    def __init__(self, path):
+    def __init__(self, path, *, context=None):
         self.path = Path(path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._context = context
+        self._last_wal_truncate_at = 0.0
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -186,6 +204,7 @@ class Store:
         """)
         if current_version < 10:
             self.db.execute("PRAGMA user_version=10")
+        self._apply_sqlite_pragmas(self.db, readonly=False)
         self.auto_vacuum_mode = int(self.db.execute("PRAGMA auto_vacuum").fetchone()[0])
         self.needs_auto_vacuum_migration = self.auto_vacuum_mode != 2
         from .profiles import Profiles
@@ -261,6 +280,36 @@ class Store:
             self.needs_auto_vacuum_migration = after != 2
             return {"migrated": after == 2, "before": before, "mode": after}
 
+    def _resource_limits(self):
+        sp = _load_series_panels()
+        if sp is not None:
+            try:
+                return sp.get_series_resource_limits(self._context)
+            except Exception:
+                pass
+        return {}
+
+    def _apply_sqlite_pragmas(self, conn, *, readonly: bool = False):
+        sp = _load_series_panels()
+        if sp is not None:
+            try:
+                return sp.apply_series_sqlite_pragmas(conn, self._context, readonly=readonly)
+            except Exception:
+                pass
+        return {}
+
+    def can_run_auto_vacuum_migration(self, *, min_freelist_pages: int = 4096) -> bool:
+        """Return True when legacy DB uses auto_vacuum!=2 with large freelist and >=2x free disk."""
+        try:
+            db_size = self.path.stat().st_size if self.path.exists() else 0
+            free_bytes = shutil.disk_usage(self.path.parent).free
+        except OSError:
+            return False
+        if free_bytes < max(db_size * 2, 1):
+            return False
+        st = self.auto_vacuum_status()
+        return bool(st["needs_migration"]) and int(st["freelist_count"]) > int(min_freelist_pages)
+
     @contextmanager
     def readonly_connection(self):
         """Independent read-only WAL connection for event-loop hooks; never contends on self.lock."""
@@ -270,6 +319,7 @@ class Store:
             try:
                 db.execute("PRAGMA busy_timeout=200")
                 db.execute("PRAGMA query_only=ON")
+                self._apply_sqlite_pragmas(db, readonly=True)
                 yield db
             finally:
                 db.close()
@@ -419,7 +469,9 @@ class Store:
         with self.lock:
             result = []
             for row in self.db.execute(
-                "SELECT e.body,p.body AS proposal FROM entries e LEFT JOIN proposals p ON p.id=json_extract(e.body,'$.proposal_id')"
+                """SELECT e.body,
+                CASE WHEN json_extract(e.body,'$.source_uids') IS NULL THEN p.body ELSE NULL END AS proposal
+                FROM entries e LEFT JOIN proposals p ON p.id=json_extract(e.body,'$.proposal_id')"""
             ):
                 entry = json.loads(row[0])
                 if "source_uids" not in entry and row[1]:
@@ -431,7 +483,9 @@ class Store:
         with self.lock:
             result = []
             for row in self.db.execute(
-                """SELECT e.body,p.body AS proposal FROM entries e
+                """SELECT e.body,
+                CASE WHEN json_extract(e.body,'$.source_uids') IS NULL THEN p.body ELSE NULL END AS proposal
+                FROM entries e
                 LEFT JOIN proposals p ON p.id=json_extract(e.body,'$.proposal_id')
                 WHERE json_extract(e.body,'$.scope')=?""",
                 (scope,),
@@ -497,14 +551,37 @@ class Store:
                 ON o.scope=q.scope AND o.last_observed=q.stamp"""
             ).fetchall():
                 combined[scope] = (float(stamp), persona)
-            for scope, persona, stamp in self.db.execute(
+            seeded = False
+            try:
+                seeded = bool(
+                    self.db.execute(
+                        "SELECT 1 FROM analysis_meta WHERE key='observed_personas_backfilled_v1'"
+                    ).fetchone()
+                )
+            except sqlite3.OperationalError:
+                seeded = False
+            if seeded and combined:
+                return {scope: persona for scope, (_stamp, persona) in combined.items()}
+            legacy_rows = self.db.execute(
                 """SELECT e.scope, e.persona, e.created FROM events e JOIN
                 (SELECT scope, max(created) AS stamp FROM events WHERE json_extract(body,'$.kind')='observed' GROUP BY scope) q
                 ON e.scope=q.scope AND e.created=q.stamp WHERE json_extract(e.body,'$.kind')='observed'"""
-            ).fetchall():
+            ).fetchall()
+            for scope, persona, stamp in legacy_rows:
                 prev = combined.get(scope)
                 if prev is None or float(stamp) > prev[0]:
                     combined[scope] = (float(stamp), persona)
+            if combined and not seeded:
+                try:
+                    with self.transaction():
+                        for scope, (stamp, persona) in combined.items():
+                            self._record_observed_persona(scope, persona, stamp)
+                        self.db.execute(
+                            "INSERT OR REPLACE INTO analysis_meta VALUES('observed_personas_backfilled_v1',?)",
+                            (str(time.time()),),
+                        )
+                except sqlite3.OperationalError:
+                    pass
             return {scope: persona for scope, (_stamp, persona) in combined.items()}
 
     def latest_character_context(self, scope, persona):
@@ -1521,29 +1598,43 @@ class Store:
             include_revision_changed=False,
             require_known_baseline=True,
         )
-        self.automatic_reviews.prune(days)
-        self.console.prune(days)
-        self.scenes.prune(days)
-        self.expressions.prune(days)
-        base_days = max(1, int(days))
-        audit_days = (
-            max(1, int(audit_retention_days))
-            if audit_retention_days is not None
-            else max(DEFAULT_AUDIT_RETENTION_DAYS, base_days)
+        limits = self._resource_limits()
+        profile = str(limits.get("profile") or "standard")
+        profile_event_days = max(
+            1, int(limits.get("learning_events_retention_days", DEFAULT_EVENTS_RETENTION_DAYS))
         )
+        profile_profile_days = max(1, int(limits.get("learning_profile_retention_days", 30)))
+        profile_audit_days = max(
+            1, int(limits.get("learning_audit_retention_days", DEFAULT_AUDIT_RETENTION_DAYS))
+        )
+        base_days = max(1, int(days))
+        profile_days = min(base_days, profile_profile_days)
+        self.automatic_reviews.prune(profile_days)
+        self.console.prune(profile_days)
+        self.scenes.prune(profile_days)
+        self.expressions.prune(profile_days)
+        if audit_retention_days is not None:
+            raw_audit = max(1, int(audit_retention_days))
+            audit_days = min(raw_audit, profile_audit_days) if profile != "standard" else raw_audit
+        else:
+            audit_days = profile_audit_days if profile != "standard" else max(profile_audit_days, base_days)
         event_days = min(
             base_days,
-            max(1, int(event_retention_days)) if event_retention_days is not None else DEFAULT_EVENTS_RETENTION_DAYS,
+            min(max(1, int(event_retention_days)), profile_event_days)
+            if event_retention_days is not None
+            else profile_event_days,
         )
         receipt_days = min(
             base_days,
             max(1, int(native_receipt_retention_days))
             if native_receipt_retention_days is not None
-            else DEFAULT_NATIVE_RECEIPTS_RETENTION_DAYS,
+            else min(DEFAULT_NATIVE_RECEIPTS_RETENTION_DAYS, profile_event_days),
         )
         chunk = max(1, int(batch_size))
         now = time.time()
-        cutoff = now - base_days * 86400
+        cutoff = now - profile_days * 86400
+        compact_days = min(profile_days, 3) if profile != "standard" else profile_days
+        compact_cutoff = now - compact_days * 86400
         event_cutoff = now - event_days * 86400
         native_receipt_cutoff = now - receipt_days * 86400
         audit_cutoff = now - audit_days * 86400
@@ -1612,7 +1703,7 @@ class Store:
             protected_applied = self._protected_applied_proposal_ids()
             candidate_rows = self.db.execute(
                 "SELECT id, state, updated FROM proposals WHERE state IN ('rejected','archived','rolled_back','applied') AND updated<?",
-                (cutoff,),
+                (compact_cutoff,),
             ).fetchall()
         prop_chunk = max(1, min(200, chunk))
         for offset in range(0, len(candidate_rows), prop_chunk):
@@ -1692,12 +1783,32 @@ class Store:
         audit_pruned = self._prune_batched("audit", "created<?", (audit_cutoff,), batch_size=chunk)
 
         with self.lock:
-            self.db.execute(f"PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT_BYTES}")
+            applied_limits = self._apply_sqlite_pragmas(self.db, readonly=False)
+            journal_limit = int(
+                applied_limits.get("sqlite_journal_limit_bytes", JOURNAL_SIZE_LIMIT_BYTES)
+            )
+            self.db.execute(f"PRAGMA journal_size_limit={journal_limit}")
             self.auto_vacuum_mode = int(self.db.execute("PRAGMA auto_vacuum").fetchone()[0])
             self.needs_auto_vacuum_migration = self.auto_vacuum_mode != 2
             if self.auto_vacuum_mode == 2:
                 self.db.execute(f"PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES})")
             self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            now_mono = time.monotonic()
+            wal_path = Path(str(self.path) + "-wal")
+            try:
+                wal_bytes = wal_path.stat().st_size
+            except OSError:
+                wal_bytes = 0
+            if (
+                self._last_wal_truncate_at <= 0.0
+                or (now_mono - self._last_wal_truncate_at) >= WAL_TRUNCATE_INTERVAL_SECONDS
+                or wal_bytes >= max(1, journal_limit // 2)
+            ):
+                try:
+                    self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self._last_wal_truncate_at = now_mono
+                except sqlite3.DatabaseError:
+                    pass
         return {
             "archived": archived["count"],
             "archived_ids": archived["archived"],

@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -332,13 +332,33 @@ class ReviewItem:
         )
 
 
+def _load_series_panels():
+    try:
+        from .. import series_panels as _sp
+
+        return _sp
+    except Exception:
+        try:
+            import series_panels as _sp
+
+            return _sp
+        except Exception:
+            return None
+
+
 class Engine:
     _review_contract_v1 = True
     _automatic_review_contract_v1 = True
+    _MAX_CHARACTER_CONTEXT_CACHE = 64
 
     def __init__(self, store, config, call_model, *, host_context=None, provider_tracks_reviews=False):
         self.store, self.config, self.call_model = store, config, call_model
         self._host_context = host_context
+        if host_context is not None and getattr(store, "_context", None) is None:
+            try:
+                store._context = host_context
+            except Exception:
+                pass
         self._provider_tracks_reviews = provider_tracks_reviews
         self.queue = asyncio.Queue(maxsize=1024)
         self.lock = asyncio.Lock()
@@ -365,7 +385,8 @@ class Engine:
         self.current_personas = {}
         self.analysis_last_served = {}
         self.character_scopes = {}
-        self._character_context_cache = {}
+        self._character_context_cache = OrderedDict()
+        self._vacuum_migration_attempted = False
         self.projection_generation = 0
         self.scope_projection_generations = {}
         self.review_retry_at = {}
@@ -621,7 +642,7 @@ class Engine:
                 self.automatic_reviews.notify_context_change()
             ingested_char_ctx = extract_character_context([row], scope=row["scope"], persona=row["persona"])
             if ingested_char_ctx is not None:
-                self._character_context_cache[pair] = ingested_char_ctx
+                self._set_character_context_cache(pair, ingested_char_ctx)
             if row["kind"] == "observed":
                 if self.current_personas.get(row["scope"]) != row["persona"]:
                     self.bump_projection_generation(row["scope"])
@@ -1637,14 +1658,69 @@ class Engine:
                 work.exception()
             raise
 
+    def _set_character_context_cache(self, key, value):
+        if not isinstance(self._character_context_cache, OrderedDict):
+            self._character_context_cache = OrderedDict(self._character_context_cache)
+        self._character_context_cache[key] = value
+        self._character_context_cache.move_to_end(key)
+        while len(self._character_context_cache) > self._MAX_CHARACTER_CONTEXT_CACHE:
+            self._character_context_cache.popitem(last=False)
+
+    def sweep_runtime_caches(self, now: float | None = None) -> dict[str, int]:
+        """Evict expired entries from in-memory retry/vibe/game maps and enforce context cache cap."""
+        stamp = time.time() if now is None else float(now)
+        removed_retry = 0
+        for pid, ts in list(self.review_retry_at.items()):
+            try:
+                expired = float(ts) <= stamp
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
+                self.review_retry_at.pop(pid, None)
+                removed_retry += 1
+        removed_vibes = 0
+        for umo, entry in list(self.scope_vibes.items()):
+            exp = entry.get("expires_at", 0.0) if isinstance(entry, dict) else 0.0
+            try:
+                expired = float(exp) <= stamp
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
+                self.scope_vibes.pop(umo, None)
+                removed_vibes += 1
+        removed_games = 0
+        for umo, entry in list(self.active_games.items()):
+            exp = entry.get("expires_at", 0.0) if isinstance(entry, dict) else 0.0
+            try:
+                expired = float(exp) <= stamp
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
+                self.active_games.pop(umo, None)
+                removed_games += 1
+        removed_ctx = 0
+        if not isinstance(self._character_context_cache, OrderedDict):
+            self._character_context_cache = OrderedDict(self._character_context_cache)
+        while len(self._character_context_cache) > self._MAX_CHARACTER_CONTEXT_CACHE:
+            self._character_context_cache.popitem(last=False)
+            removed_ctx += 1
+        return {
+            "review_retry_at": removed_retry,
+            "scope_vibes": removed_vibes,
+            "active_games": removed_games,
+            "character_context_cache": removed_ctx,
+        }
+
     def character_context_for(self, scope, persona, events=()):
         """Return consistent per-(scope, persona) character_context, hydrating lazily from SQLite."""
         key = (scope, persona)
         cached = self._character_context_cache.get(key)
+        if cached is not None and isinstance(self._character_context_cache, OrderedDict):
+            self._character_context_cache.move_to_end(key)
         extracted = extract_character_context(events, scope=scope, persona=persona)
         if extracted is not None:
             if cached is None or cached.get("persona_summary") != extracted.get("persona_summary"):
-                self._character_context_cache[key] = extracted
+                self._set_character_context_cache(key, extracted)
                 return extracted
             return cached
         if cached is not None:
@@ -1653,7 +1729,7 @@ class Engine:
         if latest is not None:
             extracted = extract_character_context([latest], scope=scope, persona=persona)
             if extracted is not None:
-                self._character_context_cache[key] = extracted
+                self._set_character_context_cache(key, extracted)
                 return extracted
         return None
 
@@ -2656,7 +2732,9 @@ class Engine:
         self.bump_projection_generation(scope)
         self.latest = {k: v for k, v in self.latest.items() if k[0] != scope}
         self.character_scopes = {k: v for k, v in self.character_scopes.items() if k[0] != scope}
-        self._character_context_cache = {k: v for k, v in self._character_context_cache.items() if k[0] != scope}
+        self._character_context_cache = OrderedDict(
+            (k, v) for k, v in self._character_context_cache.items() if k[0] != scope
+        )
         self.current_personas.pop(scope, None)
         if self.social:
             await self.social.purge(scope)
@@ -2713,7 +2791,20 @@ class Engine:
                     failed.add(pair)
                     self.last_error = type(exc).__name__
 
-            await asyncio.gather(*(run(pair) for _, pair in selected.values()))
+            sp = _load_series_panels()
+            profile = "standard"
+            if sp is not None:
+                try:
+                    profile = sp.resolve_series_resource_profile(self._host_context)
+                except Exception:
+                    profile = "standard"
+            if profile != "standard":
+                for _, pair in selected.values():
+                    await run(pair)
+                    if deferred:
+                        break
+            else:
+                await asyncio.gather(*(run(pair) for _, pair in selected.values()))
             if deferred:
                 break
 
@@ -2792,6 +2883,7 @@ class Engine:
         while not self.closed:
             self.next_check_at = None
             try:
+                self.sweep_runtime_caches()
                 if self.event_bus is not None and not self.event_bus.status().get("connected"):
                     self.event_bus.attach()
                 if self.cache_refresh_pending:
@@ -2826,6 +2918,28 @@ class Engine:
                 )
                 if isinstance(prune_result, dict) and prune_result.get("archived"):
                     invalidate_presence_cache(context=self._host_context)
+                if (
+                    getattr(self.store, "needs_auto_vacuum_migration", False)
+                    and not self._vacuum_migration_attempted
+                    and callable(getattr(self.store, "can_run_auto_vacuum_migration", None))
+                ):
+                    can_migrate = await asyncio.to_thread(self.store.can_run_auto_vacuum_migration)
+                    if can_migrate:
+                        self._vacuum_migration_attempted = True
+                        sp = _load_series_panels()
+                        if sp is not None and callable(getattr(sp, "heavy_subprocess_slot", None)):
+                            async with sp.heavy_subprocess_slot(
+                                self._host_context,
+                                "learning_db_vacuum",
+                                plugin_id="astrbot_plugin_dynamics_learning",
+                            ):
+                                await asyncio.to_thread(
+                                    self.store.enable_incremental_vacuum, vacuum=True
+                                )
+                        else:
+                            await asyncio.to_thread(
+                                self.store.enable_incremental_vacuum, vacuum=True
+                            )
                 await self.apply_pending_affection()
                 await self.apply_approved_profiles()
                 self._maintenance_active = True

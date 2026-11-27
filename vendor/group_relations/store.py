@@ -30,6 +30,20 @@ _REL_COUNTER_SELECT = (
 )
 
 
+def _load_series_panels():
+    try:
+        from ... import series_panels as _sp
+
+        return _sp
+    except Exception:
+        try:
+            import series_panels as _sp
+
+            return _sp
+        except Exception:
+            return None
+
+
 def _now() -> int:
     return int(time.time())
 
@@ -92,9 +106,11 @@ class RelationStore:
         pair_daily_budget: float = 80.0,
         activity_daily_cap: int = 80,
         shared_store: Any = None,
+        context: Any = None,
     ) -> None:
         self.db_path = db_path
         self._shared_store = shared_store
+        self._context = context if context is not None else getattr(shared_store, "_context", None)
         # 铁关系证据门槛：可选注入，缺省回退到 DEFAULT_SCORING（与评分规则同源）。
         self.min_hits_tie = int(
             min_hits_tie
@@ -120,6 +136,16 @@ class RelationStore:
         self._history_prune_interval_seconds: int = 3600
         self._init_db()
 
+    def _resource_limits(self) -> dict[str, Any]:
+        sp = _load_series_panels()
+        if sp is not None:
+            try:
+                ctx = self._context if self._context is not None else getattr(self._shared_store, "_context", None)
+                return sp.get_series_resource_limits(ctx)
+            except Exception:
+                pass
+        return {}
+
     def _connect(self) -> sqlite3.Connection | _SharedConnection:
         if self._shared_store is not None:
             return _SharedConnection(self._shared_store)
@@ -129,6 +155,12 @@ class RelationStore:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA synchronous=NORMAL")
+        sp = _load_series_panels()
+        if sp is not None:
+            try:
+                sp.apply_series_sqlite_pragmas(conn, self._context)
+            except Exception:
+                pass
         return conn
 
     def _init_db(self) -> None:
@@ -222,6 +254,9 @@ class RelationStore:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_directed_events_ts ON directed_events(ts)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_directed_events_group_ts ON directed_events(group_id, ts)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_relation_daily_day ON relation_daily(day)"
@@ -433,8 +468,121 @@ class RelationStore:
                 source_id,
             )
 
+    async def record_messages_batch(self, items: Sequence[dict[str, Any]]) -> None:
+        """Record a batch of messages in one SQLite transaction to reduce write amplification."""
+        prepared: list[tuple[Any, ...]] = []
+        for item in items:
+            ts = int(item.get("ts") or _now())
+            text = _clean_text(str(item.get("text") or ""))
+            toks = rs_tokens(text)
+            prepared.append(
+                (
+                    str(item["group_id"]),
+                    str(item["user_id"]),
+                    str(item.get("name") or ""),
+                    text,
+                    toks,
+                    ts,
+                    int(item["window_seconds"]),
+                    int(item["max_recent"]),
+                    float(item["pair_weight"]),
+                    float(item["mention_weight"]),
+                    float(item["same_topic_weight"]),
+                    list(item.get("directed") or []),
+                    float(item.get("reply_weight", 8.0)),
+                    float(item.get("at_weight", 5.0)),
+                    float(item.get("adjacency_weight", 1.5)),
+                    int(item.get("adjacency_window_seconds", 90)),
+                    float(item.get("ambient_tone_scale", 0.15)),
+                    item.get("directed_event_retain_days"),
+                    item.get("sentiment_probabilities"),
+                    str(item.get("source_id") or ""),
+                )
+            )
+        if not prepared:
+            return
+        async with self._lock:
+            await asyncio.to_thread(self._record_messages_batch_sync, prepared)
+
+    def _record_messages_batch_sync(self, prepared: Sequence[tuple[Any, ...]]) -> None:
+        limits = self._resource_limits()
+        max_recent_cap = max(1, int(limits.get("learning_relation_max_recent", 80)))
+        directed_retain_cap = max(1, int(limits.get("learning_directed_retention_days", 60)))
+        with self._connect() as conn:
+            for args in prepared:
+                self._record_message_in_conn(
+                    conn,
+                    *args[:7],
+                    min(max(1, int(args[7])), max_recent_cap),
+                    *args[8:17],
+                    min(
+                        max(1, int(args[17])) if args[17] is not None else directed_retain_cap,
+                        directed_retain_cap,
+                    ),
+                    args[18],
+                    args[19],
+                )
+
     def _record_message_sync(
         self,
+        group_id: str,
+        user_id: str,
+        name: str,
+        text: str,
+        toks: set[str],
+        ts: int,
+        window_seconds: int,
+        max_recent: int,
+        pair_weight: float,
+        mention_weight: float,
+        same_topic_weight: float,
+        directed: list[tuple[str, str, float]] | None = None,
+        reply_weight: float = 8.0,
+        at_weight: float = 5.0,
+        adjacency_weight: float = 1.5,
+        adjacency_window_seconds: int = 90,
+        ambient_tone_scale: float = 0.15,
+        directed_event_retain_days: int = 90,
+        sentiment_probabilities: dict | None = None,
+        source_id: str = "",
+    ) -> None:
+        limits = self._resource_limits()
+        max_recent_cap = max(1, int(limits.get("learning_relation_max_recent", 80)))
+        directed_retain_cap = max(1, int(limits.get("learning_directed_retention_days", 60)))
+        eff_max_recent = min(max(1, int(max_recent)), max_recent_cap)
+        eff_directed_retain = (
+            min(int(directed_event_retain_days), directed_retain_cap)
+            if int(directed_event_retain_days) > 0
+            else int(directed_event_retain_days)
+        )
+        with self._connect() as conn:
+            self._record_message_in_conn(
+                conn,
+                group_id,
+                user_id,
+                name,
+                text,
+                toks,
+                ts,
+                window_seconds,
+                eff_max_recent,
+                pair_weight,
+                mention_weight,
+                same_topic_weight,
+                directed,
+                reply_weight,
+                at_weight,
+                adjacency_weight,
+                adjacency_window_seconds,
+                ambient_tone_scale,
+                eff_directed_retain,
+                sentiment_probabilities,
+                source_id,
+            )
+
+    def _record_message_in_conn(
+        self,
+        conn: sqlite3.Connection,
         group_id: str,
         user_id: str,
         name: str,
@@ -464,7 +612,7 @@ class RelationStore:
         today = _dt.date.today().isoformat()
         haystack = (text or "").lower()
 
-        with self._connect() as conn:
+        if True:
             if source_id:
                 import hashlib
                 stamp = hashlib.sha256(json.dumps([user_id,text,directed],sort_keys=True,ensure_ascii=False).encode()).hexdigest()
@@ -902,15 +1050,19 @@ class RelationStore:
         conn: sqlite3.Connection,
         group_id: str,
         context_window_seconds: int,
+        *,
+        now_ts: int | None = None,
     ) -> dict[tuple[str, str], float | None]:
         """Map unordered pair → median_latency_s from directed_events (reply/at)."""
+        now_i = _now() if now_ts is None else int(now_ts)
+        cutoff = now_i - self.analysis_window_days * 86400
         rows = conn.execute(
             """
             SELECT src, dst, ts FROM directed_events
-            WHERE group_id=? AND kind IN ('reply', 'at')
+            WHERE group_id=? AND kind IN ('reply', 'at') AND ts >= ?
             ORDER BY ts ASC
             """,
-            (group_id,),
+            (group_id, cutoff),
         ).fetchall()
         by_pair: dict[tuple[str, str], list[tuple[str, str, int]]] = defaultdict(list)
         for row in rows:
@@ -1135,7 +1287,7 @@ class RelationStore:
             started = conn.execute(
                 "SELECT value FROM meta WHERE key='network_v2_started'"
             ).fetchone()
-            latencies = self._pair_latencies_map(conn, group_id, cw)
+            latencies = self._pair_latencies_map(conn, group_id, cw, now_ts=now)
         relations = []
         for row in rows:
             item = pair_metrics(
@@ -1215,17 +1367,22 @@ class RelationStore:
     async def prune_history(
         self,
         *,
-        directed_event_retain_days: int = 90,
+        directed_event_retain_days: int | None = None,
         receipt_retain_days: int = 30,
         daily_retain_days: int = 90,
         batch_size: int = 500,
         now_ts: int | None = None,
     ) -> dict[str, int]:
         """Batched, indexed history pruning releasing shared lock between chunks."""
+        if directed_event_retain_days is None:
+            limits = self._resource_limits()
+            directed_event_retain_days = max(
+                1, int(limits.get("learning_directed_retention_days", 60))
+            )
         async with self._lock:
             return await asyncio.to_thread(
                 self._prune_history_batched_sync,
-                directed_event_retain_days,
+                int(directed_event_retain_days),
                 receipt_retain_days,
                 daily_retain_days,
                 batch_size,

@@ -77,6 +77,21 @@ def query_queue(store,scopes,modes,names,personas,latest,*,scope='',query='',cat
     db.row_factory=sqlite3.Row
     try:
         db.execute('PRAGMA busy_timeout=5000')
+        try:
+            from .. import series_panels as _series_panels
+
+            _series_panels.apply_series_sqlite_pragmas(
+                db, getattr(store, '_context', None), readonly=True
+            )
+        except Exception:
+            try:
+                import series_panels as _series_panels
+
+                _series_panels.apply_series_sqlite_pragmas(
+                    db, getattr(store, '_context', None), readonly=True
+                )
+            except Exception:
+                pass
         db.execute('BEGIN')
         # Classify once into a connection-local temp table. The production DB remains read-only.
         db.execute('CREATE TEMP TABLE queue_result AS '+SQL+'SELECT * FROM flags',args)

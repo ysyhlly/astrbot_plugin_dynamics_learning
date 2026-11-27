@@ -395,7 +395,7 @@ def test_arbitrary_historical_version_restore_and_workbench_flags(tmp_path):
 
             p1 = _seed_entry(store, category="jargon", key="摸鱼", value="版本1：上班偷懒", persona="anan", msg_id="r1")
             await engine.refresh()
-            p2 = _seed_entry(store, category="jargon", key="摸鱼", value="版本2：划水休息", persona="anan", msg_id="r2")
+            _seed_entry(store, category="jargon", key="摸鱼", value="版本2：划水休息", persona="anan", msg_id="r2")
             await engine.refresh()
             p3 = _seed_entry(store, category="jargon", key="摸鱼", value="版本3：带薪发呆", persona="anan", msg_id="r3")
             await engine.refresh()

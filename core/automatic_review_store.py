@@ -162,6 +162,6 @@ class AutomaticReviewStore:
             self.store.db.execute("DELETE FROM automatic_review_queue WHERE scope=?", (scope,))
             self.store.db.execute("DELETE FROM review_provider_attempts WHERE scope=?", (scope,))
 
-    def prune(self, days):
-        with self.store.transaction():
-            self.store.db.execute("DELETE FROM review_provider_attempts WHERE created<?", (time.time() - days * 86400,))
+    def prune(self, days, *, batch_size=500):
+        cutoff = time.time() - max(1, int(days)) * 86400
+        self.store._prune_batched("review_provider_attempts", "created<?", (cutoff,), batch_size=batch_size)
