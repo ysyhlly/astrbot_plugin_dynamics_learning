@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -243,10 +244,13 @@ def test_my_impression_card_rendering_isolation_and_mute(tmp_path):
         assert "跨群桌游" not in payload["text"]
         assert "手冲咖啡" in payload["text"]
 
-        # PNG card rendered via Pillow
-        img_path = Path(payload["image_path"])
-        assert img_path.is_file()
-        assert img_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        # PNG card rendered via Pillow when Pillow is installed (graceful text fallback otherwise)
+        if importlib.util.find_spec("PIL") is not None:
+            img_path = Path(payload["image_path"])
+            assert img_path.is_file()
+            assert img_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        else:
+            assert payload["image_path"] == ""
 
         # Enable learning mute -> impression blocked & privacy mute enforced
         mute_calls = []
