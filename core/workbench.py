@@ -103,7 +103,39 @@ def detail(store,scopes,proposal_id='',entry_id=''):
         history=[json.loads(r[0]) for r in store.db.execute("SELECT body FROM proposals WHERE json_extract(body,'$.entry_id')=? ORDER BY created DESC LIMIT 50",(key,))]
         audit=[{'action':r[0],'actor':r[1],'created':r[2],'body':json.loads(r[3]),'proposal_id':r[4]} for r in store.db.execute("SELECT a.action,a.actor,a.created,a.body,a.proposal FROM audit a LEFT JOIN proposals p ON p.id=a.proposal WHERE json_extract(p.body,'$.entry_id')=? OR a.proposal=? ORDER BY a.id DESC LIMIT 100",(key,key))]
         usage=[{'id':r[0],'created':r[1],'turn_id':r[2]} for r in store.db.execute("SELECT DISTINCT u.id,u.created,u.turn_id FROM proposals p JOIN reply_usage_refs f ON f.source_id=p.id JOIN reply_usage u ON u.id=f.receipt WHERE u.scope=? AND json_extract(p.body,'$.entry_id')=? ORDER BY u.created DESC LIMIT 20",(subject['scope'],key))]
-        return {'proposal':p,'entry':entry,'versions':[store.console.summary(r) for r in history],
+        can_rollback = bool(
+            p
+            and entry
+            and p['state'] == 'applied'
+            and entry['revision'] == p.get('applied_revision')
+            and entry.get('proposal_id') == p['id']
+        )
+        can_restore = bool(
+            p
+            and not can_rollback
+            and p['state'] in {'applied', 'rolled_back'}
+            and p.get('applied_revision')
+            and policy_allowed(p)
+        )
+        versions = []
+        for r in history:
+            summary = store.console.summary(r)
+            row_is_current = bool(
+                entry
+                and r['state'] == 'applied'
+                and entry['revision'] == r.get('applied_revision')
+                and entry.get('proposal_id') == r['id']
+            )
+            summary['is_current'] = row_is_current
+            summary['can_restore'] = bool(
+                not row_is_current
+                and r['state'] in {'applied', 'rolled_back'}
+                and r.get('applied_revision')
+                and policy_allowed(r)
+            )
+            versions.append(summary)
+        return {'proposal':p,'entry':entry,'versions':versions,
                 'timeline':audit,'usage':usage,'claim':store.review_claim(p['id']) if p else None,
-                'can_rollback':bool(p and entry and p['state']=='applied' and entry['revision']==p.get('applied_revision') and entry.get('proposal_id')==p['id']),
+                'can_rollback':can_rollback,
+                'can_restore':can_restore,
                 'legacy_readonly':p is None}

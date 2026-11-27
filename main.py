@@ -258,6 +258,11 @@ def _text_chat_extra_kwargs(provider, config, *, role: str = "", is_single_revie
     return out
 
 
+def _command_decorator(*args, **kwargs):
+    cmd = getattr(filter, "command", None)
+    return cmd(*args, **kwargs) if callable(cmd) else (lambda fn: fn)
+
+
 class DynamicsLearning(Star):
     """Public synchronous ingress + cached read; model and SQLite work stays off reply path."""
 
@@ -1625,6 +1630,14 @@ class DynamicsLearning(Star):
         ):
             raise ReviewUnavailable("模型绑定已改变，本次结果失效")
         content = getattr(response, "completion_text", None)
+        if self.engine is not None:
+            raw_comp = getattr(response, "raw_completion", None)
+            usage = getattr(raw_comp, "usage", None) if raw_comp is not None else getattr(response, "usage", None)
+            if usage is not None:
+                pt = getattr(usage, "prompt_tokens", None) if not isinstance(usage, dict) else usage.get("prompt_tokens")
+                ct = getattr(usage, "completion_tokens", None) if not isinstance(usage, dict) else usage.get("completion_tokens")
+                if isinstance(pt, int) and isinstance(ct, int) and (pt > 0 or ct > 0):
+                    self.engine._last_provider_tokens = (pt, ct)
         try:
             return decode_model_object(content)
         except ValueError as exc:
@@ -1819,12 +1832,162 @@ class DynamicsLearning(Star):
 
         return await self._serve(operation, ("scope", "query", "category", "state", "view", "reason", "page"))
 
+    @_command_decorator("我的印象", alias={"my_impression"})
+    async def cmd_my_impression(self, event: AstrMessageEvent):
+        """查看当前角色对本人在本群已批准的脱敏印象卡片（仅本人可见本群资料）。"""
+        from .core.member_commands import build_my_impression_payload
+
+        if self.closed or not self.ready or self.engine is None:
+            yield event.plain_result("群间学习尚未就绪，请稍后再试。")
+            return
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        sender_id = str(event.get_sender_id() or "").strip()
+        name_getter = getattr(event, "get_sender_name", None)
+        sender_name = str(name_getter() or "").strip() if callable(name_getter) else ""
+        payload = await asyncio.to_thread(
+            build_my_impression_payload,
+            self.engine,
+            self.context,
+            scope=umo,
+            member=sender_id,
+            member_name=sender_name,
+        )
+        if not payload.get("ok"):
+            yield event.plain_result(str(payload.get("reason") or "暂时无法生成印象卡片。"))
+            return
+        image_path = str(payload.get("image_path") or "")
+        image_maker = getattr(event, "image_result", None)
+        if image_path and callable(image_maker):
+            try:
+                yield image_maker(image_path)
+                return
+            except Exception:
+                pass
+        yield event.plain_result(str(payload.get("text") or ""))
+
+    @_command_decorator("群黑话", alias={"group_jargon"})
+    async def cmd_group_jargon(self, event: AstrMessageEvent, keyword: str = ""):
+        """检索本群已批准的黑话词库。"""
+        from .core.member_commands import query_group_jargon_list
+
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        raw_msg = str(event.get_message_str() or "").strip()
+        kw = str(keyword or "").strip()
+        if not kw and " " in raw_msg:
+            kw = raw_msg.split(None, 1)[1].strip()
+        res = query_group_jargon_list(self.engine, scope=umo, keyword=kw)
+        yield event.plain_result(str(res.get("text") or ""))
+
+    @_command_decorator("纠正黑话", alias={"correct_jargon"})
+    async def cmd_correct_jargon(self, event: AstrMessageEvent):
+        """群友自助提交黑话词条补充或释义纠偏，进入审查队列。"""
+        from .core.member_commands import submit_member_jargon_correction
+
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        sender_id = str(event.get_sender_id() or "").strip()
+        raw_msg = str(event.get_message_str() or "").strip()
+        args = raw_msg.split(None, 1)[1].strip() if " " in raw_msg else ""
+        res = await asyncio.to_thread(
+            submit_member_jargon_correction,
+            self.engine,
+            scope=umo,
+            member=sender_id,
+            raw_args=args,
+        )
+        if res.get("ok") and isinstance(res.get("proposal"), dict):
+            prop = res["proposal"]
+            if prop.get("mode") != "human" and prop.get("state") == "pending":
+                try:
+                    await self.engine.automatic_reviews.enqueue([prop])
+                except Exception:
+                    pass
+            series_panels.invalidate_presence_cache(PLUGIN, context=self.context)
+        yield event.plain_result(str(res.get("text") or ""))
+
+    @_command_decorator("习惯纠偏", alias={"correct_habit"})
+    async def cmd_correct_habit(self, event: AstrMessageEvent):
+        """群友自助提交表达/习惯/喜恶边界纠偏，进入审查队列。"""
+        from .core.member_commands import submit_member_habit_correction
+
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        sender_id = str(event.get_sender_id() or "").strip()
+        raw_msg = str(event.get_message_str() or "").strip()
+        note = raw_msg.split(None, 1)[1].strip() if " " in raw_msg else ""
+        res = await asyncio.to_thread(
+            submit_member_habit_correction,
+            self.engine,
+            scope=umo,
+            member=sender_id,
+            note=note,
+        )
+        if res.get("ok") and isinstance(res.get("proposal"), dict):
+            prop = res["proposal"]
+            if prop.get("mode") != "human" and prop.get("state") == "pending":
+                try:
+                    await self.engine.automatic_reviews.enqueue([prop])
+                except Exception:
+                    pass
+            series_panels.invalidate_presence_cache(PLUGIN, context=self.context)
+        yield event.plain_result(str(res.get("text") or ""))
+
+    @_command_decorator("学习静音", alias={"learning_mute"})
+    async def cmd_learning_mute(self, event: AstrMessageEvent, state: str = ""):
+        """成员级退出/恢复本群学习采集与投影（兼容系列隐私静音）。"""
+        from .core.member_commands import handle_learning_mute_command
+
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        sender_id = str(event.get_sender_id() or "").strip()
+        raw_msg = str(event.get_message_str() or "").strip()
+        arg = str(state or "").strip()
+        if not arg and " " in raw_msg:
+            arg = raw_msg.split(None, 1)[1].strip()
+        res = await handle_learning_mute_command(
+            self.engine,
+            self.context,
+            scope=umo,
+            member=sender_id,
+            arg=arg,
+        )
+        yield event.plain_result(str(res.get("text") or ""))
+
     async def governance_action(self):
+        from .core.contract import CATEGORIES
+        from .core.presets import OPERATION_PRESETS, detect_active_preset, validate_review_modes
         from .core.workbench import govern
 
         async def operation(body, actor):
+            action = text(body.get("action"), "action", 32)
+            if action == "apply_preset":
+                preset_id = text(body.get("preset"), "preset", 48)
+                spec = OPERATION_PRESETS.get(preset_id)
+                if spec is None:
+                    raise ValueError(f"未知运营预设：{preset_id}")
+                async with self.engine.lock:
+                    for k, v in spec["config"].items():
+                        self.config[k] = v
+                    self._save_config_safely()
+                    series_panels.invalidate_presence_cache(PLUGIN, context=self.context)
+                return {
+                    "action": "apply_preset",
+                    "preset": preset_id,
+                    "label": spec["label"],
+                    "active_preset": detect_active_preset(self.config),
+                    "review_modes": {c: self.engine.mode(c) for c in sorted(CATEGORIES)},
+                }
+            if action == "update_review_modes":
+                cleaned = validate_review_modes(body.get("review_modes"))
+                async with self.engine.lock:
+                    for cat, mode in cleaned.items():
+                        self.config[f"{cat}_review"] = mode
+                    self._save_config_safely()
+                    series_panels.invalidate_presence_cache(PLUGIN, context=self.context)
+                return {
+                    "action": "update_review_modes",
+                    "updated": cleaned,
+                    "active_preset": detect_active_preset(self.config),
+                    "review_modes": {c: self.engine.mode(c) for c in sorted(CATEGORIES)},
+                }
             scope = text(body.get("scope"), "scope", 512)
-            action = text(body.get("action"), "action", 24)
             if action == "archive_all_stale":
                 return await self.engine.archive_group_stale(scope, actor)
             async with self.engine.lock:
@@ -1833,7 +1996,7 @@ class DynamicsLearning(Star):
             self.engine.automatic_reviews.notify_context_change()
             return result
 
-        return await self._serve(operation, ("scope", "action", "items"))
+        return await self._serve(operation, ("scope", "action", "items", "preset", "review_modes"))
 
     async def archive_stale(self):
         async def operation(body, actor):

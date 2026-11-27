@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import re
 from typing import Any
@@ -157,3 +158,97 @@ def is_member_privacy_muted(
         except Exception:
             return False
     return False
+
+
+def _add_persona_label(labels: dict[str, str], key: str, display: str) -> None:
+    clean_k = str(key or "").strip()
+    clean_v = str(display or "").strip()[:64]
+    if not clean_k or not clean_v or clean_k in _UNBOUND_PERSONA_SENTINELS or clean_v in _UNBOUND_PERSONA_SENTINELS:
+        return
+    if clean_k not in labels:
+        labels[clean_k] = clean_v
+    if len(clean_k) >= 12 and clean_k[:12] not in labels:
+        labels[clean_k[:12]] = clean_v
+
+
+def resolve_persona_labels(context: Any, store: Any = None, engine: Any = None) -> dict[str, str]:
+    """Map persona SHA-256 hashes and IDs to human-readable character/persona names."""
+    labels: dict[str, str] = {}
+
+    # 1. From live engine character_scopes & store native_scope_registry
+    char_scopes: dict[tuple[str, str], dict[str, Any]] = {}
+    if engine is not None and isinstance(getattr(engine, "character_scopes", None), dict):
+        char_scopes.update(engine.character_scopes)
+    if store is not None and hasattr(store, "native"):
+        try:
+            for pair, body in (store.native.scopes() or {}).items():
+                char_scopes.setdefault(pair, body)
+        except Exception:
+            pass
+
+    for (_scope, persona_key), body in char_scopes.items():
+        if not isinstance(body, dict):
+            continue
+        pid = str(body.get("persona_id") or body.get("name") or "").strip()
+        if pid:
+            _add_persona_label(labels, persona_key, pid)
+            _add_persona_label(labels, pid, pid)
+
+    # 2. From AstrBot host persona_manager (matches both persona_id and sha256(prompt))
+    pm = getattr(context, "persona_manager", None) if context is not None else None
+    raw_personas: list[Any] = []
+    if pm is not None:
+        for attr in ("personas", "personas_v3"):
+            items = getattr(pm, attr, None)
+            if isinstance(items, (list, tuple)):
+                raw_personas.extend(items)
+            elif isinstance(items, dict):
+                raw_personas.extend(items.values())
+    for item in raw_personas:
+        if isinstance(item, dict):
+            pid = str(item.get("persona_id") or item.get("name") or item.get("id") or "").strip()
+            name = str(item.get("name") or pid).strip()
+            prompt = str(item.get("system_prompt") or item.get("prompt") or "").strip()
+        else:
+            pid = str(getattr(item, "persona_id", "") or getattr(item, "name", "") or "").strip()
+            name = str(getattr(item, "name", "") or pid).strip()
+            prompt = str(getattr(item, "system_prompt", "") or getattr(item, "prompt", "") or "").strip()
+        if not name:
+            continue
+        if pid:
+            _add_persona_label(labels, pid, name)
+            _add_persona_label(labels, hashlib.sha256(pid.encode("utf-8")).hexdigest(), name)
+        if prompt:
+            _add_persona_label(labels, hashlib.sha256(prompt.encode("utf-8")).hexdigest(), name)
+
+    # 3. From dynamics_world companion if active (optional display name enrichment)
+    if context is not None:
+        world = series_panels.find_plugin_owner(context, "astrbot_plugin_dynamics_world")
+        if world is not None:
+            for method_name in ("list_series_personas", "get_character_names"):
+                fn = getattr(world, method_name, None)
+                if callable(fn) and not inspect.iscoroutinefunction(fn):
+                    try:
+                        raw = fn()
+                        if inspect.isawaitable(raw):
+                            if inspect.iscoroutine(raw):
+                                raw.close()
+                            continue
+                        if isinstance(raw, dict):
+                            for k, v in raw.items():
+                                _add_persona_label(labels, str(k), str(v))
+                        elif isinstance(raw, (list, tuple)):
+                            for row in raw:
+                                if isinstance(row, dict):
+                                    pid = str(row.get("persona_id") or row.get("id") or "").strip()
+                                    name = str(row.get("name") or row.get("display_name") or pid).strip()
+                                    if pid and name:
+                                        _add_persona_label(labels, pid, name)
+                    except Exception:
+                        continue
+
+    # 4. From shared persona_id as fallback label for itself
+    shared_pid = resolve_shared_persona_id(context)
+    if shared_pid:
+        _add_persona_label(labels, shared_pid, shared_pid)
+    return labels

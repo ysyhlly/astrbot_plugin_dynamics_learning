@@ -127,6 +127,18 @@
           </div>
           <div class="card">
             <div class="section-head section-head-sub">
+              <h3 data-series-text="模型调用与 Token 估算（24h）">模型调用与 Token 估算（24h）</h3>
+              <details class="info-popover">
+                <summary aria-label="调用统计说明" data-series-aria-label="调用统计说明"><span class="info-icon" aria-hidden="true">i</span></summary>
+                <div class="info-popover-body">
+                  <p class="muted" data-series-text="按分析、审查、维护阶段统计 24 小时调用次数与 Token 估算（优先使用模型返回 usage，缺失时按字符数估算）。">按分析、审查、维护阶段统计 24 小时调用次数与 Token 估算（优先使用模型返回 usage，缺失时按字符数估算）。</p>
+                </div>
+              </details>
+            </div>
+            <div id="llm-usage-box"></div>
+          </div>
+          <div class="card">
+            <div class="section-head section-head-sub">
               <h3 data-series-text="任务诊断">任务诊断</h3>
               <details class="info-popover">
                 <summary aria-label="任务诊断说明" data-series-aria-label="任务诊断说明"><span class="info-icon" aria-hidden="true">i</span></summary>
@@ -195,6 +207,10 @@
             <button id="review-prev" type="button" data-series-text="上一页">上一页</button>
             <button id="review-next" type="button" data-series-text="下一页">下一页</button>
           </div>
+          <details id="recent-applied-panel" class="card recent-applied-panel">
+            <summary data-series-text="近期已应用（快速回滚与历史版本）">近期已应用（快速回滚与历史版本）</summary>
+            <div id="recent-applied-list"></div>
+          </details>
         </section>
 
         <section id="entries" hidden>
@@ -467,8 +483,13 @@
             </details>
           </div>
           <div id="scope-list"></div>
+          <h3 data-series-text="运营预设">运营预设</h3>
+          <div id="preset-list" class="preset-grid"></div>
           <h3 data-series-text="审查方式">审查方式</h3>
           <div id="modes"></div>
+          <div class="actions">
+            <button id="save-modes" type="button" class="primary" data-series-text="保存审查方式">保存审查方式</button>
+          </div>
         </section>
       </main>
     </div>
@@ -483,7 +504,12 @@
     <form method="dialog">
       <h2 data-series-text="修改并重新提案">修改并重新提案</h2>
       <p data-series-text="修改后的提案重新进入审查，旧的审查意见不会自动沿用。">修改后的提案重新进入审查，旧的审查意见不会自动沿用。</p>
-      <label><span data-series-text="调整内容">调整内容</span><textarea id="edit-value" rows="6" required></textarea></label>
+      <div class="edit-mode-bar">
+        <span id="edit-mode-hint" class="muted"></span>
+        <button id="edit-mode-toggle" type="button" hidden data-series-text="切换到高级 JSON">切换到高级 JSON</button>
+      </div>
+      <div id="edit-structured" class="edit-structured" hidden></div>
+      <label id="edit-raw-wrap"><span data-series-text="调整内容">调整内容</span><textarea id="edit-value" rows="6"></textarea></label>
       <label><span data-series-text="修改理由">修改理由</span><textarea id="edit-reason" rows="3" maxlength="1500" required></textarea></label>
       <footer>
         <button value="cancel" formnovalidate data-series-text="取消">取消</button>

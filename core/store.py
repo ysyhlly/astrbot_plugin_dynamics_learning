@@ -181,6 +181,8 @@ class Store:
         CREATE TABLE IF NOT EXISTS horizons_reflections(id TEXT PRIMARY KEY,scope TEXT NOT NULL,persona TEXT NOT NULL,
           member TEXT NOT NULL,topic TEXT NOT NULL,summary TEXT NOT NULL,sentiment TEXT NOT NULL,created REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS horizons_reflections_scope ON horizons_reflections(scope,persona,created);
+        CREATE TABLE IF NOT EXISTS member_privacy_mutes(scope TEXT NOT NULL,member TEXT NOT NULL,muted INTEGER NOT NULL,
+          updated REAL NOT NULL,actor TEXT NOT NULL,PRIMARY KEY(scope,member));
         """)
         if current_version < 10:
             self.db.execute("PRAGMA user_version=10")
@@ -1063,6 +1065,132 @@ class Store:
             self.db.execute("DELETE FROM review_batches WHERE scope=?", (scope,))
             self.db.execute("DELETE FROM review_claims WHERE scope=?", (scope,))
             self.db.execute("DELETE FROM horizons_reflections WHERE scope=?", (scope,))
+            self.db.execute("DELETE FROM member_privacy_mutes WHERE scope=?", (scope,))
+            self.db.execute("DELETE FROM llm_usage_stats WHERE scope=?", (scope,))
+
+    def set_local_privacy_mute(self, scope: str, member: str, muted: bool, *, actor: str = "") -> dict:
+        now = time.time()
+        with self.transaction():
+            self.db.execute(
+                "INSERT OR REPLACE INTO member_privacy_mutes(scope,member,muted,updated,actor) VALUES(?,?,?,?,?)",
+                (str(scope), str(member), 1 if muted else 0, now, str(actor or "")),
+            )
+        return {"scope": str(scope), "member": str(member), "muted": bool(muted), "updated": now}
+
+    def is_local_privacy_muted(self, scope: str, member: str) -> bool:
+        if not scope or not member:
+            return False
+        with self.lock:
+            row = self.db.execute(
+                "SELECT muted FROM member_privacy_mutes WHERE scope=? AND member=?",
+                (str(scope), str(member)),
+            ).fetchone()
+            return bool(row and int(row[0]) == 1)
+
+    def count_member_corrections_today(self, scope: str, actor: str) -> int:
+        cutoff = time.time() - 86400
+        with self.lock:
+            row = self.db.execute(
+                "SELECT count(*) FROM proposals WHERE scope=? AND created>=? "
+                "AND json_extract(body,'$.submitted_by')=?",
+                (str(scope), cutoff, str(actor)),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def recent_applied_proposals(self, allowed_scopes, limit: int = 10) -> list[dict]:
+        scopes = list(allowed_scopes or ())
+        if not scopes:
+            return []
+        max_rows = max(1, min(30, int(limit or 10)))
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT body FROM proposals WHERE state='applied' "
+                "AND scope IN (SELECT value FROM json_each(?)) "
+                "ORDER BY coalesce(json_extract(body,'$.applied_at'), updated) DESC LIMIT ?",
+                (encode(scopes), max_rows),
+            ).fetchall()
+            out = []
+            for r in rows:
+                p = json.loads(r[0])
+                out.append(self.console.summary(p))
+            return out
+
+    def restore_version(self, proposal_id: str, actor: str, expected_updated=None, *, reason: str = "") -> dict:
+        """Restore an entry to any previously applied historical proposal revision."""
+        with self.transaction():
+            target = self.get(proposal_id)
+            if expected_updated is not None and target["updated"] != expected_updated:
+                raise Conflict("proposal changed; refresh before restore")
+            if target["state"] not in {"applied", "rolled_back"} or not target.get("applied_revision"):
+                raise Conflict("仅支持恢复曾经已生效的历史修订版本")
+            if not policy_allowed(target):
+                raise Conflict("该历史版本不符合当前固定人格红线，禁止恢复")
+            row = self.db.execute("SELECT body FROM entries WHERE id=?", (target["entry_id"],)).fetchone()
+            current = json.loads(row[0]) if row else None
+            if (
+                current is not None
+                and current.get("active")
+                and current.get("proposal_id") == target["id"]
+                and current.get("revision") == target.get("applied_revision")
+            ):
+                raise Conflict("当前生效版本已是该历史修订，无需重复恢复")
+
+            now = time.time()
+            from_rev = int(current["revision"]) if current else 0
+            next_rev = from_rev + 1
+
+            # Demote the previously active proposal (if distinct) to rolled_back so history stays consistent
+            prev_pid = str(current.get("proposal_id") or "") if current else ""
+            if prev_pid and prev_pid != target["id"] and not prev_pid.startswith("legacy:"):
+                prev_row = self.db.execute("SELECT body FROM proposals WHERE id=?", (prev_pid,)).fetchone()
+                if prev_row is not None:
+                    prev_prop = json.loads(prev_row[0])
+                    if prev_prop.get("state") == "applied":
+                        prev_prop["state"] = "rolled_back"
+                        prev_prop["rolled_back_by"] = actor
+                        prev_prop["rolled_back_at"] = now
+                        self._save(prev_prop)
+
+            restored = {
+                k: target[k]
+                for k in ("scope", "persona", "member", "category", "key", "value", "baseline", "host_version")
+            }
+            for policy_key in ("profile_policy", "scene_policy", "expression_policy"):
+                if policy_key in target:
+                    restored[policy_key] = target[policy_key]
+            restored.update(self.provenance(target))
+            restored.update(
+                id=target["entry_id"],
+                revision=next_rev,
+                proposal_id=target["id"],
+                expires=now + target["days"] * 86400,
+                active=True,
+                state_updated_at=now,
+                restored_from_proposal_id=target["id"],
+            )
+            if target["category"] == "affection":
+                restored["tone_updated_at"] = now
+            self.db.execute("INSERT OR REPLACE INTO entries VALUES(?,?)", (restored["id"], encode(restored)))
+
+            target["state"] = "applied"
+            target["applied_revision"] = next_rev
+            target["applied_at"] = now
+            target["applied_by"] = actor
+            target["restored_at"] = now
+            target["restored_by"] = actor
+            self._save(target)
+            self._audit(
+                target,
+                "restored_version",
+                actor,
+                {
+                    "from_revision": from_rev,
+                    "to_revision": next_rev,
+                    "replaced_proposal": prev_pid,
+                    "reason": str(reason or "人工恢复历史版本")[:500],
+                },
+            )
+            return target
 
     def record_horizons_reflection(
         self,

@@ -25,6 +25,10 @@ class Console:
         CREATE INDEX IF NOT EXISTS review_batches_scope ON review_batches(scope,created);
         CREATE INDEX IF NOT EXISTS review_batches_status_created ON review_batches(status,created);
         CREATE TABLE IF NOT EXISTS analysis_meta(key TEXT PRIMARY KEY,value TEXT);
+        CREATE TABLE IF NOT EXISTS llm_usage_stats(id INTEGER PRIMARY KEY AUTOINCREMENT,scope TEXT,phase TEXT,ok INTEGER,
+          prompt_chars INTEGER,completion_chars INTEGER,prompt_tokens INTEGER,completion_tokens INTEGER,elapsed_ms INTEGER,created REAL);
+        CREATE INDEX IF NOT EXISTS llm_usage_stats_created ON llm_usage_stats(created);
+        CREATE INDEX IF NOT EXISTS llm_usage_stats_phase ON llm_usage_stats(phase,created);
         """)
         with store.transaction():
             if not store.db.execute("SELECT 1 FROM analysis_meta WHERE key='reply_usage_refs_backfilled_v1'").fetchone():
@@ -126,7 +130,7 @@ class Console:
                     seen_risks.add(clean)
                     risks.append(clean)
         result["risks"] = risks
-        for key in ("applied_by", "rolled_back_by", "auto_guard_reason"):
+        for key in ("applied_by", "rolled_back_by", "auto_guard_reason", "applied_revision", "applied_at", "source_kind", "submitted_by", "restored_at"):
             if key in p:
                 result[key] = p[key]
         return result
@@ -299,12 +303,114 @@ class Console:
                 ).fetchone()[0],
             }
 
+    def record_llm_usage(
+        self,
+        *,
+        scope: str = "",
+        phase: str = "analysis",
+        ok: bool = True,
+        prompt_chars: int = 0,
+        completion_chars: int = 0,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        elapsed_ms: int = 0,
+    ) -> None:
+        clean_phase = str(phase or "analysis").strip().lower()
+        if clean_phase not in {"analysis", "review", "maintenance"}:
+            clean_phase = "analysis"
+        p_chars = max(0, int(prompt_chars or 0))
+        c_chars = max(0, int(completion_chars or 0))
+        p_tok = (
+            max(0, int(prompt_tokens))
+            if isinstance(prompt_tokens, (int, float)) and not isinstance(prompt_tokens, bool) and prompt_tokens > 0
+            else (max(1, round(p_chars / 2.2)) if p_chars > 0 else 0)
+        )
+        c_tok = (
+            max(0, int(completion_tokens))
+            if isinstance(completion_tokens, (int, float))
+            and not isinstance(completion_tokens, bool)
+            and completion_tokens > 0
+            else (max(1, round(c_chars / 2.2)) if c_chars > 0 else 0)
+        )
+        with self.store.transaction():
+            self.store.db.execute(
+                "INSERT INTO llm_usage_stats(scope,phase,ok,prompt_chars,completion_chars,prompt_tokens,completion_tokens,elapsed_ms,created) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    str(scope or "")[:512],
+                    clean_phase,
+                    1 if ok else 0,
+                    p_chars,
+                    c_chars,
+                    p_tok,
+                    c_tok,
+                    max(0, int(elapsed_ms or 0)),
+                    time.time(),
+                ),
+            )
+
+    def llm_usage_summary(self, hours: int = 24) -> dict:
+        window = max(1, min(24 * 30, int(hours or 24)))
+        cutoff = time.time() - window * 3600
+        phases = {
+            name: {
+                "calls": 0,
+                "ok": 0,
+                "failed": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "avg_ms": 0,
+            }
+            for name in ("analysis", "review", "maintenance")
+        }
+        with self.store.lock:
+            rows = self.store.db.execute(
+                "SELECT phase, count(*) AS calls, sum(ok) AS ok_calls, "
+                "coalesce(sum(prompt_tokens),0) AS p_tok, coalesce(sum(completion_tokens),0) AS c_tok, "
+                "coalesce(avg(elapsed_ms),0) AS avg_ms "
+                "FROM llm_usage_stats WHERE created>=? GROUP BY phase",
+                (cutoff,),
+            ).fetchall()
+        total_calls = ok_calls = p_sum = c_sum = 0
+        for row in rows:
+            ph = str(row["phase"] or "analysis")
+            if ph not in phases:
+                continue
+            calls = int(row["calls"] or 0)
+            ok = int(row["ok_calls"] or 0)
+            pt = int(row["p_tok"] or 0)
+            ct = int(row["c_tok"] or 0)
+            phases[ph] = {
+                "calls": calls,
+                "ok": ok,
+                "failed": max(0, calls - ok),
+                "prompt_tokens": pt,
+                "completion_tokens": ct,
+                "total_tokens": pt + ct,
+                "avg_ms": round(float(row["avg_ms"] or 0)),
+            }
+            total_calls += calls
+            ok_calls += ok
+            p_sum += pt
+            c_sum += ct
+        return {
+            "window_hours": window,
+            "total_calls": total_calls,
+            "ok_calls": ok_calls,
+            "failed_calls": max(0, total_calls - ok_calls),
+            "estimated_prompt_tokens": p_sum,
+            "estimated_completion_tokens": c_sum,
+            "estimated_total_tokens": p_sum + c_sum,
+            "by_phase": phases,
+        }
+
     def prune(self, days):
         with self.store.transaction():
             self.store.db.execute(
                 "DELETE FROM review_batches WHERE status NOT IN ('queued','running','pausing','paused','cancelling','interrupted') AND coalesce(json_extract(body,'$.updated'),created)<?",
                 (time.time() - days * 86400,),
             )
-            for table, column in [("console_tasks", "queued"), ("reply_usage", "created")]:
+            for table, column in [("console_tasks", "queued"), ("reply_usage", "created"), ("llm_usage_stats", "created")]:
                 self.store.db.execute("DELETE FROM " + table + " WHERE " + column + "<?", (time.time() - days * 86400,))
             self.store.db.execute("DELETE FROM reply_usage_refs WHERE receipt NOT IN (SELECT id FROM reply_usage)")

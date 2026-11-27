@@ -1,6 +1,7 @@
 import {msg,tr,setText,apply,feedback,confirmAction,getLanguage} from './series-ui.js';
-export function installWorkbench({$,api,el,button,table,details,displayValue,categories,states,snapshot,note,reload}){
+export function installWorkbench({$,api,el,button,table,details,displayValue,personaLabel,categories,states,snapshot,note,reload}){
  let libraryPage=1,libraryTotal=0,libraryEpoch=0,previewEpoch=0,detailEpoch=0;
+ const fmtPersona=p=>typeof personaLabel==='function'?personaLabel(p):String(p||'').slice(0,12);
  function refreshScopes(){for(const id of ['library-scope','preview-scope']){const node=$('#'+id),old=node.value;node.replaceChildren();const placeholder=el('option','',msg(id==='library-scope'?'全部群':'请选择群聊'));placeholder.value='';node.append(placeholder);for(const scope of snapshot().sessions||[]){const o=el('option','',scope);o.value=scope;node.append(o);}if(old&&![...node.options].some(o=>o.value===old)){const o=el('option','',old+' · '+msg('暂无资料'));o.value=old;node.append(o);}node.value=old;}}
  function invalidateScope(){libraryPage=1;++libraryEpoch;++previewEpoch;for(const id of ['library-summary','library-records','preview-output'])$('#'+id)?.replaceChildren();for(const id of ['library-prev','library-next'])$('#'+id).disabled=true;}
  function clearLibrary(){
@@ -19,9 +20,11 @@ export function installWorkbench({$,api,el,button,table,details,displayValue,cat
  async function openMaterial(identity){const epoch=++detailEpoch,dialog=$('#material-detail');$('#material-body').replaceChildren(el('p','',msg("正在加载资料…")));if(!dialog.open)dialog.showModal();try{
   const d=await api('apiPost','material_detail',identity);if(epoch!==detailEpoch||!dialog.open)return;
   const p=d.proposal,e=d.entry,subject=p||e,box=$('#material-body');box.replaceChildren();
-  box.append(el('h2','',`${categories[subject.category]||subject.category} · ${subject.key}`),el('p','scope',msg('{0} · 人格 {1}',msg('{0} · {1}',subject.scope,subject.member||msg('全群')),subject.persona)));
+  const pLine=el('p','scope',msg('{0} · 人格 {1}',msg('{0} · {1}',subject.scope,subject.member||msg('全群')),fmtPersona(subject.persona)));
+  if(subject.persona)pLine.title=subject.persona;
+  box.append(el('h2','',`${categories[subject.category]||subject.category} · ${subject.key}`),pLine);
   if(e)box.append(el('h3','',msg("当前学习项")),el('pre','',displayValue(e.value)),el('p','muted',msg('版本 {0} · {1} · {2}',e.revision,!e.active?msg('已撤回'):e.category!=='affection'&&e.expires*1000<=Date.now()?msg('已过期'):msg('启用'),e.category==='affection'?msg('长期关系'):new Date(e.expires*1000).toLocaleString(getLanguage()))));
-  if(p){box.append(el('h3','',msg("所选提案")),el('pre','',displayValue(p.value)),el('p','muted',`${states[p.state]||p.state} · ${p.archive_reason||''}`));
+  if(p){box.append(el('h3','',msg("所选提案")),el('pre','',displayValue(p.value)),el('p','muted',`${states[p.state]||p.state}${p.applied_revision?' · 修订 v'+p.applied_revision:''}${p.archive_reason?' · '+p.archive_reason:''}`));
    box.append(details(msg("原始证据"),p.evidence),details(msg("完整审查意见"),p.reviews));
    if(d.can_rollback)box.append(button(msg("回滚本次调整"),async()=>{
     if(!await confirmAction(msg("确认回滚此版本？会恢复其调整前状态，后续版本存在时将拒绝操作。")))return;
@@ -31,10 +34,22 @@ export function installWorkbench({$,api,el,button,table,details,displayValue,cat
     await reload();
     note(result.warning||msg("回滚已提交，历史版本与证据已保留。"));
    },'danger'));
-   else if(p.state==='applied')box.append(el('p','muted',msg("当前学习项已有后续版本，请先查看并处理最新版本。")));
+   else if(d.can_restore)box.append(button(msg("恢复到此历史版本"),async()=>{
+    if(!await confirmAction(msg("确认将当前学习项恢复到此历史版本？将创建新的递增版本号并完整保留审计与历史记录。")))return;
+    if(epoch!==detailEpoch||!dialog.open)return;
+    await api('apiPost','action',{id:p.id,updated:p.updated,action:'restore'});
+    if(epoch===detailEpoch&&dialog.open)await openMaterial(identity);
+    await reload();
+    note(msg("已恢复到此历史修订版本，审计与历史记录已保留。"));
+   },'primary'));
+   else if(p.state==='applied')box.append(el('p','muted',msg("当前学习项已有后续版本，可在下方版本记录中切换并一键恢复任意历史版本。")));
   }else box.append(el('p','muted',msg("历史导入资料：可查看当前值，没有本插件提案可回滚。")));
   box.append(el('h3','',msg("版本记录")));
-  for(const row of d.versions||[])box.append(button(`${states[row.state]||row.state} · ${new Date(row.created*1000).toLocaleString(getLanguage())} · ${row.id.slice(0,8)}`,()=>openMaterial({proposal_id:row.id})));
+  for(const row of d.versions||[]){
+   const tag=row.is_current?' · 当前生效':row.can_restore?' · 可恢复':'';
+   const rev=row.applied_revision?`v${row.applied_revision} · `:'';
+   box.append(button(`${rev}${states[row.state]||row.state}${tag} · ${new Date(row.created*1000).toLocaleString(getLanguage())} · ${row.id.slice(0,8)}`,()=>openMaterial({proposal_id:row.id})));
+  }
   box.append(el('h3','',msg("变更时间线")),table([msg("时间"),msg("操作"),msg("操作者")],(d.timeline||[]).map(r=>[new Date(r.created*1000).toLocaleString(getLanguage()),r.action,r.actor])),details(msg("时间线详情"),d.timeline||[]),el('h3','',msg("资料使用记录")),table([msg("时间"),msg("回合")],(d.usage||[]).map(r=>[new Date(r.created*1000).toLocaleString(getLanguage()),r.turn_id])));
   if(!d.usage?.length)box.append(el('p','muted',msg("暂无已送入模型的使用回执；这不代表模型效果结论。")));
  }catch(e){if(epoch===detailEpoch)$('#material-body').replaceChildren(el('p','',e.message));}}

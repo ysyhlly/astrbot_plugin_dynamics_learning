@@ -11,6 +11,16 @@ const categories = {expression_style:"本群表达习惯",expression_adjustment:
 const states = {pending:msg("待审查"),reviewed:msg("初审通过"),applied:msg("已应用"),rejected:msg("已拒绝"),rolled_back:msg("已回滚"),archived:msg("已归档")};
 const modes = {auto:'自动生效（无需审查）',human:'人工审查',llm:'LLM 审查通过后自动生效',llm_then_human:'LLM 初审＋人工确认'};
 const PROVIDER_SOURCES = {explicit:'显式配置',shared_light:'继承群间核心轻量模型',shared_decision:'继承群间核心决策模型',shared_reply:'继承群间核心回复模型',host_default:'回退宿主默认模型',none:'未就绪'};
+const STRUCTURED_EDIT_CATEGORIES = new Set(['affection','preference','expression_example']);
+let editUseRawJson = false;
+function personaLabel(persona){
+ const raw=String(persona||'').trim();
+ if(!raw)return '未绑定角色';
+ const labels=snapshot.persona_labels||{};
+ const mapped=labels[raw]||labels[raw.slice(0,12)];
+ if(mapped&&mapped!==raw)return mapped;
+ return raw.length>16?raw.slice(0,12):raw;
+}
 function sessionSourceMeta(){
  const src=snapshot.sessions_source||(snapshot.sessions?.length?'explicit':'empty');
  if(src==='inherited')return {code:'inherited',label:'继承自群间核心',tone:'info',detail:'当前「生效会话」留空，已自动继承群间核心（Chat Dynamics）的接管群列表。'};
@@ -178,7 +188,7 @@ function renderReviewCards(){
   if(p.state==='applied')actions.append(button(msg("回滚本次调整"),()=>act(p,'rollback'),'danger'));
   body.append(actions);c.append(body);
   const count=p.evidence_count??new Set((p.evidence||[]).map(e=>e.turn_id)).size;
-  c.append(el('p','review-meta',`${groupReview()?shortScope(p.scope)+' · '+(p.display_name||p.member||'全群')+' · 人格 '+p.persona.slice(0,12):p.member||'全群'} · ${count} 条证据 · ${p.category==='affection'?'长期保存':p.days+' 天有效'}${mode==='llm'?' · LLM 审查通过后自动生效':''}`));
+  c.append(el('p','review-meta',`${groupReview()?shortScope(p.scope)+' · '+(p.display_name||p.member||'全群')+' · 角色 '+personaLabel(p.persona):p.member||'全群'} · ${count} 条证据 · ${p.category==='affection'?'长期保存':p.days+' 天有效'}${mode==='llm'?' · LLM 审查通过后自动生效':''}`));
   if(groupReview()&&!ready&&p.blocked_reason)c.append(el('p','review-meta',p.blocked_reason));
   const detail=el('details','review-detail');detail.append(el('summary','',msg('查看依据与修改')));
   detail.append(el('p','',p.reason),el('p','scope',scopeLine(p)),el('p','muted',modes[mode]));
@@ -190,12 +200,41 @@ function renderReviewCards(){
   const secondary=el('div','actions');
   if(pending){
    if(p.mode!=='auto'&&(p.mode!=='human'||mode!=='human'))secondary.append(button(msg("LLM 审查"),async()=>{await api('apiPost','review',{id:p.id});note('审查任务已开始，完成后刷新查看结果。');}));
-   actions.append(button(msg("修改提案"),()=>{editing=p;$('#edit-value').value=p.category==='affection'?JSON.stringify({experience_delta:p.value.experience_delta,tone:p.value.tone??0},null,2):(typeof p.value==='object'?JSON.stringify(p.value,null,2):p.value);$('#edit-reason').value='';$('#edit').showModal();}));
+   actions.append(button(msg("修改提案"),()=>openEditDialog(p)));
   }
   detail.append(secondary);c.append(detail);cards.append(c);
  }
  if(!cards.children.length){const empty=el('div','review-empty');empty.append(el('strong','',reviewView==='ready'?(groupReview()?'当前筛选没有可批准的调整':'本页没有需要确认的调整'):'没有匹配的记录'),el('p','muted',reviewView==='ready'?(groupReview()?'已查询所选范围的全部待审内容，可切换全部待审或调整筛选。':'自动审查和自动生效的内容无需手动批准。可切换到本页全部，或继续查看下一页、下一组。'):'尝试清空搜索或筛选条件。'));cards.append(empty);}
+ renderRecentApplied();
  selectionStatus();
+}
+function renderRecentApplied(){
+ const panel=$('#recent-applied-panel'),list=$('#recent-applied-list');
+ if(!panel||!list)return;
+ const rows=(snapshot.recent_applied||[]).filter(p=>!reviewGroupKey||p.scope===reviewGroupKey);
+ list.replaceChildren();
+ if(!rows.length){
+  list.append(el('p','muted','当前范围内暂无近期已应用记录。可在「资料版本中心」查看全部历史版本。'));
+  return;
+ }
+ for(const p of rows){
+  const row=el('div','recent-applied-row');
+  const info=el('div','recent-applied-info');
+  info.append(
+   el('strong','',`${categories[p.category]||p.category} · ${p.key}`),
+   el('p','review-meta',`${shortScope(p.scope)} · ${p.member||'全群'} · 角色 ${personaLabel(p.persona)}${p.applied_revision?' · 修订 v'+p.applied_revision:''} · ${p.applied_at?formatDate(p.applied_at):''}`)
+  );
+  const acts=el('div','recent-applied-actions');
+  acts.append(
+   button('版本历史与恢复',()=>workbench?.openMaterial({proposal_id:p.id})),
+   button('回滚本次调整',async()=>{
+    if(!await window.DynamicsUI.confirm('确认回滚此条已应用记录？会恢复至调整前状态并保留审计记录。',{danger:true}))return;
+    await act(p,'rollback');
+   },'danger')
+  );
+  row.append(info,acts);
+  list.append(row);
+ }
 }
 
 const displayValue=v=>{
@@ -211,7 +250,7 @@ const note = (value,state='info') => {feedback($('#notice'),value,state);};
 async function api(method,path,body){const bridge=(window.DynamicsPanelBridge || window.AstrBotPluginPage);if(!bridge)throw Error('请从 AstrBot 插件详情打开此页面。');const r=await bridge[method](path,body||{});if(r.status==='error'||r.ok===false)throw Error(r.message||r.error||'请求失败');return r.data??r;}
 function button(label,fn,cls=''){const b=el('button',cls,label);b.type='button';b.addEventListener('click',async()=>{if(b.disabled)return;b.disabled=true;b.setAttribute('aria-busy','true');try{await fn();}catch(e){note(e.message,'error');}finally{b.disabled=false;b.removeAttribute('aria-busy');}});return b;}
 function details(label,value){const d=el('details');d.append(el('summary','',label),el('pre','',typeof value==='string'?value:JSON.stringify(value,null,2)));return d;}
-function scopeLine(p){return `${p.scope} · 人格 ${p.persona.slice(0,12)} · ${p.member?'成员 '+p.member:'当前会话'}`;}
+function scopeLine(p){return `${p.scope} · 角色 ${personaLabel(p.persona)} · ${p.member?'成员 '+p.member:'当前会话'}`;}
 function evidenceBody(evidence){
  const box=el('div','series-evidence');
  const rows=Array.isArray(evidence)?evidence:[];
@@ -286,10 +325,11 @@ function render(){
  const srcBanner=el('div','scope-source-banner');
  srcBanner.append(el('span','scope-source-pill tone-'+srcMeta.tone,srcMeta.label),el('span','muted',srcMeta.detail));
  scopeList.append(srcBanner);
- for(const s of snapshot.sessions){const c=el('article','card');c.append(el('h3','',s));for(const batch of snapshot.batches.filter(b=>b.scope===s)){const a=el('div','actions');a.append(el('span','muted',`人格 ${batch.persona.slice(0,12)} · ${batch.count} 个待分析回合`),button(msg("现在分析"),async()=>{await api('apiPost','analyze',{scope:s,persona:batch.persona});note('分析任务已开始，完成后刷新查看提案。');}));c.append(a);}c.append(button(msg("删除此会话学习数据"),async()=>{const confirmation=await window.DynamicsUI.prompt(msg('将删除此会话的事件、提案和学习内容。请输入完整会话标识确认：'),{danger:true});if(confirmation!==s)return;await api('apiPost','purge',{scope:s,confirm_scope:confirmation});await load();},'danger'));scopeList.append(c);}
+ for(const s of snapshot.sessions){const c=el('article','card');c.append(el('h3','',s));for(const batch of snapshot.batches.filter(b=>b.scope===s)){const a=el('div','actions');a.append(el('span','muted',`角色 ${personaLabel(batch.persona)} · ${batch.count} 个待分析回合`),button(msg("现在分析"),async()=>{await api('apiPost','analyze',{scope:s,persona:batch.persona});note('分析任务已开始，完成后刷新查看提案。');}));c.append(a);}c.append(button(msg("删除此会话学习数据"),async()=>{const confirmation=await window.DynamicsUI.prompt(msg('将删除此会话的事件、提案和学习内容。请输入完整会话标识确认：'),{danger:true});if(confirmation!==s)return;await api('apiPost','purge',{scope:s,confirm_scope:confirmation});await load();},'danger'));scopeList.append(c);}
  selectionStatus();
  if(!snapshot.sessions.length)scopeList.append(el('div','empty','当前暂无生效会话。留空「生效会话」将自动继承群间核心（Chat Dynamics）的接管群；或在插件配置中填写完整 UMO 作为显式白名单。'));
- $('#modes').replaceChildren(...Object.entries(snapshot.review_modes).map(([k,v])=>el('p','muted',`${categories[k]}：${modes[v]}`)));
+ renderPresets();
+ renderModesEditor();
  renderHome();fillScope('#entries-scope',true);fillScope('#usage-scope');
  const selectedProfile=$('#profile-scope').value;$('#profile-scope').replaceChildren(...snapshot.sessions.filter(s=>s.includes(':GroupMessage:')).map(s=>{const o=el('option','',s);o.value=s;return o;}));if(snapshot.sessions.includes(selectedProfile))$('#profile-scope').value=selectedProfile;
  const historyScope=$('#history-scope').value;$('#history-scope').replaceChildren(...snapshot.sessions.map(s=>{const o=el('option','',s);o.value=s;return o;}));if(snapshot.sessions.includes(historyScope))$('#history-scope').value=historyScope;
@@ -366,16 +406,176 @@ async function load(){
   note(snapshot.last_error?'最近任务：'+snapshot.last_error:snapshot.jobs.length?'正在处理：'+snapshot.jobs.length+' 个任务':`已连接 · 丢弃事件 ${snapshot.dropped} · 无效事件 ${snapshot.invalid}`);
  }catch(e){note(e.message,'error');}
 }
+function renderPresets(){
+ const box=$('#preset-list');
+ if(!box)return;
+ box.replaceChildren();
+ const list=snapshot.presets||[];
+ const active=snapshot.active_preset||'';
+ for(const preset of list){
+  const isCurrent=active===preset.id;
+  const card=el('article','preset-card'+(isCurrent?' is-active':''));
+  const head=el('div','preset-card-head');
+  head.append(el('strong','',preset.label));
+  if(isCurrent)head.append(el('span','badge','当前生效'));
+  card.append(head,el('p','',preset.summary));
+  card.append(button(isCurrent?'重新应用预设':'一键应用预设',async()=>{
+   if(!await window.DynamicsUI.confirm(`确认切换至「${preset.label}」运营预设？将更新分析频率与各类别审查方式并保存配置。`))return;
+   await api('apiPost','governance_action',{action:'apply_preset',preset:preset.id});
+   await load();
+   note(`已切换至「${preset.label}」运营预设。`);
+  },isCurrent?'':'primary'));
+  box.append(card);
+ }
+}
+function renderModesEditor(){
+ const box=$('#modes');
+ if(!box)return;
+ box.replaceChildren();
+ const allowedMap=snapshot.allowed_modes||{};
+ for(const [cat,curMode] of Object.entries(snapshot.review_modes||{})){
+  const row=el('label','mode-row');
+  row.append(el('span','',categories[cat]||cat));
+  const sel=el('select');
+  sel.dataset.modeCategory=cat;
+  sel.setAttribute('aria-label',`${categories[cat]||cat}审查方式`);
+  const opts=allowedMap[cat]||Object.keys(modes);
+  for(const m of opts){
+   const o=el('option','',modes[m]||m);
+   o.value=m;
+   sel.append(o);
+  }
+  sel.value=curMode;
+  row.append(sel);
+  box.append(row);
+ }
+}
+if($('#save-modes'))$('#save-modes').onclick=async()=>{
+ const btn=$('#save-modes');
+ if(btn.disabled)return;
+ btn.disabled=true;
+ try{
+  const review_modes={};
+  for(const sel of document.querySelectorAll('#modes select[data-mode-category]'))review_modes[sel.dataset.modeCategory]=sel.value;
+  await api('apiPost','governance_action',{action:'update_review_modes',review_modes});
+  await load();
+  note('审查方式已保存生效。');
+ }catch(e){note(e.message,'error');}
+ finally{btn.disabled=false;}
+};
+function structuredEditInitial(p){
+ const v=p?.value||{};
+ if(p.category==='affection')return {experience_delta:String(v.experience_delta??0),tone:Number(v.tone??0)};
+ if(p.category==='preference')return {topic:String(v.topic||''),stance:String(v.stance||'like'),condition:String(v.condition||''),quote:String(v.quote||''),source_id:String(v.source_id||'')};
+ if(p.category==='expression_example')return {...v};
+ return v;
+}
+function renderStructuredEditForm(p,val){
+ const box=$('#edit-structured');
+ box.replaceChildren();
+ if(p.category==='affection'){
+  const lDelta=el('label','');lDelta.append(el('span','','经验变化 (-20 至 20)'));
+  const iDelta=el('input');iDelta.type='number';iDelta.step='0.5';iDelta.min='-20';iDelta.max='20';iDelta.dataset.field='experience_delta';iDelta.value=val.experience_delta??0;
+  lDelta.append(iDelta);
+  const lTone=el('label','');lTone.append(el('span','','短期语气 (-1 至 1)'));
+  const iTone=el('input');iTone.type='number';iTone.step='0.1';iTone.min='-1';iTone.max='1';iTone.dataset.field='tone';iTone.value=val.tone??0;
+  lTone.append(iTone);
+  box.append(lDelta,lTone);
+ }else if(p.category==='preference'){
+  const lStance=el('label','');lStance.append(el('span','','立场'));
+  const sStance=el('select');sStance.dataset.field='stance';
+  for(const [k,t] of [['like','喜欢 (like)'],['dislike','反感 (dislike)'],['boundary','交流边界 (boundary)']]){const o=el('option','',t);o.value=k;sStance.append(o);}
+  sStance.value=val.stance||'like';lStance.append(sStance);
+  const lTopic=el('label','');lTopic.append(el('span','','具体对象 (topic)'));
+  const iTopic=el('input');iTopic.type='text';iTopic.maxLength=80;iTopic.dataset.field='topic';iTopic.value=val.topic||'';lTopic.append(iTopic);
+  const lCond=el('label','edit-field-wide');lCond.append(el('span','','适用条件（可选）'));
+  const iCond=el('input');iCond.type='text';iCond.maxLength=160;iCond.dataset.field='condition';iCond.value=val.condition||'';lCond.append(iCond);
+  const lQuote=el('label','edit-field-wide');lQuote.append(el('span','','成员连续原话（须与原消息一致）'));
+  const iQuote=el('textarea');iQuote.rows=2;iQuote.maxLength=400;iQuote.dataset.field='quote';iQuote.value=val.quote||'';lQuote.append(iQuote);
+  const lSrc=el('label','edit-field-wide');lSrc.append(el('span','','原话事件 ID（自动保留）'));
+  const iSrc=el('input');iSrc.type='text';iSrc.readOnly=true;iSrc.dataset.field='source_id';iSrc.value=val.source_id||'';lSrc.append(iSrc);
+  box.append(lStance,lTopic,lCond,lQuote,lSrc);
+ }else if(p.category==='expression_example'){
+  const info=el('p','muted edit-field-wide','原话样例须严格对应真实来源消息，禁止编造或改写原话；如需核对底层字段可切换至高级 JSON。');
+  const lSit=el('label','edit-field-wide');lSit.append(el('span','','触发场景 (situation)'));
+  const iSit=el('textarea');iSit.rows=2;iSit.readOnly=true;iSit.dataset.field='situation';iSit.value=val.situation||'';lSit.append(iSit);
+  const lExp=el('label','edit-field-wide');lExp.append(el('span','','成员原话 (expression)'));
+  const iExp=el('textarea');iExp.rows=2;iExp.readOnly=true;iExp.dataset.field='expression';iExp.value=val.expression||'';lExp.append(iExp);
+  box.append(info,lSit,lExp);
+ }
+}
+function readStructuredEditValue(p){
+ const box=$('#edit-structured');
+ if(p.category==='affection'){
+  const deltaStr=String(box.querySelector('[data-field="experience_delta"]')?.value??'').trim();
+  const toneNum=Number(box.querySelector('[data-field="tone"]')?.value??0);
+  if(!deltaStr||!Number.isFinite(Number(deltaStr)))throw Error('请填写有效的经验变化数值');
+  if(!Number.isFinite(toneNum)||toneNum<-1||toneNum>1)throw Error('短期语气须在 -1 至 1 之间');
+  return {experience_delta:deltaStr,tone:toneNum};
+ }
+ if(p.category==='preference'){
+  const topic=String(box.querySelector('[data-field="topic"]')?.value||'').trim();
+  const stance=String(box.querySelector('[data-field="stance"]')?.value||'like').trim();
+  const condition=String(box.querySelector('[data-field="condition"]')?.value||'').trim();
+  const quote=String(box.querySelector('[data-field="quote"]')?.value||'').trim();
+  const source_id=String(box.querySelector('[data-field="source_id"]')?.value||'').trim();
+  if(!topic||!quote)throw Error('对象主题与原话不能为空');
+  return {topic,stance,condition,quote,source_id};
+ }
+ return structuredEditInitial(p);
+}
+function syncEditVisibility(p){
+ const isStructured=!p?.manual_jargon&&STRUCTURED_EDIT_CATEGORIES.has(p?.category);
+ const showForm=isStructured&&!editUseRawJson;
+ $('#edit-structured').hidden=!showForm;
+ $('#edit-raw-wrap').hidden=showForm;
+ $('#edit-mode-toggle').hidden=!isStructured;
+ $('#edit-mode-toggle').textContent=showForm?'切换到高级 JSON':'返回可视化表单';
+ $('#edit-mode-hint').textContent=isStructured?(showForm?'可视化表单模式：自动校验字段，无需手写 JSON。':'高级 JSON 模式：可直接编辑原始结构。'):'';
+}
+function openEditDialog(p){
+ editing=p;
+ editUseRawJson=false;
+ const isStructured=!p.manual_jargon&&STRUCTURED_EDIT_CATEGORIES.has(p.category);
+ const initObj=isStructured?structuredEditInitial(p):p.value;
+ $('#edit-value').value=typeof initObj==='object'?JSON.stringify(initObj,null,2):String(initObj??'');
+ if(isStructured)renderStructuredEditForm(p,initObj);
+ syncEditVisibility(p);
+ $('#edit-reason').value='';
+ $('#edit').showModal();
+}
+if($('#edit-mode-toggle'))$('#edit-mode-toggle').onclick=()=>{
+ if(!editing||!STRUCTURED_EDIT_CATEGORIES.has(editing.category))return;
+ try{
+  if(!editUseRawJson){
+   const cur=readStructuredEditValue(editing);
+   $('#edit-value').value=JSON.stringify(cur,null,2);
+   editUseRawJson=true;
+  }else{
+   const parsed=JSON.parse($('#edit-value').value);
+   renderStructuredEditForm(editing,parsed);
+   editUseRawJson=false;
+  }
+  syncEditVisibility(editing);
+ }catch(e){note('JSON 格式有误：'+e.message,'error');}
+};
 async function act(p,action){await api('apiPost','action',{id:p.id,action,updated:p.updated});await load();}
 $('#save-edit').onclick=async()=>{
  const save=$('#save-edit'),draft=editing;
  if(save.disabled||!draft)return;
  save.disabled=true;
  try{
-  let value=$('#edit-value').value;
-  if(draft.category==='participation')value=Number(value);
-  if(typeof draft.value==='object')value=JSON.parse(value);
+  let value;
+  const isStructured=!draft.manual_jargon&&STRUCTURED_EDIT_CATEGORIES.has(draft.category);
+  if(isStructured&&!editUseRawJson){
+   value=readStructuredEditValue(draft);
+  }else{
+   value=$('#edit-value').value;
+   if(draft.category==='participation')value=Number(value);
+   if(typeof draft.value==='object')value=JSON.parse(value);
+  }
   const reason=$('#edit-reason').value;
+  if(!String(reason||'').trim())throw Error('请填写修改理由');
   if(draft.manual_jargon)await api('apiPost','jargon_propose',{id:draft.id,revision:draft.revision,value,reason});
   else await api('apiPost','amend',{id:draft.id,updated:draft.updated,value,reason});
   if(editing===draft)$('#edit').close();
@@ -386,7 +586,7 @@ $('#save-edit').onclick=async()=>{
 $('#state').onchange=$('#review-category').onchange=$('#review-reason').onchange=updateReviewFilters;$('#refresh').onclick=load;
 for(const b of document.querySelectorAll('[data-tab]'))b.onclick=()=>activate(b.dataset.tab);
 function table(headers,rows){const wrapper=el('div','table-scroll');wrapper.tabIndex=0;wrapper.setAttribute('role','region');wrapper.setAttribute('aria-label',headers.join(' / '));const t=el('table');const head=el('tr');for(const label of headers)head.append(el('th','',label));t.append(head);for(const row of rows){const r=el('tr');for(const value of row){const td=el('td');if(value instanceof Node)td.append(value);else td.textContent=String(value??'');r.append(td);}t.append(r);}wrapper.append(t);return wrapper;}
-function renderJargon(){const text=$('#jargon-search').value.toLowerCase();const rows=(socialSnapshot?.jargon||[]).filter(e=>(e.key+' '+e.value).toLowerCase().includes(text));$('#jargon-table').replaceChildren(table(['词语','含义','来源','维护'],rows.map(e=>[e.key,e.value,e.imported?'历史已确认词条':'审查后学习',button(msg("纠正含义"),()=>{editing={...e,manual_jargon:true};$('#edit-value').value=e.value;$('#edit-reason').value='';$('#edit').showModal();})])));}
+function renderJargon(){const text=$('#jargon-search').value.toLowerCase();const rows=(socialSnapshot?.jargon||[]).filter(e=>(e.key+' '+e.value).toLowerCase().includes(text));$('#jargon-table').replaceChildren(table(['词语','含义','来源','维护'],rows.map(e=>[e.key,e.value,e.imported?'历史已确认词条':'审查后学习',button(msg("纠正含义"),()=>openEditDialog({...e,manual_jargon:true}))])));}
 function renderSocial(){const d=socialSnapshot,g=d.graph;$('#social-stats').replaceChildren(...[['观察成员',g.total_members??Object.keys(g.users).length],['近期活跃',g.active_member_count],['有效关系',g.relation_count],['互动圈',d.circle_count??d.circles.length]].map(([label,value])=>{const e=el('div','stat');e.append(el('strong','',value),el('span','',label));return e;}));
  network?.setData(g);
  $('#social-explanations').replaceChildren(details('群聊分布与统计说明',d.explanations));
@@ -681,6 +881,21 @@ function renderHome() {
    formatTime(task.queued)+' · '+recovery,
   ];
  });
+ const llmBox=$('#llm-usage-box');
+ if(llmBox){
+  const u=snapshot.llm_usage||{};
+  const byPhase=u.by_phase||{};
+  const sumBar=el('div','llm-usage-summary');
+  sumBar.append(
+   el('span','',`总调用 ${u.total_calls||0} 次（成功 ${u.ok_calls||0} / 失败 ${u.failed_calls||0}）`),
+   el('span','',`估算总 Token ${Number(u.estimated_total_tokens||0).toLocaleString()}（输入 ${Number(u.estimated_prompt_tokens||0).toLocaleString()} / 输出 ${Number(u.estimated_completion_tokens||0).toLocaleString()}）`)
+  );
+  const phaseRows=[['analysis','分析阶段'],['review','审查阶段'],['maintenance','维护阶段']].map(([key,label])=>{
+   const row=byPhase[key]||{};
+   return [label,`${row.calls||0}（成功 ${row.ok||0} / 失败 ${row.failed||0}）`,Number(row.prompt_tokens||0).toLocaleString(),Number(row.completion_tokens||0).toLocaleString(),Number(row.total_tokens||0).toLocaleString(),row.avg_ms?`${(row.avg_ms/1000).toFixed(2)}s`:'—'];
+  });
+  llmBox.replaceChildren(sumBar,table(['阶段','调用次数','估算输入 Token','估算输出 Token','合计 Token','平均耗时'],phaseRows));
+ }
  $('#task-list').replaceChildren(table(['阶段 / 群','状态','排队 / 执行','时间与恢复'].map(key=>msg(key)),tasks));
 }
 window.addEventListener('series-languagechange',()=>{
@@ -700,7 +915,8 @@ function clearEntries(){
 }
 $('#entries-load').onclick=()=>{entryPage=1;loadEntries();};$('#entries-prev').onclick=()=>{if(entryPage>1){entryPage--;loadEntries();}};$('#entries-next').onclick=()=>{if(entryPage*25<entryTotal){entryPage++;loadEntries();}};
 function affectionVersion(entry){
- const version=el('span','',entry.persona.slice(0,12));
+ const version=el('span','',personaLabel(entry.persona));
+ if(entry.persona)version.title=entry.persona;
  if(entry.affection_current===true){
   version.append(' · ',el('span','',msg(entry.affection_selection==='current_persona'?'当前人设':'最近记录')));
  }else if(entry.affection_current===false){
@@ -865,6 +1081,6 @@ document.addEventListener('keydown',ev=>{
  else if(key==='r'&&currentCard){const card=currentCard;const btn=card?.querySelector('[data-quick-action="reject"]');if(btn&&!btn.disabled){ev.preventDefault();btn.click();}}
  else if(key==='h'){const card=items[Math.max(0,focusedReviewIndex)];const det=card?.querySelector('details.review-detail');if(det){ev.preventDefault();det.open=!det.open;const src=card.querySelector('details.series-source-jump');if(det.open&&src)src.open=true;}}
 });
-workbench=installWorkbench({$,api,el,button,table,details,displayValue,categories,states,snapshot:()=>snapshot,note,reload:load});
+workbench=installWorkbench({$,api,el,button,table,details,displayValue,personaLabel,categories,states,snapshot:()=>snapshot,note,reload:load});
 
 

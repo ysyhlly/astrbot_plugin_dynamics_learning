@@ -1,82 +1,77 @@
 {
   "enabled": {
-    "description": "启用群间学习",
+    "description": "【基础】启用群间学习",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "关闭后停止采集、分析与注入，已保存学习资料保留。"
   },
   "sessions": {
-    "description": "生效会话",
+    "description": "【基础】生效会话",
     "type": "list",
     "default": [],
     "hint": "填写完整 UMO（含平台实例和群聊/私聊类型）。留空时自动继承群间核心（Chat Dynamics）的接管群列表；填写后作为显式白名单覆盖继承。若未安装群间核心且留空，则不采集、不注入。"
   },
   "analysis_provider": {
-    "description": "分析模型",
+    "description": "【基础】分析模型",
     "type": "string",
     "default": "",
     "_special": "select_provider",
     "hint": "普通聊天模型，用于生成调整提案；不选择 Jev 抉择模型。留空时自动回退继承群间核心共享模型（优先轻量分析模型，其次回复模型），未安装群间核心时回退宿主默认聊天模型。"
   },
   "review_provider": {
-    "description": "审查模型",
+    "description": "【基础】审查模型",
     "type": "string",
     "default": "",
     "_special": "select_provider",
     "hint": "用于独立审查提案，可与分析模型不同。留空时自动回退继承群间核心共享模型（优先轻量分析模型，其次非 Jev 决策模型或回复模型），未安装群间核心时回退宿主默认聊天模型；仅当全部回退均不可用时等待，不自动批准。"
   },
+  "auto_analyze": {
+    "description": "【调度】自动生成提案",
+    "type": "bool",
+    "default": true
+  },
+  "analysis_interval": {
+    "description": "【调度】分析检查间隔（秒）",
+    "type": "int",
+    "default": 600
+  },
+  "batch_events": {
+    "description": "【调度】新增回合达到多少条后分析",
+    "type": "int",
+    "default": 20,
+    "hint": "同一回合的多次回调先合并再计数；少量消息等待一个检查间隔后也会处理。"
+  },
+  "analysis_max_rounds_per_cycle": {
+    "description": "【调度】单周期最大分析轮数",
+    "type": "int",
+    "default": 2,
+    "hint": "每个维护周期最多连续执行的分析轮数；精简输入后单轮可处理约 40+ 回合，默认 2 轮兼顾吞吐与缓存效率。"
+  },
   "automatic_review_batch_enabled": {
-    "description": "合并兼容提案的自动初审",
+    "description": "【调度】合并兼容提案的自动初审",
     "type": "bool",
     "default": true,
     "hint": "同一会话、角色、成员和审查策略下，最多合并四条；最早待审提案最多等待五分钟。人工发起的审查和纠正立即处理。"
   },
   "automatic_review_coalesce_seconds": {
-    "description": "自动审查短合批窗口（秒）",
+    "description": "【调度】自动审查短合批窗口（秒）",
     "type": "float",
     "default": 15.0,
     "hint": "短时间连续到达的非紧急待审提案等待此窗口合批发送；达到单批上限或紧急提案立即处理，设为 0 关闭短窗等待。"
   },
-  "auto_analyze": {
-    "description": "自动生成提案",
-    "type": "bool",
-    "default": true
-  },
-  "analysis_interval": {
-    "description": "分析检查间隔（秒）",
-    "type": "int",
-    "default": 600
-  },
-  "analysis_max_rounds_per_cycle": {
-    "description": "单周期最大分析轮数",
-    "type": "int",
-    "default": 2,
-    "hint": "每个维护周期最多连续执行的分析轮数；精简输入后单轮可处理约 40+ 回合，默认 2 轮兼顾吞吐与缓存效率。"
-  },
-  "batch_events": {
-    "description": "新增回合达到多少条后分析",
-    "type": "int",
-    "default": 20,
-    "hint": "同一回合的多次回调先合并再计数；少量消息等待一个检查间隔后也会处理。"
-  },
-  "retention_days": {
-    "description": "原始事件保留天数",
-    "type": "int",
-    "default": 30,
-    "hint": "提案引用证据保留至删除会话学习数据。"
-  },
   "model_timeout": {
-    "description": "模型超时（秒）",
+    "description": "【模型】模型超时（秒）",
     "type": "int",
     "default": 60
   },
   "model_max_tokens": {
-    "description": "可选输出 Token 上限",
+    "description": "【模型】可选输出 Token 上限",
     "type": "int",
     "default": 0,
     "hint": "0 表示自动按任务分层上限（单条审查 768、批量审查/分析 1536）；非零时单条审查最低按 512、批量/分析最低按 1024 保护，仅在提供方支持该参数时透传。"
   },
   "model_reasoning_effort": {
-    "description": "可选思考强度透传",
+    "description": "【模型】可选思考强度透传",
     "type": "string",
     "default": "low",
     "options": [
@@ -90,7 +85,40 @@
     "hint": "默认 low 以抑制结构化 JSON 分类任务的冗长思考输出；留空表示沿用模型默认配置；仅在提供方支持 reasoning_effort 或 extra_body 时透传。"
   },
   "style_review": {
-    "description": "群友表达方式审查方式",
+    "description": "【审查】群友表达方式审查方式",
+    "type": "string",
+    "default": "llm",
+    "options": [
+      "human",
+      "llm",
+      "llm_then_human"
+    ],
+    "hint": "默认LLM审查通过后自动生效，无需人工确认；拒绝或暂缓的资料不生效。可改为人工或LLM初审＋人工确认。"
+  },
+  "typing_habit_review": {
+    "description": "【审查】群友打字习惯审查方式",
+    "type": "string",
+    "default": "llm",
+    "options": [
+      "human",
+      "llm",
+      "llm_then_human"
+    ],
+    "hint": "默认LLM审查通过后自动生效，无需人工确认；拒绝或暂缓的资料不生效。可改为人工或LLM初审＋人工确认。"
+  },
+  "preference_review": {
+    "description": "【审查】群友喜恶审查方式",
+    "type": "string",
+    "default": "llm",
+    "options": [
+      "human",
+      "llm",
+      "llm_then_human"
+    ],
+    "hint": "默认LLM审查通过后自动生效，无需人工确认；拒绝或暂缓的资料不生效。可改为人工或LLM初审＋人工确认。"
+  },
+  "expression_example_review": {
+    "description": "【审查】原话样例审查方式",
     "type": "string",
     "default": "llm",
     "options": [
@@ -101,7 +129,7 @@
     "hint": "默认LLM审查通过后自动生效，无需人工确认；拒绝或暂缓的资料不生效。可改为人工或LLM初审＋人工确认。"
   },
   "jargon_review": {
-    "description": "群聊黑话审查方式",
+    "description": "【审查】群聊黑话审查方式",
     "type": "string",
     "default": "llm_then_human",
     "options": [
@@ -112,7 +140,7 @@
     "hint": "human：人工；llm：LLM 审查通过后自动应用；llm_then_human：LLM 初审后由人工确认。"
   },
   "relationship_review": {
-    "description": "社交关系审查方式",
+    "description": "【审查】社交关系审查方式",
     "type": "string",
     "default": "llm_then_human",
     "options": [
@@ -123,7 +151,7 @@
     "hint": "human：人工；llm：LLM 审查通过后自动应用；llm_then_human：LLM 初审后由人工确认。"
   },
   "state_review": {
-    "description": "短期状态审查方式",
+    "description": "【审查】短期状态审查方式",
     "type": "string",
     "default": "llm_then_human",
     "options": [
@@ -134,7 +162,7 @@
     "hint": "human：人工；llm：LLM 审查通过后自动应用；llm_then_human：LLM 初审后由人工确认。"
   },
   "decision_guidance_review": {
-    "description": "决策指导审查方式",
+    "description": "【审查】决策指导审查方式",
     "type": "string",
     "default": "llm_then_human",
     "options": [
@@ -145,7 +173,7 @@
     "hint": "human：人工；llm：LLM 审查通过后自动应用；llm_then_human：LLM 初审后由人工确认。"
   },
   "participation_review": {
-    "description": "接话阈值审查方式",
+    "description": "【审查】接话阈值审查方式",
     "type": "string",
     "default": "llm_then_human",
     "options": [
@@ -155,30 +183,14 @@
     ],
     "hint": "human：人工；llm：LLM 审查通过后自动应用；llm_then_human：LLM 初审后由人工确认。"
   },
-  "jargon_enabled": {
-    "description": "启用黑话词库与按需解释",
-    "type": "bool",
-    "default": true
-  },
   "affection_enabled": {
-    "description": "启用数值好感度",
+    "description": "【好感与社交】启用数值好感度",
     "type": "bool",
     "default": true,
     "hint": "沿用无上限经验曲线；100为参照，好感变化按审查方式批准。"
   },
-  "group_relations_enabled": {
-    "description": "启用群友互动分布与关系分析",
-    "type": "bool",
-    "default": true
-  },
-  "shared_sentiment_enabled": {
-    "description": "复用已运行的共享情感模型",
-    "type": "bool",
-    "default": false,
-    "hint": "可选，不安装模型；未开启时沿用规则证据。"
-  },
   "affection_review": {
-    "description": "好感度变化生效方式",
+    "description": "【好感与社交】好感度变化生效方式",
     "type": "string",
     "default": "auto",
     "options": [
@@ -190,207 +202,268 @@
     "hint": "auto：无需LLM或人工审查，分析得到增减后自动生效；仍保留来源校验、重复证据去重、角色隔离、单日上限与突变复审、变化记录和回滚。"
   },
   "affection_auto_review_threshold": {
-    "description": "自动好感突变复审阈值",
+    "description": "【好感与社交】自动好感突变复审阈值",
     "type": "int",
     "default": 10,
     "hint": "affection_review=auto 时，单次经验变化绝对值达到或超过该阈值将自动转入 LLM+人工复审（范围 1-20）。"
   },
   "affection_auto_daily_limit": {
-    "description": "自动好感单成员每日累计变化上限",
+    "description": "【好感与社交】自动好感单成员每日累计变化上限",
     "type": "int",
     "default": 25,
     "hint": "affection_review=auto 时，单成员 24 小时内累计经验变动绝对值超出上限的提案将自动转入 LLM+人工复审（范围 1-100）。"
   },
-  "relation_window_days": {
-    "description": "群关系：观察窗口（天）",
+  "jargon_enabled": {
+    "description": "【好感与社交】启用黑话词库与按需解释",
+    "type": "bool",
+    "default": true
+  },
+  "group_relations_enabled": {
+    "description": "【好感与社交】启用群友互动分布与关系分析",
+    "type": "bool",
+    "default": true
+  },
+  "shared_sentiment_enabled": {
+    "description": "【好感与社交】复用已运行的共享情感模型",
+    "type": "bool",
+    "default": false,
+    "hint": "可选，不安装模型；未开启时沿用规则证据。"
+  },
+  "member_correction_daily_limit": {
+    "description": "【好感与社交】群友自助纠偏每日上限",
     "type": "int",
-    "default": 30
-  },
-  "relation_growth_scale": {
-    "description": "群关系：互动增长尺度",
-    "type": "int",
-    "default": 120
-  },
-  "relation_pair_daily_budget": {
-    "description": "群关系：每对成员每日证据预算",
-    "type": "int",
-    "default": 80
-  },
-  "relation_activity_daily_cap": {
-    "description": "群关系：活跃度每日计分消息数",
-    "type": "int",
-    "default": 80
-  },
-  "relation_context_window_seconds": {
-    "description": "群关系：上下文窗口（秒）",
-    "type": "int",
-    "default": 300
-  },
-  "relation_max_recent": {
-    "description": "群关系：上下文消息条数",
-    "type": "int",
-    "default": 80
-  },
-  "relation_pair_base_weight": {
-    "description": "群关系：同场互动权重",
-    "type": "int",
-    "default": 1
-  },
-  "relation_mention_weight": {
-    "description": "群关系：提及权重",
-    "type": "int",
-    "default": 5
-  },
-  "relation_same_topic_weight": {
-    "description": "群关系：同话题权重",
-    "type": "float",
-    "default": 0.8
-  },
-  "relation_reply_weight": {
-    "description": "群关系：引用回复权重",
-    "type": "int",
-    "default": 8
-  },
-  "relation_at_weight": {
-    "description": "群关系：直接提及权重",
-    "type": "int",
-    "default": 5
-  },
-  "relation_adjacency_weight": {
-    "description": "群关系：相邻接话权重",
-    "type": "float",
-    "default": 1.5
-  },
-  "relation_adjacency_window_seconds": {
-    "description": "群关系：相邻接话窗口（秒）",
-    "type": "int",
-    "default": 90
-  },
-  "relation_ambient_tone_scale": {
-    "description": "群关系：环境语气权重",
-    "type": "float",
-    "default": 0.15
-  },
-  "relation_daily_decay": {
-    "description": "群关系：每日关系衰减系数",
-    "type": "float",
-    "default": 0.985
-  },
-  "typing_habit_review": {
-    "description": "群友打字习惯审查方式",
-    "type": "string",
-    "default": "llm",
-    "options": [
-      "human",
-      "llm",
-      "llm_then_human"
-    ],
-    "hint": "默认LLM审查通过后自动生效，无需人工确认；拒绝或暂缓的资料不生效。可改为人工或LLM初审＋人工确认。"
-  },
-  "preference_review": {
-    "description": "群友喜恶审查方式",
-    "type": "string",
-    "default": "llm",
-    "options": [
-      "human",
-      "llm",
-      "llm_then_human"
-    ],
-    "hint": "默认LLM审查通过后自动生效，无需人工确认；拒绝或暂缓的资料不生效。可改为人工或LLM初审＋人工确认。"
-  },
-  "expression_example_review": {
-    "description": "原话样例审查方式",
-    "type": "string",
-    "default": "llm",
-    "options": [
-      "human",
-      "llm",
-      "llm_then_human"
-    ],
-    "hint": "默认LLM审查通过后自动生效，无需人工确认；拒绝或暂缓的资料不生效。可改为人工或LLM初审＋人工确认。"
+    "default": 10,
+    "hint": "熟人小群宽松模式：每人每天可通过「/纠正黑话」「/习惯纠偏」提交的待审提案上限（默认 10 次，范围 1-50）。"
   },
   "replace_selflearning": {
-    "description": "接管原生社交与学习接口",
+    "description": "【协同与私聊】接管原生社交与学习接口",
     "type": "bool",
     "default": false,
     "hint": "完成历史迁移并停用旧SelfLearning后开启；旧插件仍运行时不声明接管，避免两个状态源。"
   },
   "private_shared_group_sources": {
-    "description": "私聊可读取的群资料来源",
+    "description": "【协同与私聊】私聊可读取的群资料来源",
     "type": "list",
     "default": [],
     "hint": "完整群 UMO（支持列表或逗号分隔文本）。留空时自动继承群间核心的私聊共享群来源；仅同平台、同角色、当前私聊成员本人的已批准资料和好感度，只读、不合并数值，不从私聊写入群资料。"
   },
   "scene_learning_enabled": {
-    "description": "群内接话场景学习（试验）",
+    "description": "【试验功能】群内接话场景学习（试验）",
     "type": "bool",
     "default": false,
     "hint": "后台提炼同群通用接话方法，经LLM审查后按场景检索；不改变自身人设，默认关闭。"
   },
   "scene_disambiguation_enabled": {
-    "description": "困难场景补充判断（试验）",
+    "description": "【试验功能】困难场景补充判断（试验）",
     "type": "bool",
     "default": false,
-    "hint": "场景学习开启后，仅不明确的已准入回复额外调用分析模型一次，含排队最多等待5秒。"
+    "hint": "场景学习开启后，仅不明确的已准入回复额外调用分析模型一次，含排队最多等待5秒。",
+    "condition": {
+      "scene_learning_enabled": true
+    }
   },
   "scene_pattern_review": {
-    "description": "接话场景审查",
+    "description": "【试验功能】接话场景审查",
     "type": "string",
     "default": "llm",
     "options": [
       "llm",
       "llm_then_human"
-    ]
+    ],
+    "condition": {
+      "scene_learning_enabled": true
+    }
   },
   "scene_adjustment_review": {
-    "description": "接话反馈调整审查",
+    "description": "【试验功能】接话反馈调整审查",
     "type": "string",
     "default": "llm",
     "options": [
       "llm",
       "llm_then_human"
-    ]
+    ],
+    "condition": {
+      "scene_learning_enabled": true
+    }
   },
   "expression_style_enabled": {
-    "description": "学习群内说话习惯（明显群聊化，试验）",
+    "description": "【试验功能】学习群内说话习惯（明显群聊化，试验）",
     "type": "bool",
     "default": false,
     "hint": "保留自身身份和喜恶，学习有证据的口语写法；成员均衡、独立审查，默认关闭。"
   },
   "expression_style_review": {
-    "description": "群体表达习惯审查",
+    "description": "【试验功能】群体表达习惯审查",
     "type": "string",
     "default": "llm",
     "options": [
       "llm",
       "llm_then_human"
-    ]
+    ],
+    "condition": {
+      "expression_style_enabled": true
+    }
   },
   "expression_adjustment_review": {
-    "description": "表达反馈调整审查",
+    "description": "【试验功能】表达反馈调整审查",
     "type": "string",
     "default": "llm",
     "options": [
       "llm",
       "llm_then_human"
-    ]
+    ],
+    "condition": {
+      "expression_style_enabled": true
+    }
   },
   "reply_projection_budget": {
-    "description": "回复学习材料注入总字符预算",
+    "description": "【预算与留存】回复学习材料注入总字符预算",
     "type": "int",
     "default": 6000,
     "hint": "单轮回复可注入的学习资料总字符上限（范围 1200-8400）。"
   },
   "max_jargon_per_turn": {
-    "description": "单轮回复最多注入黑话条数",
+    "description": "【预算与留存】单轮回复最多注入黑话条数",
     "type": "int",
     "default": 4,
     "hint": "单轮命中群聊黑话时最多附带的词条数量（范围 1-12）。"
   },
+  "retention_days": {
+    "description": "【预算与留存】原始事件保留天数",
+    "type": "int",
+    "default": 30,
+    "hint": "提案引用证据保留至删除会话学习数据。"
+  },
   "audit_retention_days": {
-    "description": "审计与终态提案保留天数",
+    "description": "【预算与留存】审计与终态提案保留天数",
     "type": "int",
     "default": 90,
     "hint": "审计日志与已拒绝/归档/回滚提案的留存天数（默认 90 天）。"
+  },
+  "show_advanced_relation_weights": {
+    "description": "【高级】展开底层群关系图权重（13 项）",
+    "type": "bool",
+    "default": false,
+    "hint": "默认折叠 13 个底层群关系图权重参数以降低配置门槛；仅控制配置面板显示，已有配置值完整保留。"
+  },
+  "relation_window_days": {
+    "description": "群关系：观察窗口（天）",
+    "type": "int",
+    "default": 30,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_growth_scale": {
+    "description": "群关系：互动增长尺度",
+    "type": "int",
+    "default": 120,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_pair_daily_budget": {
+    "description": "群关系：每对成员每日证据预算",
+    "type": "int",
+    "default": 80,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_activity_daily_cap": {
+    "description": "群关系：活跃度每日计分消息数",
+    "type": "int",
+    "default": 80,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_context_window_seconds": {
+    "description": "群关系：上下文窗口（秒）",
+    "type": "int",
+    "default": 300,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_max_recent": {
+    "description": "群关系：上下文消息条数",
+    "type": "int",
+    "default": 80,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_pair_base_weight": {
+    "description": "群关系：同场互动权重",
+    "type": "int",
+    "default": 1,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_mention_weight": {
+    "description": "群关系：提及权重",
+    "type": "int",
+    "default": 5,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_same_topic_weight": {
+    "description": "群关系：同话题权重",
+    "type": "float",
+    "default": 0.8,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_reply_weight": {
+    "description": "群关系：引用回复权重",
+    "type": "int",
+    "default": 8,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_at_weight": {
+    "description": "群关系：直接提及权重",
+    "type": "int",
+    "default": 5,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_adjacency_weight": {
+    "description": "群关系：相邻接话权重",
+    "type": "float",
+    "default": 1.5,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_adjacency_window_seconds": {
+    "description": "群关系：相邻接话窗口（秒）",
+    "type": "int",
+    "default": 90,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_ambient_tone_scale": {
+    "description": "群关系：环境语气权重",
+    "type": "float",
+    "default": 0.15,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
+  },
+  "relation_daily_decay": {
+    "description": "群关系：每日关系衰减系数",
+    "type": "float",
+    "default": 0.985,
+    "condition": {
+      "show_advanced_relation_weights": true
+    }
   }
 }

@@ -48,6 +48,7 @@ from .model_projection import (
     project_event_for_model,
     utf8_len,
 )
+from .presets import allowed_modes_for_category, detect_active_preset, preset_catalog
 from .review_batches import ReviewDeferred, ReviewUnavailable
 from .review_evidence import DEFER_FINGERPRINT, ReviewContext, review_context, review_is_sleeping
 from .scenes import REVIEW_SCENES
@@ -55,6 +56,7 @@ from .series_bridge import (
     is_member_privacy_muted,
     normalize_str_list,
     read_extended_shared_config,
+    resolve_persona_labels,
     resolve_shared_persona_id,
 )
 from .store import Conflict
@@ -369,6 +371,8 @@ class Engine:
         self.review_retry_at = {}
         self.cache_refresh_pending = False
         self._turn_budget_usage = {}
+        self._maintenance_active = False
+        self._last_provider_tokens = None
         from .review_batches import ReviewBatches
 
         self.review_batches = ReviewBatches(self)
@@ -419,6 +423,10 @@ class Engine:
         return resolve_shared_persona_id(self._host_context)
 
     def is_privacy_muted(self, scope: str, member_id: str) -> bool:
+        if not scope or not member_id:
+            return False
+        if self.store.is_local_privacy_muted(scope, member_id):
+            return True
         return is_member_privacy_muted(self._host_context, scope, member_id, "learning")
 
     @staticmethod
@@ -1154,12 +1162,53 @@ class Engine:
                         raise ValueError("model job invalidated before start")
                     if prepare:
                         instruction, data, dispatch = await prepare()
-                    if dispatch and self._provider_tracks_reviews:
-                        value = await self.call_model(role, instruction, data, review_dispatch=dispatch)
-                    else:
-                        if dispatch:
-                            self.store.automatic_reviews.record_dispatch(dispatch)
-                        value = await self.call_model(role, instruction, data)
+                    usage_phase = (
+                        "maintenance"
+                        if self._maintenance_active
+                        else ("review" if role == "review_provider" else "analysis")
+                    )
+                    prompt_chars = len(str(instruction or "")) + len(encode(data) if data else "")
+                    call_started = time.monotonic()
+                    self._last_provider_tokens = None
+                    try:
+                        if dispatch and self._provider_tracks_reviews:
+                            value = await self.call_model(role, instruction, data, review_dispatch=dispatch)
+                        else:
+                            if dispatch:
+                                self.store.automatic_reviews.record_dispatch(dispatch)
+                            value = await self.call_model(role, instruction, data)
+                    except BaseException as call_exc:
+                        if not isinstance(call_exc, (ReviewDeferred, asyncio.CancelledError)) and not is_provider_budget_busy_error(call_exc):
+                            elapsed_ms = round((time.monotonic() - call_started) * 1000)
+                            await self.review_write(
+                                lambda: self.store.console.record_llm_usage(
+                                    scope=source.get("scope", ""),
+                                    phase=usage_phase,
+                                    ok=False,
+                                    prompt_chars=prompt_chars,
+                                    completion_chars=0,
+                                    elapsed_ms=elapsed_ms,
+                                )
+                            )
+                        raise
+                    elapsed_ms = round((time.monotonic() - call_started) * 1000)
+                    completion_chars = len(encode(value)) if value is not None else 0
+                    tok_override = self._last_provider_tokens
+                    self._last_provider_tokens = None
+                    p_tok = tok_override[0] if isinstance(tok_override, tuple) and len(tok_override) == 2 else None
+                    c_tok = tok_override[1] if isinstance(tok_override, tuple) and len(tok_override) == 2 else None
+                    await self.review_write(
+                        lambda: self.store.console.record_llm_usage(
+                            scope=source.get("scope", ""),
+                            phase=usage_phase,
+                            ok=True,
+                            prompt_chars=prompt_chars,
+                            completion_chars=completion_chars,
+                            prompt_tokens=p_tok,
+                            completion_tokens=c_tok,
+                            elapsed_ms=elapsed_ms,
+                        )
+                    )
                     await self.review_write(lambda: self.store.console.task_finished(task_id, "succeeded"))
                     return value
                 finally:
@@ -2507,6 +2556,18 @@ class Engine:
                     return result
 
                 return await self.finish_operation(commit_and_refresh())
+            if action == "restore":
+
+                async def commit_restore_and_refresh():
+                    result = await asyncio.to_thread(
+                        self.store.restore_version, p["id"], actor, expected_updated, reason=reason
+                    )
+                    self.cache_refresh_pending = True
+                    await self._refresh_scope(p["scope"])
+                    invalidate_presence_cache(context=self._host_context)
+                    return result
+
+                return await self.finish_operation(commit_restore_and_refresh())
             raise ValueError("invalid action")
 
     async def amend(self, proposal_id, value, reason, actor, *, expected_updated=None):
@@ -2762,31 +2823,35 @@ class Engine:
                     invalidate_presence_cache(context=self._host_context)
                 await self.apply_pending_affection()
                 await self.apply_approved_profiles()
-                await self.review_pending_profiles()
-                await self.review_pending_proposals()
-                if self.config.get("auto_analyze", True) and not self.automatic_reviews.is_budget_backed_off(
-                    role="analysis_provider"
-                ):
-                    await self.analysis_cycle()
-                    for scope, persona in list(self.current_personas.items()):
-                        if self.automatic_reviews.is_budget_backed_off(role="analysis_provider"):
-                            break
-                        if self.expressions.enabled(scope, persona):
-                            try:
-                                await self.expressions.analyze(scope, persona)
-                            except ReviewDeferred as exc:
-                                self.automatic_reviews.note_budget_busy(exc, role="analysis_provider")
+                self._maintenance_active = True
+                try:
+                    await self.review_pending_profiles()
+                    await self.review_pending_proposals()
+                    if self.config.get("auto_analyze", True) and not self.automatic_reviews.is_budget_backed_off(
+                        role="analysis_provider"
+                    ):
+                        await self.analysis_cycle()
+                        for scope, persona in list(self.current_personas.items()):
+                            if self.automatic_reviews.is_budget_backed_off(role="analysis_provider"):
                                 break
-                            except Exception as exc:
-                                self.last_error = type(exc).__name__
-                        if self.scenes.enabled(scope, persona):
-                            try:
-                                await self.scenes.analyze(scope, persona)
-                            except ReviewDeferred as exc:
-                                self.automatic_reviews.note_budget_busy(exc, role="analysis_provider")
-                                break
-                            except Exception as exc:
-                                self.last_error = type(exc).__name__
+                            if self.expressions.enabled(scope, persona):
+                                try:
+                                    await self.expressions.analyze(scope, persona)
+                                except ReviewDeferred as exc:
+                                    self.automatic_reviews.note_budget_busy(exc, role="analysis_provider")
+                                    break
+                                except Exception as exc:
+                                    self.last_error = type(exc).__name__
+                            if self.scenes.enabled(scope, persona):
+                                try:
+                                    await self.scenes.analyze(scope, persona)
+                                except ReviewDeferred as exc:
+                                    self.automatic_reviews.note_budget_busy(exc, role="analysis_provider")
+                                    break
+                                except Exception as exc:
+                                    self.last_error = type(exc).__name__
+                finally:
+                    self._maintenance_active = False
             except Exception as exc:
                 self.last_error = type(exc).__name__
 
@@ -3154,6 +3219,10 @@ class Engine:
         counts = await asyncio.to_thread(self.store.proposal_counts)
         queue_summary = await asyncio.to_thread(self.queue_counts)
         scene_summary = await asyncio.to_thread(self.store.scenes.summary)
+        effective_scopes = self.effective_sessions()
+        recent_applied = await asyncio.to_thread(self.store.recent_applied_proposals, effective_scopes, 10)
+        llm_usage = await asyncio.to_thread(self.store.console.llm_usage_summary, 24)
+        persona_labels = await asyncio.to_thread(resolve_persona_labels, self._host_context, self.store, self)
         return {
             "schema_version": 1,
             "console_version": 1,
@@ -3174,18 +3243,21 @@ class Engine:
                     for r in self.cache
                 ),
             },
-            "sessions": self.effective_sessions(),
+            "sessions": effective_scopes,
             "sessions_source": self.sessions_source(),
             "explicit_sessions": self._explicit_sessions(),
             "shared_persona_id": self.shared_persona_id(),
+            "persona_labels": persona_labels,
             "batches": batches,
             "entries": [],
             "entries_paged": True,
             "proposals": proposals,
+            "recent_applied": recent_applied,
             "review_groups": groups,
             "proposal_counts": counts,
             "queue_summary": queue_summary,
             "daily": await asyncio.to_thread(self.store.console.daily),
+            "llm_usage": llm_usage,
             "tasks": await asyncio.to_thread(self.store.console.tasks),
             "next_check_at": self.next_check_at,
             "scheduler": {
@@ -3199,6 +3271,9 @@ class Engine:
             "personality_locked": True,
             "personality_policy": PERSONALITY_POLICY,
             "review_modes": {c: self.mode(c) for c in sorted(CATEGORIES)},
+            "allowed_modes": {c: list(allowed_modes_for_category(c)) for c in sorted(CATEGORIES)},
+            "presets": preset_catalog(),
+            "active_preset": detect_active_preset(self.config),
         }
 
     def horizons_social_hints(self, scope: str, member_id: str = "") -> dict:
@@ -3217,8 +3292,7 @@ class Engine:
             return empty
 
         now = time.time()
-        group_interests: list[str] = []
-        seen_interests: set[str] = set()
+        interest_scores: dict[str, list] = {}  # casefold -> [display_topic, count, latest_ts]
         member_dislikes: dict[str, list[str]] = {}
         member_boundaries: dict[str, list[str]] = {}
         muted_cache: dict[str, bool] = {}
@@ -3229,6 +3303,16 @@ class Engine:
             if mid not in muted_cache:
                 muted_cache[mid] = self.is_privacy_muted(clean_scope, mid)
             return muted_cache[mid]
+
+        def _bump_interest(topic_val: str, ts_val: float, weight: float = 1.0) -> None:
+            key_cf = topic_val.casefold()
+            slot = interest_scores.get(key_cf)
+            if slot is None:
+                interest_scores[key_cf] = [topic_val, weight, ts_val]
+            else:
+                slot[1] += weight
+                if ts_val > slot[2]:
+                    slot[2] = ts_val
 
         entries = sorted(
             self._entries_for(clean_scope, persona),
@@ -3253,11 +3337,9 @@ class Engine:
             topic = " ".join(str(val.get("topic") or "").split())[:80]
             if not topic:
                 continue
+            ts_val = float(entry.get("state_updated_at") or entry.get("revision") or 0)
             if stance == "like":
-                key_cf = topic.casefold()
-                if key_cf not in seen_interests and len(group_interests) < 20:
-                    seen_interests.add(key_cf)
-                    group_interests.append(topic)
+                _bump_interest(topic, ts_val, weight=1.5)
             elif stance == "dislike":
                 bucket = member_dislikes.setdefault(member, [])
                 if topic.casefold() not in {t.casefold() for t in bucket} and len(bucket) < 12:
@@ -3286,13 +3368,15 @@ class Engine:
             topic = " ".join(str(row.get("topic") or "").split())[:80]
             if not topic:
                 continue
-            key_cf = topic.casefold()
-            if key_cf not in seen_interests and len(group_interests) < 20:
-                seen_interests.add(key_cf)
-                group_interests.append(topic)
+            _bump_interest(topic, float(row.get("created") or 0), weight=1.0)
+
+        ranked_interests = [
+            item[0]
+            for item in sorted(interest_scores.values(), key=lambda x: (-x[1], -x[2], x[0]))[:20]
+        ]
 
         return {
-            "group_interests": group_interests,
+            "group_interests": ranked_interests,
             "member_dislikes": member_dislikes,
             "member_boundaries": member_boundaries,
         }
@@ -3305,7 +3389,11 @@ class Engine:
         summary: str,
         sentiment: str = "positive",
     ) -> dict:
-        """Record an interest/affection clue coming from a shared Dynamics Horizons discussion."""
+        """Record an interest/affection clue coming from a shared Dynamics Horizons discussion.
+
+        Also converts qualified clues into structured preference/affection review candidates
+        entering the standard Learning review queue under PERSONALITY_POLICY.
+        """
         clean_scope = str(scope or "").strip()[:512]
         clean_member = str(member_id or "").strip()[:128]
         clean_topic = " ".join(str(topic or "").split())[:80]
@@ -3340,8 +3428,87 @@ class Engine:
             summary=clean_summary,
             sentiment=clean_sentiment,
         )
+
+        proposal_ids: list[str] = []
+        if clean_member and persona and clean_sentiment in {"positive", "negative"}:
+            char_scope = self.character_scopes.get((clean_scope, persona)) or {}
+            quote = clean_summary or f"共同讨论了「{clean_topic}」"
+            ev_id = record["id"]
+            evidence_event = {
+                "id": ev_id,
+                "scope": clean_scope,
+                "persona": persona,
+                "member": clean_member,
+                "message_id": ev_id,
+                "turn_id": ev_id,
+                "kind": "horizons_reflection",
+                "baseline": "horizons_reflection",
+                "host_version": "horizons_reflection",
+                "baseline_threshold": 0,
+                "text": quote,
+                "timestamp": record["created"],
+                "context": {
+                    "source_verified": True,
+                    "character_scope": dict(char_scope) if isinstance(char_scope, dict) else {},
+                },
+            }
+            # 1) Structured preference candidate entering review queue (never bypasses review)
+            try:
+                stance = "like" if clean_sentiment == "positive" else "dislike"
+                pref_raw = {
+                    "category": "preference",
+                    "key": clean_topic,
+                    "member": clean_member,
+                    "value": {
+                        "topic": clean_topic,
+                        "stance": stance,
+                        "condition": "见闻讨论",
+                        "quote": quote,
+                        "source_id": ev_id,
+                    },
+                    "reason": f"来自群间见闻共聊后记的兴趣线索（{clean_sentiment}），需核对并严守固定性格红线。",
+                    "days": 30,
+                    "evidence_ids": [ev_id],
+                }
+                pref_data = candidate(pref_raw, [evidence_event], None)
+                if policy_allowed(pref_data):
+                    pref_data["source_kind"] = "horizons_reflection"
+                    pref_mode = "human" if self.mode("preference") == "human" else "llm_then_human"
+                    prop = self.store.propose(pref_data, pref_mode, "plugin:dynamics_horizons")
+                    proposal_ids.append(prop["id"])
+            except Exception:
+                pass
+
+            # 2) Conservative affection clue candidate when positive & character identity verified
+            if clean_sentiment == "positive" and self.config.get("affection_enabled", True) and char_scope:
+                try:
+                    prev_aff = (
+                        self.social.current_affection(clean_scope, persona, clean_member)
+                        if self.social is not None
+                        else None
+                    )
+                    aff_raw = {
+                        "category": "affection",
+                        "key": "bot_affection",
+                        "member": clean_member,
+                        "value": {"experience_delta": "2", "tone": 0.25},
+                        "reason": f"群间见闻共聊主题「{clean_topic}」带来正向互动线索，待复审确认。",
+                        "days": 30,
+                        "evidence_ids": [ev_id],
+                    }
+                    aff_data = candidate(aff_raw, [evidence_event], prev_aff)
+                    if policy_allowed(aff_data):
+                        aff_data["source_kind"] = "horizons_reflection"
+                        aff_data["auto_guard_reason"] = "horizons_reflection"
+                        aff_mode = "human" if self.mode("affection") == "human" else "llm_then_human"
+                        aff_prop = self.store.propose(aff_data, aff_mode, "plugin:dynamics_horizons")
+                        proposal_ids.append(aff_prop["id"])
+                except Exception:
+                    pass
+
         return {
             "ok": True,
             "accepted": True,
             **record,
+            "proposal_ids": proposal_ids,
         }

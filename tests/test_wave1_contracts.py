@@ -98,6 +98,10 @@ def _load_main_module():
             return lambda fn: fn
 
         @staticmethod
+        def command(*_a, **_kw):
+            return lambda fn: fn
+
+        @staticmethod
         def platform_adapter_type(*_a, **_kw):
             return lambda fn: fn
 
