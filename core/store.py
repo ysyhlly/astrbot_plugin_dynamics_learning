@@ -178,6 +178,9 @@ class Store:
         CREATE TABLE IF NOT EXISTS affection_source_claims(scope TEXT,persona TEXT,member TEXT,message_id TEXT,proposal TEXT,
           PRIMARY KEY(scope,persona,member,message_id));
         CREATE INDEX IF NOT EXISTS affection_source_claims_proposal ON affection_source_claims(proposal);
+        CREATE TABLE IF NOT EXISTS horizons_reflections(id TEXT PRIMARY KEY,scope TEXT NOT NULL,persona TEXT NOT NULL,
+          member TEXT NOT NULL,topic TEXT NOT NULL,summary TEXT NOT NULL,sentiment TEXT NOT NULL,created REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS horizons_reflections_scope ON horizons_reflections(scope,persona,created);
         """)
         if current_version < 10:
             self.db.execute("PRAGMA user_version=10")
@@ -1059,6 +1062,62 @@ class Store:
             self.db.execute("DELETE FROM console_tasks WHERE scope=?", (scope,))
             self.db.execute("DELETE FROM review_batches WHERE scope=?", (scope,))
             self.db.execute("DELETE FROM review_claims WHERE scope=?", (scope,))
+            self.db.execute("DELETE FROM horizons_reflections WHERE scope=?", (scope,))
+
+    def record_horizons_reflection(
+        self,
+        *,
+        scope: str,
+        persona: str,
+        member: str,
+        topic: str,
+        summary: str,
+        sentiment: str = "positive",
+    ) -> dict:
+        rec_id = "href:" + uuid.uuid4().hex
+        created = time.time()
+        with self.transaction():
+            self.db.execute(
+                "INSERT INTO horizons_reflections(id,scope,persona,member,topic,summary,sentiment,created) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (rec_id, scope, persona, member, topic, summary, sentiment, created),
+            )
+        return {
+            "id": rec_id,
+            "scope": scope,
+            "persona": persona,
+            "member": member,
+            "topic": topic,
+            "summary": summary,
+            "sentiment": sentiment,
+            "created": created,
+        }
+
+    def recent_horizons_reflections(
+        self,
+        scope: str,
+        persona: str = "",
+        *,
+        member: str = "",
+        limit: int = 40,
+        days: int = 90,
+        readonly: bool = False,
+    ) -> list[dict]:
+        cutoff = time.time() - max(1, int(days)) * 86400
+        max_rows = max(1, min(200, int(limit or 40)))
+        sql = (
+            "SELECT id,scope,persona,member,topic,summary,sentiment,created FROM horizons_reflections "
+            "WHERE scope=? AND (?='' OR persona=?) AND (?='' OR member=?) AND created>=? "
+            "ORDER BY created DESC LIMIT ?"
+        )
+        params = (scope, persona, persona, member, member, cutoff, max_rows)
+        if readonly:
+            with self.readonly_connection() as db:
+                rows = db.execute(sql, params).fetchall()
+        else:
+            with self.lock:
+                rows = self.db.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
 
     def latest_baselines(self):
         with self.lock:
@@ -1285,6 +1344,7 @@ class Store:
                     "UPDATE analysis_inbox SET processed=1 WHERE processed=0 AND created<?",
                     (inbox_cutoff,),
                 ).rowcount
+            self.db.execute("DELETE FROM horizons_reflections WHERE created<?", (audit_cutoff,))
 
         # 2) Indexed batched pruning of high-volume tables (releases self.lock between chunks)
         self._prune_batched(

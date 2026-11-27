@@ -10,6 +10,71 @@ window.DynamicsGetActiveScope=()=>($('#global-scope')?.value||'').trim();
 const categories = {expression_style:"本群表达习惯",expression_adjustment:"表达反馈调整",scene_pattern:"群内接话场景",scene_adjustment:"接话反馈调整",expression_example:msg("原话样例"),style:msg("群友表达方式"),typing_habit:msg("群友打字习惯"),preference:msg("群友喜恶"),jargon:msg("群聊黑话"),affection:msg("数值好感度"),relationship:msg("社交关系"),state:msg("短期状态"),persona:msg("旧人格增量（已停用）"),decision_guidance:msg("决策指导"),participation:msg("接话阈值")};
 const states = {pending:msg("待审查"),reviewed:msg("初审通过"),applied:msg("已应用"),rejected:msg("已拒绝"),rolled_back:msg("已回滚"),archived:msg("已归档")};
 const modes = {auto:'自动生效（无需审查）',human:'人工审查',llm:'LLM 审查通过后自动生效',llm_then_human:'LLM 初审＋人工确认'};
+const PROVIDER_SOURCES = {explicit:'显式配置',shared_light:'继承群间核心轻量模型',shared_decision:'继承群间核心决策模型',shared_reply:'继承群间核心回复模型',host_default:'回退宿主默认模型',none:'未就绪'};
+function sessionSourceMeta(){
+ const src=snapshot.sessions_source||(snapshot.sessions?.length?'explicit':'empty');
+ if(src==='inherited')return {code:'inherited',label:'继承自群间核心',tone:'info',detail:'当前「生效会话」留空，已自动继承群间核心（Chat Dynamics）的接管群列表。'};
+ if(src==='explicit')return {code:'explicit',label:'显式白名单',tone:'accent',detail:'当前使用插件配置「生效会话」中的显式白名单（覆盖群间核心继承）。'};
+ return {code:'empty',label:'未启用',tone:'warm',detail:'当前暂无生效会话；留空时将自动继承群间核心接管群，或可在插件配置中填写完整 UMO 作为显式白名单。'};
+}
+function collectProposalRisks(p){
+ const seen=new Set(),out=[];
+ const push=v=>{const s=String(v||'').trim();if(s&&!seen.has(s)){seen.add(s);out.push(s);}};
+ if(Array.isArray(p?.risks))for(const r of p.risks)push(r);
+ if(Array.isArray(p?.reviews))for(const rev of [...p.reviews].reverse())if(Array.isArray(rev?.risks))for(const r of rev.risks)push(r);
+ return out;
+}
+function formatAutoGuardReason(raw){
+ const clean=String(raw||'').trim();
+ if(!clean)return null;
+ let m=clean.match(/^spike:([^>]+)>=([^>]+)$/);
+ if(m)return {badge:'好感突变护栏',detail:`单次经验变动 ${m[1]} 达到复审阈值 ${m[2]}，已暂停自动生效并转入复审（红线：防止单轮情绪波动大幅拉扯长期好感）。`};
+ m=clean.match(/^daily_limit:([^>]+)>([^>]+)$/);
+ if(m)return {badge:'日变动上限护栏',detail:`该成员 24 小时累计好感变动 ${m[1]} 超过日上限 ${m[2]}，已转入复审（红线：防止短时间刷分或异常叠加）。`};
+ m=clean.match(/^daily_count:([^>]+)>([^>]+)$/);
+ if(m)return {badge:'日频次上限护栏',detail:`该成员 24 小时好感变动次数（第 ${m[1]} 次）超过上限 ${m[2]}，已转入复审（红线：避免高频碎片化加减分）。`};
+ if(clean==='invalid_delta')return {badge:'好感数值异常',detail:'好感变动数值无法解析，已触发护栏并转入人工复审。'};
+ return {badge:'好感护栏复审',detail:`触发自动护栏（${clean}），已转入 LLM/人工复审。`};
+}
+function explainRiskRedline(risk){
+ const text=String(risk||'').trim();
+ if(!text)return '';
+ const low=text.toLowerCase();
+ if(/persona|personality|人格|性格|人设|核心设定/.test(low))return '红线：Bot 原始性格固定，不可改写人设';
+ if(/privacy|隐私|敏感|个人身份|手机号|住址/.test(low))return '红线：避免沉淀敏感隐私或身份推断';
+ if(/attrib|归属|第三人|他人|错绑|转述|引用/.test(low))return '红线：仅可归属当前发言成员本人原话';
+ if(/joke|sarcas|玩笑|反话|讽刺|一时情绪|短期情绪|情绪/.test(low))return '红线：不把玩笑反话或一时情绪固化为长期资料';
+ if(/boundary|stop|边界|停止|越界|打扰|冒犯/.test(low))return '红线：严守成员交流边界与停止规则';
+ if(/threshold|阈值|沉默|未回复|发送成功/.test(low))return '红线：不把沉默或单次发送误归因于接话阈值';
+ if(/evidence|sample|证据|样本|单次|孤证/.test(low))return '红线：需有充分独立真实原话作为依据';
+ return '红线提醒：请结合原始证据核对该风险后再决定是否应用';
+}
+function renderRiskBanner(p){
+ const guard=formatAutoGuardReason(p?.auto_guard_reason);
+ const risks=collectProposalRisks(p);
+ if(!guard&&!risks.length)return null;
+ const banner=el('div','review-risk-banner'+(guard?' has-guard':''));
+ banner.setAttribute('role','note');
+ if(guard){
+  const row=el('div','review-risk-row');
+  row.append(el('span','review-guard-pill',guard.badge),el('span','review-risk-guard-text',guard.detail));
+  banner.append(row);
+ }
+ if(risks.length){
+  const row=el('div','review-risk-row');
+  row.append(el('span','review-risk-label','风险项'));
+  const hints=new Set();
+  for(const risk of risks){
+   const chip=el('span','review-risk-chip',risk);
+   const redline=explainRiskRedline(risk);
+   if(redline){chip.title=redline;hints.add(redline);}
+   row.append(chip);
+  }
+  banner.append(row);
+  if(hints.size)banner.append(el('p','review-risk-hint',[...hints].slice(0,2).join('；')));
+ }
+ return banner;
+}
 let snapshot = {proposals:[],entries:[]}, editing = null;
 let socialSnapshot=null;let activeSection=null;let entryPage=1,entryTotal=0,usagePage=1,usageTotal=0,memberPage=1,memberTotal=0;const socialPages={affection:1,jargon:1};let socialQuery='';
 let reviewGroupKey=null,reviewPage=1,reviewTotal=0,reviewProposals=[],reviewEpoch=0;
@@ -92,6 +157,8 @@ function renderReviewCards(){
   const status=p.can_archive?'已失效':p.reason_code==='held'?'批次保留':ready?'待确认':p.state==='reviewed'&&mode==='llm'?'已通过 · 自动生效中':pending&&mode!=='human'?'等待 LLM 审查':states[p.state];
   const badgeTone=p.can_archive?' tone-danger':(ready||p.reason_code==='held'||(pending&&mode!=='human'))?' tone-warm':(p.state==='reviewed'&&mode==='llm')?' tone-info':'';
   top.append(el('span','badge'+badgeTone,status));c.append(top);
+  const riskBanner=renderRiskBanner(p);
+  if(riskBanner)c.append(riskBanner);
   const body=el('div','review-item-body'),valWrap=el('div','review-val-col');
   const proposedText=displayValue(p.value);
   if(p.before?.active){
@@ -116,7 +183,7 @@ function renderReviewCards(){
   const detail=el('details','review-detail');detail.append(el('summary','',msg('查看依据与修改')));
   detail.append(el('p','',p.reason),el('p','scope',scopeLine(p)),el('p','muted',modes[mode]));
   const diff=el('div','diff');for(const [label,value] of [['调整前',p.before?.active?p.before.value:'尚无学习增量'],['调整后',p.value]]){const d=el('div');d.append(el('small','',label),el('span','',displayValue(value)));diff.append(d);}detail.append(diff);
-  const reviews=el('div','review-verdicts');for(const r of p.reviews||[])reviews.append(el('p','muted',`${r.actor?.startsWith('llm:')?'LLM':'审查人'}：${{approve:'通过',reject:'拒绝',revise:'需修改'}[r.verdict]||r.verdict||''} · ${r.reason||'未提供说明'}`));detail.append(reviews,evidence);
+  const reviews=el('div','review-verdicts');for(const r of p.reviews||[]){const riskSuffix=Array.isArray(r.risks)&&r.risks.length?` · 风险：${r.risks.join('、')}`:'';reviews.append(el('p','muted',`${r.actor?.startsWith('llm:')?'LLM':'审查人'}：${{approve:'通过',reject:'拒绝',revise:'需修改',defer:'暂缓'}[r.verdict]||r.verdict||''} · ${r.reason||'未提供说明'}${riskSuffix}`));}detail.append(reviews,evidence);
   if(p.evaluation?.note)detail.append(el('p','muted',p.evaluation.note));
   if(p.observations)detail.append(details('应用前后观察',p.observations));
   if(p.applied_by)detail.append(el('p','muted',`应用人 ${p.applied_by}${p.rolled_back_by?' · 回滚人 '+p.rolled_back_by:''}`));
@@ -184,10 +251,11 @@ function renderOverviewStats() {
  const batchTurns = snapshot.batches.reduce((n,b)=>n+b.count,0);
  updatePendingTabBadge(readyCount, staleCount);
  const totalProposals = Math.max(1, pendingCount + appliedCount);
+ const srcMeta = sessionSourceMeta();
  const metrics = [
   ['待审查', pendingCount, pendingCount > 0 ? {pill: msg('需关注'), tone: 'warm', ratio: Math.min(100, Math.round((pendingCount / totalProposals) * 100))} : {pill: msg('已清空'), tone: 'accent'}],
   ['已应用', appliedCount, {pill: msg('已生效'), tone: 'accent', ratio: Math.min(100, Math.round((appliedCount / totalProposals) * 100))}],
-  ['生效会话', sessionCount, {pill: sessionCount > 0 ? msg('运行中') : msg('未启用'), tone: sessionCount > 0 ? 'info' : 'warm'}],
+  ['生效会话', sessionCount, {pill: msg(srcMeta.label), tone: srcMeta.tone}],
   ['待分析回合', batchTurns, batchTurns > 0 ? {pill: msg('积压中'), tone: 'warm'} : {pill: msg('空闲'), tone: 'accent'}],
  ];
  $('#stats').replaceChildren(...metrics.map(metricCard));
@@ -214,9 +282,13 @@ function render(){
  renderReviewCards();
  if(!snapshot.entries_paged)renderEntries(snapshot.entries.filter(e=>e.active));
  const scopeList=$('#scope-list');scopeList.replaceChildren();
+ const srcMeta=sessionSourceMeta();
+ const srcBanner=el('div','scope-source-banner');
+ srcBanner.append(el('span','scope-source-pill tone-'+srcMeta.tone,srcMeta.label),el('span','muted',srcMeta.detail));
+ scopeList.append(srcBanner);
  for(const s of snapshot.sessions){const c=el('article','card');c.append(el('h3','',s));for(const batch of snapshot.batches.filter(b=>b.scope===s)){const a=el('div','actions');a.append(el('span','muted',`人格 ${batch.persona.slice(0,12)} · ${batch.count} 个待分析回合`),button(msg("现在分析"),async()=>{await api('apiPost','analyze',{scope:s,persona:batch.persona});note('分析任务已开始，完成后刷新查看提案。');}));c.append(a);}c.append(button(msg("删除此会话学习数据"),async()=>{const confirmation=await window.DynamicsUI.prompt(msg('将删除此会话的事件、提案和学习内容。请输入完整会话标识确认：'),{danger:true});if(confirmation!==s)return;await api('apiPost','purge',{scope:s,confirm_scope:confirmation});await load();},'danger'));scopeList.append(c);}
  selectionStatus();
- if(!snapshot.sessions.length)scopeList.append(el('div','empty','尚未启用会话。请在插件配置的「生效会话」中填写完整 UMO。'));
+ if(!snapshot.sessions.length)scopeList.append(el('div','empty','当前暂无生效会话。留空「生效会话」将自动继承群间核心（Chat Dynamics）的接管群；或在插件配置中填写完整 UMO 作为显式白名单。'));
  $('#modes').replaceChildren(...Object.entries(snapshot.review_modes).map(([k,v])=>el('p','muted',`${categories[k]}：${modes[v]}`)));
  renderHome();fillScope('#entries-scope',true);fillScope('#usage-scope');
  const selectedProfile=$('#profile-scope').value;$('#profile-scope').replaceChildren(...snapshot.sessions.filter(s=>s.includes(':GroupMessage:')).map(s=>{const o=el('option','',s);o.value=s;return o;}));if(snapshot.sessions.includes(selectedProfile))$('#profile-scope').value=selectedProfile;
@@ -574,6 +646,10 @@ function renderHome() {
  const nextCheck = snapshot.next_check_at ? formatTime(snapshot.next_check_at) : msg('等待调度');
  const readiness = snapshot.provider_readiness;
  const guidance = [];
+ const srcMeta = sessionSourceMeta();
+ const srcLine = el('div', 'scope-source-banner is-compact');
+ srcLine.append(el('span', 'scope-source-pill tone-' + srcMeta.tone, '会话来源：' + srcMeta.label), el('span', 'muted', srcMeta.detail));
+ guidance.push(srcLine);
  if (snapshot.legacy_kv_v1?.present) {
   guidance.push(el('p', 'muted', msg('检测到旧版 v1.4.1 共享 KV（{0} 条 learning_*_v1）：v2.0 使用独立 learning.sqlite3，不会自动导入旧调参数据，请在「会话与设置」核对生效会话并绑定模型。', snapshot.legacy_kv_v1.count || 1)));
  }
@@ -581,7 +657,12 @@ function renderHome() {
   const missing = [];
   if (!readiness.analysis_provider?.ready) missing.push(msg(readiness.analysis_provider?.configured ? '分析模型不可用' : '未配置分析模型'));
   if (!readiness.review_provider?.ready) missing.push(msg(readiness.review_provider?.configured ? '审查模型不可用' : '未配置审查模型'));
-  if (missing.length) guidance.push(el('p', 'muted', msg('模型配置状态：{0}；请在插件配置中绑定普通聊天模型。', missing.join(' · '))));
+  if (missing.length) guidance.push(el('p', 'muted', msg('模型配置状态：{0}；留空将自动回退群间核心共享模型或宿主默认模型，也可在插件配置中显式指定普通聊天模型。', missing.join(' · '))));
+  else {
+   const aSrc = PROVIDER_SOURCES[readiness.analysis_provider?.source] || '';
+   const rSrc = PROVIDER_SOURCES[readiness.review_provider?.source] || '';
+   if (aSrc || rSrc) guidance.push(el('p', 'muted', `模型来源：分析模型（${aSrc || '已就绪'}）· 审查模型（${rSrc || '已就绪'}）`));
+  }
  }
  $('#backlog-list').replaceChildren(
   ...guidance,

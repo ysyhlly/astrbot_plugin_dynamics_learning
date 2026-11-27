@@ -41,21 +41,32 @@ from .core.contract import (
 from . import series_panels
 from .core.engine import Engine
 from .core.model_projection import encode_prompt_payload
-from .core.native import current_persona, group_projection, private_projection, replacement_allowed, role_provider
+from .core.native import (
+    affection_query_allowed,
+    current_persona,
+    group_projection,
+    private_projection,
+    replacement_allowed,
+    role_provider,
+)
 from .core.profiles import native_message
 from .core.review_batches import ReviewDeferred, ReviewUnavailable
 from .core.review_evidence import provider_model
+from .core.series_bridge import (
+    is_member_privacy_muted,
+    normalize_str_list,
+    read_extended_shared_config,
+    resolve_shared_persona_id,
+)
 from .core.social import Social, character_key, observed_event
 from .core.source_withdrawals import recall_source
 from .core.store import Store
 from .series_panels import (
     find_provider_silently,
-    get_series_defaults,
     inherit_umos,
     is_provider_budget_busy_error,
     is_series_group_excluded,
     require_series_admin,
-    resolve_series_provider,
     resolve_series_timezone,
     series_llm_call,
 )
@@ -260,6 +271,7 @@ class DynamicsLearning(Star):
         self.jobs = set()
         self.projection_error = ""
         self.legacy_kv_v1 = {"present": False, "count": 0}
+        self._scope_config_version = 0
 
     async def _detect_legacy_kv_v1(self):
         """Read-only check for residual v1.4.1 learning_*_v1 shared KV keys; never migrates or applies them."""
@@ -288,39 +300,83 @@ class DynamicsLearning(Star):
         fn = getattr(self.engine, "effective_sessions", None)
         if callable(fn):
             return fn()
-        explicit = self.config.get("sessions")
+        explicit = normalize_str_list(self.config.get("sessions"))
+        excluded = set(normalize_str_list(self.config.get("excluded_sessions")))
         if explicit:
-            return list(explicit)
-        return inherit_umos([], self.context) if self.context is not None else []
+            return [s for s in explicit if s not in excluded]
+        inherited = inherit_umos([], self.context) if self.context is not None else []
+        return [s for s in inherited if s not in excluded]
 
-    def _effective_provider(self, role: str) -> str:
-        if self.engine is not None:
-            return str(self.engine.provider_for(role) or "").strip()
+    def _sessions_source(self) -> str:
+        fn = getattr(self.engine, "sessions_source", None)
+        if callable(fn):
+            return fn()
+        if normalize_str_list(self.config.get("sessions")):
+            return "explicit"
+        if self.context is not None and inherit_umos([], self.context):
+            return "inherited"
+        return "empty"
+
+    def _save_config_safely(self) -> None:
+        saver = getattr(self.config, "save_config", None)
+        if callable(saver):
+            try:
+                saver()
+            except Exception as exc:
+                logger.warning("[DynamicsLearning] Failed to save config: %s", type(exc).__name__)
+
+    def _current_scope_version(self, scope: str) -> str:
+        proj_gen = int(self.engine.scope_projection_generation(scope)) if (self.engine and scope) else 0
+        return f"{int(getattr(self, '_scope_config_version', 0))}:{proj_gen}"
+
+    def _is_privacy_muted(self, scope: str, member_id: str) -> bool:
+        if self.engine is not None and hasattr(self.engine, "is_privacy_muted"):
+            return bool(self.engine.is_privacy_muted(scope, member_id))
+        return is_member_privacy_muted(self.context, scope, member_id, "learning")
+
+    def _effective_provider_with_source(self, role: str) -> tuple[str, str]:
+        if self.engine is not None and hasattr(self.engine, "provider_with_source"):
+            pid, source = self.engine.provider_with_source(role)
+            return str(pid or "").strip(), str(source or "none")
         explicit = str(self.config.get(role, "") or "").strip()
         if explicit:
-            return explicit
+            return explicit, "explicit"
+        if self.context is None:
+            return "", "none"
+        shared = read_extended_shared_config(self.context)
         if role == "analysis_provider":
-            return resolve_series_provider(
-                self.context, "", role="reply"
-            ) or Engine._host_default_provider_id(self.context)
+            light = str(shared.get("light_analysis_provider") or "").strip()
+            if light and not Engine._is_native_decision_provider(self.context, light):
+                return light, "shared_light"
+            reply_p = str(shared.get("reply_provider") or "").strip()
+            if reply_p:
+                return reply_p, "shared_reply"
+            host_p = Engine._host_default_provider_id(self.context)
+            return (host_p, "host_default") if host_p else ("", "none")
         if role == "review_provider":
-            defaults = get_series_defaults(self.context)
-            candidate = str(defaults.get("decision_provider") or "").strip()
-            if candidate:
-                provider = find_provider_silently(self.context, candidate)
-                if provider is None or not getattr(provider, "is_native_decision_provider", False):
-                    return candidate
-            return str(defaults.get("reply_provider") or "").strip() or Engine._host_default_provider_id(
-                self.context
-            )
-        return ""
+            light = str(shared.get("light_analysis_provider") or "").strip()
+            if light and not Engine._is_native_decision_provider(self.context, light):
+                return light, "shared_light"
+            candidate = str(shared.get("decision_provider") or "").strip()
+            if candidate and not Engine._is_native_decision_provider(self.context, candidate):
+                return candidate, "shared_decision"
+            reply_p = str(shared.get("reply_provider") or "").strip()
+            if reply_p:
+                return reply_p, "shared_reply"
+            host_p = Engine._host_default_provider_id(self.context)
+            return (host_p, "host_default") if host_p else ("", "none")
+        return "", "none"
+
+    def _effective_provider(self, role: str) -> str:
+        pid, _source = self._effective_provider_with_source(role)
+        return pid
 
     def _provider_status(self):
         status = {}
         for role in ("analysis_provider", "review_provider"):
-            pid = self._effective_provider(role)
+            pid, source = self._effective_provider_with_source(role)
             if not pid:
-                status[role] = {"configured": False, "ready": False, "provider_id": ""}
+                status[role] = {"configured": False, "ready": False, "provider_id": "", "source": source}
                 continue
             provider = find_provider_silently(self.context, pid)
             ready = bool(
@@ -328,7 +384,7 @@ class DynamicsLearning(Star):
                 and callable(getattr(provider, "text_chat", None))
                 and not getattr(provider, "is_native_decision_provider", False)
             )
-            status[role] = {"configured": True, "ready": ready, "provider_id": pid}
+            status[role] = {"configured": True, "ready": ready, "provider_id": pid, "source": source}
         return status
 
     async def initialize(self):
@@ -579,24 +635,31 @@ class DynamicsLearning(Star):
         """Read-only per-scope status for the cross-plugin group control matrix."""
         scope = str(umo or "").strip()[:512]
         master_enabled = bool(self.config.get("enabled", True))
+        mode = self._sessions_source()
         if self.closed or not self.ready or self.engine is None:
             return {
+                "umo": scope,
                 "enabled": False,
+                "writable": False,
+                "mode": mode,
                 "configured": False,
                 "master_enabled": master_enabled,
                 "supported": False,
                 "persona_id": "",
                 "activity_today": None,
                 "summary": "群间学习尚未就绪",
-                "version": 0,
+                "detail": "群间学习尚未就绪",
+                "version": self._current_scope_version(scope),
             }
         try:
             sessions = self._effective_sessions()
             configured = bool(scope and scope in sessions)
             excluded_by_core = bool(scope and is_series_group_excluded(self.context, umo=scope))
             active = bool(scope and not excluded_by_core and self.engine.allowed(scope))
-            persona_id = str(self.engine.current_personas.get(scope, "") or "")
-            version = int(self.engine.scope_projection_generation(scope)) if scope else 0
+            persona_id = str(self.engine.current_personas.get(scope, "") or "") or (
+                resolve_shared_persona_id(self.context) if scope else ""
+            )
+            version = self._current_scope_version(scope)
             if not scope:
                 summary = (
                     f"已配置 {len(sessions)} 个会话"
@@ -604,7 +667,10 @@ class DynamicsLearning(Star):
                     else f"学习总开关已关闭（已配置 {len(sessions)} 个会话）"
                 )
                 return {
+                    "umo": "",
                     "enabled": False,
+                    "writable": True,
+                    "mode": mode,
                     "configured": False,
                     "excluded_by_core": False,
                     "master_enabled": master_enabled,
@@ -612,6 +678,7 @@ class DynamicsLearning(Star):
                     "persona_id": "",
                     "activity_today": 0,
                     "summary": summary,
+                    "detail": summary,
                     "version": version,
                 }
             now = time.time()
@@ -648,7 +715,10 @@ class DynamicsLearning(Star):
             else:
                 summary = "未纳入生效会话"
             return {
+                "umo": scope,
                 "enabled": active,
+                "writable": True,
+                "mode": mode,
                 "configured": configured,
                 "excluded_by_core": excluded_by_core,
                 "master_enabled": master_enabled,
@@ -656,19 +726,161 @@ class DynamicsLearning(Star):
                 "persona_id": persona_id,
                 "activity_today": activity_today,
                 "summary": summary,
+                "detail": summary,
                 "version": version,
             }
         except Exception:
             return {
+                "umo": scope,
                 "enabled": None,
+                "writable": False,
+                "mode": mode,
                 "configured": False,
                 "master_enabled": master_enabled,
                 "supported": True,
                 "persona_id": "",
                 "activity_today": None,
                 "summary": "状态读取失败",
-                "version": 0,
+                "detail": "状态读取失败",
+                "version": self._current_scope_version(scope),
             }
+
+    async def set_series_scope_enabled(
+        self, umo: str, enabled: bool, expected_version: str | int | None = None
+    ) -> dict:
+        """Optimistically toggle whether a UMO is enabled in Dynamics Learning."""
+        scope = str(umo or "").strip()[:512]
+        if not scope:
+            return {
+                "ok": False,
+                "umo": "",
+                "enabled": False,
+                "version": self._current_scope_version(""),
+                "reason": "invalid_umo",
+            }
+        if self.closed or not self.ready or self.engine is None:
+            return {
+                "ok": False,
+                "umo": scope,
+                "enabled": False,
+                "version": self._current_scope_version(scope),
+                "reason": "plugin_not_ready",
+            }
+        target_enabled = bool(enabled)
+        async with self.engine.lock:
+            current_version = self._current_scope_version(scope)
+            if expected_version is not None and str(expected_version).strip() != str(current_version):
+                return {
+                    "ok": False,
+                    "conflict": True,
+                    "umo": scope,
+                    "enabled": bool(self.engine.allowed(scope)),
+                    "version": str(current_version),
+                    "reason": "version_conflict",
+                    "summary": "状态已变更（版本冲突），请刷新后重试",
+                }
+
+            explicit = normalize_str_list(self.config.get("sessions"))
+            excluded = normalize_str_list(self.config.get("excluded_sessions"))
+            inherited = inherit_umos([], self.context) if self.context is not None else []
+
+            if target_enabled:
+                if scope in excluded:
+                    excluded = [s for s in excluded if s != scope]
+                if explicit:
+                    if scope not in explicit:
+                        explicit.append(scope)
+                elif scope not in inherited:
+                    merged = list(dict.fromkeys([*inherited, scope]))
+                    explicit = [s for s in merged if s not in excluded]
+                if not bool(self.config.get("enabled", True)):
+                    self.config["enabled"] = True
+            else:
+                if explicit:
+                    explicit = [s for s in explicit if s != scope]
+                    if not explicit and scope in inherited and scope not in excluded:
+                        excluded.append(scope)
+                elif scope in inherited:
+                    if scope not in excluded:
+                        excluded.append(scope)
+
+            self.config["sessions"] = explicit
+            if excluded or "excluded_sessions" in self.config:
+                self.config["excluded_sessions"] = excluded
+
+            self._scope_config_version += 1
+            self.engine.bump_projection_generation(scope)
+            self._save_config_safely()
+            series_panels.invalidate_presence_cache(PLUGIN, context=self.context)
+            if target_enabled and self.engine.social is not None and ":GroupMessage:" in scope:
+                self.engine.social.request_refresh(scope)
+
+            active_now = bool(self.engine.allowed(scope))
+            excluded_by_core = bool(is_series_group_excluded(self.context, umo=scope))
+            new_version = self._current_scope_version(scope)
+            reason = "excluded_by_core" if (target_enabled and excluded_by_core) else "ok"
+            summary = "开启" if active_now else ("主控排除" if excluded_by_core else "已暂停")
+            return {
+                "ok": True,
+                "umo": scope,
+                "enabled": active_now,
+                "version": str(new_version),
+                "reason": reason,
+                "summary": summary,
+            }
+
+    def activate_series_runtime(self) -> dict:
+        """Uniform runtime activation hook for Series Setup Wizard step 4."""
+        if self.closed or self.engine is None:
+            return {
+                "ok": False,
+                "enabled": False,
+                "ready": False,
+                "reason": "plugin_not_ready",
+            }
+        changed = False
+        if not bool(self.config.get("enabled", True)):
+            self.config["enabled"] = True
+            changed = True
+        if changed:
+            self._scope_config_version += 1
+            self._save_config_safely()
+            self.engine.bump_projection_generation()
+            series_panels.invalidate_presence_cache(PLUGIN, context=self.context)
+        return {
+            "ok": True,
+            "enabled": bool(self.config.get("enabled", True)),
+            "ready": bool(self.ready and not self.closed),
+            "changed": changed,
+            "sessions": self._effective_sessions(),
+            "sessions_source": self._sessions_source(),
+            "reason": "ok",
+        }
+
+    def get_horizons_social_hints(self, umo: str, member_id: str = "") -> dict:
+        """Read-only, sanitized group interests & member dislikes/boundaries for Dynamics Horizons."""
+        if self.closed or not self.ready or self.engine is None:
+            return {
+                "group_interests": [],
+                "member_dislikes": {},
+                "member_boundaries": {},
+            }
+        return self.engine.horizons_social_hints(umo, member_id=member_id)
+
+    def ingest_horizons_reflection(
+        self,
+        umo: str,
+        member_id: str,
+        topic: str,
+        summary: str,
+        sentiment: str = "positive",
+    ) -> dict:
+        """Record an interest/affection clue coming from a shared Dynamics Horizons discussion."""
+        if self.closed or not self.ready or self.engine is None:
+            return {"ok": False, "accepted": False, "reason": "plugin_not_ready"}
+        return self.engine.ingest_horizons_reflection(
+            umo, member_id, topic, summary, sentiment=sentiment
+        )
 
     def series_search_items(self, query: str, scope: str = "", limit: int = 8, persona: str = "") -> list[dict]:
         """Lightweight read-only search across pending proposals and active learned entries."""
@@ -881,9 +1093,18 @@ class DynamicsLearning(Star):
             return {"schema_version": 1, "available": False, "accepted": 0}
         if not isinstance(events, list) or len(events) > 100:
             raise ValueError("invalid native event batch")
+        filtered = []
+        for ev in events:
+            if isinstance(ev, dict):
+                ev_scope = ev.get("scope")
+                ev_umo = str(ev_scope.get("umo", "") or "") if isinstance(ev_scope, dict) else ""
+                ev_member = str(ev.get("actor_id") or ev.get("member") or "").strip()
+                if ev_umo and ev_member and self._is_privacy_muted(ev_umo, ev_member):
+                    continue
+            filtered.append(ev)
         async with self.engine.lock:
             accepted = await asyncio.to_thread(
-                self.engine.store.native.observe, events, self._effective_sessions()
+                self.engine.store.native.observe, filtered, self._effective_sessions()
             )
         return {"schema_version": 1, "available": True, "accepted": accepted}
 
@@ -999,6 +1220,8 @@ class DynamicsLearning(Star):
     def get_affection_for_decision(self, *, scope, persona, member, **kwargs):
         if self.closed or not self.engine or not self.engine.social or not self.engine.allowed(scope):
             return None
+        if self._is_privacy_muted(str(scope or ""), str(member or "")):
+            return None
         entry = self.engine.social.current_affection(scope, persona, member)
         if not entry:
             return None
@@ -1053,6 +1276,8 @@ class DynamicsLearning(Star):
         items = []
         for persona in personas[:1]:
             for member in participants[:8]:
+                if self._is_privacy_muted(str(scope.get("umo", "") or ""), str(member)):
+                    continue
                 content, versions = self.engine.social.context(scope["umo"], persona, str(member))
                 if content:
                     items.append(
@@ -1124,6 +1349,8 @@ class DynamicsLearning(Star):
                 event._dynamics_learning_private_scope_v1 = {"owner": self, "event": event, "scope": dict(scope)}
                 return
             member = str(event.get_sender_id())
+            if self._is_privacy_muted(str(scope.get("umo", "") or ""), member):
+                return
             if ":GroupMessage:" in scope["umo"]:
                 persona = current_persona(self.engine, scope)
                 if not persona:
@@ -1164,8 +1391,11 @@ class DynamicsLearning(Star):
             group_id(str): 留空使用当前范围；管理员私聊可指定授权来源群。
             limit(int): 排名数量，1至20。
         """
-        if not self.ready or not replacement_allowed(self):
+        if not self.ready or self.engine is None or not affection_query_allowed(self):
             return encode({"available": False})
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        if is_series_group_excluded(self.context, umo=umo):
+            return encode({"available": False, "reason": "当前群已被主控排除"})
         sender = str(event.get_sender_id())
         member = str(user_id or sender)
         check = getattr(event, "is_admin", None)
@@ -1173,8 +1403,20 @@ class DynamicsLearning(Star):
         if (member != sender or mode == "ranking") and not admin:
             return encode({"available": False, "reason": "查询其他成员或排名需要管理员权限"})
         scope = await self._character_for_event(event)
+        fallback_persona = ""
         if not scope:
-            return encode({"available": False, "reason": "当前角色未就绪"})
+            if ":GroupMessage:" in umo and self.engine.allowed(umo):
+                known_persona = self.engine.current_personas.get(umo)
+                if known_persona:
+                    fallback_persona = known_persona
+                    scope = {
+                        "platform": umo.rsplit(":", 2)[0],
+                        "umo": umo,
+                        "persona_id": known_persona,
+                        "instance_id": "",
+                    }
+            if not scope:
+                return encode({"available": False, "reason": "当前角色未就绪"})
         if ":GroupMessage:" not in scope["umo"]:
             rows = private_projection(self.engine, scope, member)
             if group_id:
@@ -1186,17 +1428,21 @@ class DynamicsLearning(Star):
             return encode({"available": bool(rows), "sources": rows})
         if group_id and group_id != scope["umo"].rsplit(":", 1)[-1]:
             return encode({"available": False, "reason": "不能跨群查询"})
-        persona = current_persona(self.engine, scope)
+        persona = fallback_persona or current_persona(self.engine, scope)
         if not persona:
             return encode({"available": False})
         if mode == "user":
+            if self._is_privacy_muted(scope["umo"], member):
+                return encode({"available": False, "reason": "该成员已启用隐私静音"})
             return encode(self.engine.social.query(scope["umo"], member, "affection"))
         if mode != "ranking":
             return encode({"available": False, "reason": "未知查询模式"})
         entries = [
             e
             for e in self.engine.cache
-            if (e["scope"], e["persona"], e["category"]) == (scope["umo"], persona, "affection") and e["active"]
+            if (e["scope"], e["persona"], e["category"]) == (scope["umo"], persona, "affection")
+            and e["active"]
+            and not self._is_privacy_muted(scope["umo"], str(e.get("member") or ""))
         ]
         entries.sort(key=lambda e: e["value"]["affection_level"], reverse=True)
         return encode(
@@ -1231,9 +1477,11 @@ class DynamicsLearning(Star):
     async def observe_group_message(self, event: AstrMessageEvent):
         if self.closed or not self.engine or not self.engine.social:
             return
-        if is_series_group_excluded(
-            self.context, umo=str(getattr(event, "unified_msg_origin", "") or "")
-        ):
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        if is_series_group_excluded(self.context, umo=umo):
+            return
+        sender_id = str(event.get_sender_id() or "").strip() if callable(getattr(event, "get_sender_id", None)) else ""
+        if sender_id and self._is_privacy_muted(umo, sender_id):
             return
         try:
             self.engine.capture_message(native_message(event))

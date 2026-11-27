@@ -8,21 +8,21 @@
     "description": "生效会话",
     "type": "list",
     "default": [],
-    "hint": "填写完整 UMO（含平台实例和群聊/私聊类型）。空列表不采集、不注入。"
+    "hint": "填写完整 UMO（含平台实例和群聊/私聊类型）。留空时自动继承群间核心（Chat Dynamics）的接管群列表；填写后作为显式白名单覆盖继承。若未安装群间核心且留空，则不采集、不注入。"
   },
   "analysis_provider": {
     "description": "分析模型",
     "type": "string",
     "default": "",
     "_special": "select_provider",
-    "hint": "普通聊天模型，用于生成调整提案；不选择 Jev 抉择模型。"
+    "hint": "普通聊天模型，用于生成调整提案；不选择 Jev 抉择模型。留空时自动回退继承群间核心共享模型（优先轻量分析模型，其次回复模型），未安装群间核心时回退宿主默认聊天模型。"
   },
   "review_provider": {
     "description": "审查模型",
     "type": "string",
     "default": "",
     "_special": "select_provider",
-    "hint": "用于独立审查提案。可与分析模型不同；未配置时等待，不自动批准。"
+    "hint": "用于独立审查提案，可与分析模型不同。留空时自动回退继承群间核心共享模型（优先轻量分析模型，其次非 Jev 决策模型或回复模型），未安装群间核心时回退宿主默认聊天模型；仅当全部回退均不可用时等待，不自动批准。"
   },
   "automatic_review_batch_enabled": {
     "description": "合并兼容提案的自动初审",
@@ -319,7 +319,7 @@
     "description": "私聊可读取的群资料来源",
     "type": "list",
     "default": [],
-    "hint": "完整群UMO。仅同平台、同角色、当前私聊成员本人的已批准资料和好感度；只读、不合并数值，不从私聊写入群资料。"
+    "hint": "完整群 UMO（支持列表或逗号分隔文本）。留空时自动继承群间核心的私聊共享群来源；仅同平台、同角色、当前私聊成员本人的已批准资料和好感度，只读、不合并数值，不从私聊写入群资料。"
   },
   "scene_learning_enabled": {
     "description": "群内接话场景学习（试验）",

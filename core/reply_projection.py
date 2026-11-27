@@ -191,9 +191,16 @@ def private_material(engine, scope, persona, member, character_scope, query=''):
     if (engine.closed or not engine.config.get('enabled',True) or len(parts)!=3 or parts[1] not in {'FriendMessage','PrivateMessage'} or
         identity.get('umo')!=scope or identity.get('platform')!=parts[0] or not identity.get('persona_id') or not identity.get('instance_id')):
         return result
-    for source in dict.fromkeys(engine.config.get('private_shared_group_sources',[])):
+    sources = (
+        engine.effective_private_shared_group_sources()
+        if hasattr(engine, 'effective_private_shared_group_sources')
+        else list(dict.fromkeys(engine.config.get('private_shared_group_sources', [])))
+    )
+    for source in sources:
         source_parts=source.rsplit(':',2)
         if len(source_parts)!=3 or source_parts[:2]!=[parts[0],'GroupMessage'] or not engine.allowed(source):
+            continue
+        if hasattr(engine, 'is_privacy_muted') and engine.is_privacy_muted(source, member):
             continue
         source_persona=engine.current_personas.get(source)
         origin=engine.character_scopes.get((source,source_persona),{})

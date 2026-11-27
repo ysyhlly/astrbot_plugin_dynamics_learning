@@ -120,6 +120,8 @@ class Social:
         scope = event.get('scope')
         if not self.engine.allowed(scope) or not self.engine.config.get('group_relations_enabled', True):
             return False
+        if hasattr(self.engine, 'is_privacy_muted') and self.engine.is_privacy_muted(scope, event.get('member', '')):
+            return False
         try:
             self.queue.put_nowait((self.engine.scope_token(scope), deepcopy(event)))
             return True
@@ -234,8 +236,9 @@ class Social:
     def context_bundle(self, scope, persona, member, query=''):
         if not self.engine.allowed(scope):
             return '', [], None
+        muted = bool(hasattr(self.engine, 'is_privacy_muted') and self.engine.is_privacy_muted(scope, member))
         data, versions = {'query_tool':'query_group_social'}, []
-        affection = self.current_affection(scope, persona, member)
+        affection = None if muted else self.current_affection(scope, persona, member)
         if affection:
             raw_val = affection['value']
             value = raw_val if isinstance(raw_val, dict) and 'affection_level' in raw_val else affection_state(raw_val)
@@ -250,22 +253,47 @@ class Social:
             graph = self.groups[scope]
             users = graph.get('users', {})
             by_member = graph.get('relations_by_member')
-            relevant = (
-                by_member.get(member, [])
-                if isinstance(by_member, dict)
-                else [r for r in graph.get('all_relations', []) if member in (r['a'], r['b'])]
-            )
-            pairs = relevant[:5]
+            if muted:
+                pairs = []
+                freq_users = [
+                    {'id': uid, 'name': u.get('name', uid), 'active_days': u.get('active_days', 0)}
+                    for uid, u in graph.get('active_users', [])
+                    if uid != member
+                ][:5]
+                rep_edges = [
+                    self.edge(r)
+                    for r in graph.get('all_relations', [])
+                    if member not in (r.get('a'), r.get('b'))
+                ][:3]
+                circles = [
+                    [{'id': uid, 'name': users.get(uid, {}).get('name', uid)} for uid in circle if uid != member][:5]
+                    for circle in graph.get('interaction_circles', [])[:3]
+                ]
+                circles = [c for c in circles if c]
+            else:
+                relevant = (
+                    by_member.get(member, [])
+                    if isinstance(by_member, dict)
+                    else [r for r in graph.get('all_relations', []) if member in (r['a'], r['b'])]
+                )
+                pairs = relevant[:5]
+                freq_users = [
+                    {'id': uid, 'name': u.get('name', uid), 'active_days': u.get('active_days', 0)}
+                    for uid, u in graph.get('active_users', [])[:5]
+                ]
+                rep_edges = [self.edge(r) for r in graph.get('all_relations', [])[:3]]
+                circles = [
+                    [{'id': uid, 'name': users.get(uid, {}).get('name', uid)} for uid in circle[:5]]
+                    for circle in graph.get('interaction_circles', [])[:3]
+                ]
             data['observed_group'] = {
                 'window_days': self.settings['window_days'], 'observed_members': len(users), 'recent_active': graph.get('active_member_count', 0),
                 'breadth': round(graph.get('breadth', 0), 1), 'balance': round(graph.get('balance', 0), 1),
                 'reciprocity': round(graph.get('reciprocity', 0), 1),
-                'frequent_participants': [{'id': uid, 'name': u.get('name', uid), 'active_days': u.get('active_days', 0)}
-                                        for uid, u in graph.get('active_users', [])[:5]],
+                'frequent_participants': freq_users,
                 'current_member_edges': [self.edge(r) for r in pairs],
-                'representative_edges': [self.edge(r) for r in graph.get('all_relations', [])[:3]],
-                'interaction_circles': [[{'id':uid,'name':users.get(uid,{}).get('name',uid)} for uid in circle[:5]]
-                                       for circle in graph.get('interaction_circles',[])[:3]],
+                'representative_edges': rep_edges,
+                'interaction_circles': circles,
                 'note': '这是已观察群聊的互动分布，不代表完整群成员名单、现实身份或确定的私人关系。未发言者未知。'}
             versions.append(self.snapshot_version(scope))
         payload = encode(data) if data else ''

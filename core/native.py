@@ -32,9 +32,20 @@ def role_provider(context, role, legacy_name=''):
     return found[0] if len(found) == 1 else None
 
 
+def legacy_selflearning_active(context) -> bool:
+    return any(name == 'astrbot_plugin_self_learning' for name, _ in instances(context))
+
+
+def affection_query_allowed(plugin) -> bool:
+    return bool(
+        plugin.config.get('enabled', True)
+        and not plugin.closed
+        and not legacy_selflearning_active(plugin.context)
+    )
+
+
 def replacement_allowed(plugin):
-    return bool(plugin.config.get('replace_selflearning', False) and plugin.config.get('enabled', True) and
-                not plugin.closed and not any(name == 'astrbot_plugin_self_learning' for name, _ in instances(plugin.context)))
+    return bool(plugin.config.get('replace_selflearning', False) and affection_query_allowed(plugin))
 
 
 class NativeStore:
@@ -117,9 +128,16 @@ def private_projection(engine, scope, member):
     if len(parts) != 3 or parts[1] not in {'FriendMessage','PrivateMessage'} or parts[0] != scope.get('platform') or not scope.get('persona_id'):
         return []
     items = []
-    for source in dict.fromkeys(engine.config.get('private_shared_group_sources', [])):
+    sources = (
+        engine.effective_private_shared_group_sources()
+        if hasattr(engine, 'effective_private_shared_group_sources')
+        else list(dict.fromkeys(engine.config.get('private_shared_group_sources', [])))
+    )
+    for source in sources:
         source_parts = source.rsplit(':',2)
         if len(source_parts) != 3 or source_parts[0] != parts[0] or source_parts[1] != 'GroupMessage' or not engine.allowed(source):
+            continue
+        if hasattr(engine, 'is_privacy_muted') and engine.is_privacy_muted(source, member):
             continue
         persona = engine.current_personas.get(source)
         origin = engine.character_scopes.get((source,persona), {})
@@ -149,6 +167,8 @@ def group_projection(engine, scope, participants):
         return []
     items=[]
     for member in dict.fromkeys(str(m) for m in participants[:8]):
+        if hasattr(engine, 'is_privacy_muted') and engine.is_privacy_muted(scope['umo'], member):
+            continue
         entry = engine.social.current_affection(scope['umo'],persona,member)
         if not entry:
             continue

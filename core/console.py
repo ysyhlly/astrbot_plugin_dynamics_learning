@@ -110,6 +110,22 @@ class Console:
         result["evidence_count"] = len(p.get("evidence", []))
         result["evidence"] = []
         result["details_lazy"] = True
+        risks: list[str] = []
+        seen_risks: set[str] = set()
+        for raw_risk in p.get("risks") or ():
+            clean = str(raw_risk or "").strip()
+            if clean and clean not in seen_risks:
+                seen_risks.add(clean)
+                risks.append(clean)
+        for rev in reversed(p.get("reviews") or ()):
+            if not isinstance(rev, dict):
+                continue
+            for raw_risk in rev.get("risks") or ():
+                clean = str(raw_risk or "").strip()
+                if clean and clean not in seen_risks:
+                    seen_risks.add(clean)
+                    risks.append(clean)
+        result["risks"] = risks
         for key in ("applied_by", "rolled_back_by", "auto_guard_reason"):
             if key in p:
                 result[key] = p[key]
