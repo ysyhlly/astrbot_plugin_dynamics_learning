@@ -1097,6 +1097,106 @@ class Store:
             ).fetchone()
             return int(row[0]) if row else 0
 
+    def count_event_bus_proposals_today(self, scope: str) -> int:
+        cutoff = time.time() - 86400
+        with self.lock:
+            row = self.db.execute(
+                "SELECT count(*) FROM proposals WHERE scope=? AND created>=? "
+                "AND json_extract(body,'$.source_kind') LIKE 'event_bus:%'",
+                (str(scope), cutoff),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def jargon_heat_metrics(self, scope: str, entries: list[dict], *, window_days: int = 14) -> dict[str, dict]:
+        """Compute read-only heat score, recent usage count, and first-seen timestamp per jargon entry."""
+        if not entries:
+            return {}
+        now = time.time()
+        cutoff = now - max(1, int(window_days)) * 86400
+        entry_ids = [str(e.get("id") or "") for e in entries if e.get("id")]
+        metrics: dict[str, dict] = {}
+        try:
+            with self.readonly_connection() as db:
+                # 1. Earliest proposal created timestamp & proposal ids per entry_id
+                first_seen_map: dict[str, float] = {}
+                proposal_ids_by_entry: dict[str, list[str]] = {}
+                if entry_ids:
+                    placeholders = ",".join("?" for _ in entry_ids)
+                    for row in db.execute(
+                        f"SELECT id, json_extract(body,'$.entry_id') AS eid, created FROM proposals "
+                        f"WHERE json_extract(body,'$.entry_id') IN ({placeholders})",
+                        entry_ids,
+                    ).fetchall():
+                        eid = str(row["eid"] or "")
+                        ts = float(row["created"] or 0.0)
+                        if eid:
+                            proposal_ids_by_entry.setdefault(eid, []).append(str(row["id"] or ""))
+                            if ts > 0 and (eid not in first_seen_map or ts < first_seen_map[eid]):
+                                first_seen_map[eid] = ts
+
+                # 2. Recent reply_usage hits per proposal_id
+                all_pids = [pid for pids in proposal_ids_by_entry.values() for pid in pids if pid]
+                usage_hits_by_pid: dict[str, int] = {}
+                for offset in range(0, len(all_pids), 300):
+                    batch = all_pids[offset : offset + 300]
+                    ph = ",".join("?" for _ in batch)
+                    for row in db.execute(
+                        f"SELECT r.source_id, count(*) AS cnt FROM reply_usage_refs r "
+                        f"JOIN reply_usage u ON u.id=r.receipt "
+                        f"WHERE u.scope=? AND u.created>=? AND r.source_id IN ({ph}) GROUP BY r.source_id",
+                        (scope, cutoff, *batch),
+                    ).fetchall():
+                        usage_hits_by_pid[str(row["source_id"])] = int(row["cnt"] or 0)
+
+                # 3. Recent observed messages & profile_messages mentioning each jargon term
+                recent_texts: list[str] = []
+                for row in db.execute(
+                    "SELECT json_extract(body,'$.text') AS txt FROM events "
+                    "WHERE scope=? AND created>=? ORDER BY created DESC LIMIT 400",
+                    (scope, cutoff),
+                ).fetchall():
+                    if row["txt"]:
+                        recent_texts.append(str(row["txt"]))
+                for row in db.execute(
+                    "SELECT json_extract(body,'$.text') AS txt FROM profile_messages "
+                    "WHERE scope=? AND created>=? ORDER BY created DESC LIMIT 400",
+                    (scope, cutoff),
+                ).fetchall():
+                    if row["txt"]:
+                        recent_texts.append(str(row["txt"]))
+
+                from .contract import jargon_matches
+
+                for e in entries:
+                    eid = str(e.get("id") or "")
+                    term = str(e.get("key") or "")
+                    pids = proposal_ids_by_entry.get(eid, [])
+                    reply_hits = sum(usage_hits_by_pid.get(pid, 0) for pid in pids)
+                    msg_hits = sum(1 for txt in recent_texts if jargon_matches(term, txt))
+                    recent_use = reply_hits + msg_hits
+                    first_seen = first_seen_map.get(eid) or float(e.get("state_updated_at") or now)
+                    updated_at = float(e.get("state_updated_at") or first_seen)
+                    age_days = max(0.0, (now - updated_at) / 86400.0)
+                    freshness = max(0.0, 15.0 * (1.0 - min(age_days, 30.0) / 30.0))
+                    rev_bonus = min(15.0, max(0, int(e.get("revision") or 1) - 1) * 5.0)
+                    use_score = min(70.0, recent_use * 7.0)
+                    heat = round(min(100.0, use_score + rev_bonus + freshness), 1)
+                    metrics[eid] = {
+                        "heat_score": heat,
+                        "recent_use_count": int(recent_use),
+                        "first_seen_at": float(first_seen),
+                    }
+        except Exception:
+            for e in entries:
+                eid = str(e.get("id") or "")
+                first_seen = float(e.get("state_updated_at") or now)
+                metrics[eid] = {
+                    "heat_score": 0.0,
+                    "recent_use_count": 0,
+                    "first_seen_at": first_seen,
+                }
+        return metrics
+
     def recent_applied_proposals(self, allowed_scopes, limit: int = 10) -> list[dict]:
         scopes = list(allowed_scopes or ())
         if not scopes:

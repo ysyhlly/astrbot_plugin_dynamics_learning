@@ -373,6 +373,9 @@ class Engine:
         self._turn_budget_usage = {}
         self._maintenance_active = False
         self._last_provider_tokens = None
+        self.scope_vibes = {}
+        self.active_games = {}
+        self.event_bus = None
         from .review_batches import ReviewBatches
 
         self.review_batches = ReviewBatches(self)
@@ -2789,6 +2792,8 @@ class Engine:
         while not self.closed:
             self.next_check_at = None
             try:
+                if self.event_bus is not None and not self.event_bus.status().get("connected"):
+                    self.event_bus.attach()
                 if self.cache_refresh_pending:
                     async with self.lock:
                         await self.refresh()
@@ -3274,6 +3279,15 @@ class Engine:
             "allowed_modes": {c: list(allowed_modes_for_category(c)) for c in sorted(CATEGORIES)},
             "presets": preset_catalog(),
             "active_preset": detect_active_preset(self.config),
+            "event_bus": self.event_bus.status()
+            if self.event_bus is not None
+            else {
+                "connected": False,
+                "subscribed_events": [],
+                "received_counts": {},
+                "proposals_created": 0,
+                "recent_count": 0,
+            },
         }
 
     def horizons_social_hints(self, scope: str, member_id: str = "") -> dict:
@@ -3388,16 +3402,23 @@ class Engine:
         topic: str,
         summary: str,
         sentiment: str = "positive",
+        *,
+        participants: list[str] | tuple[str, ...] | None = None,
+        activity_kind: str = "",
+        experience_delta: float | int | str | None = None,
     ) -> dict:
-        """Record an interest/affection clue coming from a shared Dynamics Horizons discussion.
+        """Record an interest/affection clue coming from a shared Horizons or co-reading discussion.
 
-        Also converts qualified clues into structured preference/affection review candidates
-        entering the standard Learning review queue under PERSONALITY_POLICY.
+        Supports both single-member reflections and multi-member co-reading completion/discussion
+        affection increments, strictly routed through privacy mute, auto_guard, PERSONALITY_POLICY,
+        and the existing Learning review queue.
         """
         clean_scope = str(scope or "").strip()[:512]
         clean_member = str(member_id or "").strip()[:128]
         clean_topic = " ".join(str(topic or "").split())[:80]
         clean_summary = " ".join(str(summary or "").split())[:400]
+        clean_kind = str(activity_kind or "").strip().lower()[:32]
+        is_co_reading = clean_kind in {"reading", "co_reading", "book_club", "共读"}
         raw_sentiment = str(sentiment or "positive").strip().lower()
         sentiment_map = {
             "positive": "positive",
@@ -3417,98 +3438,186 @@ class Engine:
             return {"ok": False, "accepted": False, "reason": "invalid_sentiment"}
         if not self.allowed(clean_scope):
             return {"ok": False, "accepted": False, "reason": "scope_not_enabled"}
-        if clean_member and self.is_privacy_muted(clean_scope, clean_member):
-            return {"ok": False, "accepted": False, "reason": "privacy_muted"}
+
+        # Assemble deduplicated participant list (primary member_id + optional co-reading participants)
+        raw_members: list[str] = []
+        if clean_member:
+            raw_members.append(clean_member)
+        if isinstance(participants, (list, tuple, set)):
+            for item in participants:
+                mid = str(item or "").strip()[:128]
+                if mid and mid not in raw_members:
+                    raw_members.append(mid)
+                if len(raw_members) >= 12:
+                    break
+
+        skipped_muted: list[str] = []
+        eligible_members: list[str] = []
+        for mid in raw_members:
+            if self.is_privacy_muted(clean_scope, mid):
+                skipped_muted.append(mid)
+            else:
+                eligible_members.append(mid)
+
+        if raw_members and not eligible_members:
+            return {
+                "ok": False,
+                "accepted": False,
+                "reason": "privacy_muted",
+                "skipped_muted": skipped_muted,
+            }
+
         persona = self.current_personas.get(clean_scope) or self.shared_persona_id() or ""
+        primary_member = eligible_members[0] if eligible_members else ""
         record = self.store.record_horizons_reflection(
             scope=clean_scope,
             persona=persona,
-            member=clean_member,
+            member=primary_member,
             topic=clean_topic,
             summary=clean_summary,
             sentiment=clean_sentiment,
         )
 
-        proposal_ids: list[str] = []
-        if clean_member and persona and clean_sentiment in {"positive", "negative"}:
-            char_scope = self.character_scopes.get((clean_scope, persona)) or {}
-            quote = clean_summary or f"共同讨论了「{clean_topic}」"
-            ev_id = record["id"]
-            evidence_event = {
-                "id": ev_id,
-                "scope": clean_scope,
-                "persona": persona,
-                "member": clean_member,
-                "message_id": ev_id,
-                "turn_id": ev_id,
-                "kind": "horizons_reflection",
-                "baseline": "horizons_reflection",
-                "host_version": "horizons_reflection",
-                "baseline_threshold": 0,
-                "text": quote,
-                "timestamp": record["created"],
-                "context": {
-                    "source_verified": True,
-                    "character_scope": dict(char_scope) if isinstance(char_scope, dict) else {},
-                },
-            }
-            # 1) Structured preference candidate entering review queue (never bypasses review)
+        # Compute clamped experience delta for affection candidate proposals
+        default_delta = Decimal("3") if is_co_reading else Decimal("2")
+        if experience_delta is not None and not isinstance(experience_delta, bool):
             try:
-                stance = "like" if clean_sentiment == "positive" else "dislike"
-                pref_raw = {
-                    "category": "preference",
-                    "key": clean_topic,
-                    "member": clean_member,
-                    "value": {
-                        "topic": clean_topic,
-                        "stance": stance,
-                        "condition": "见闻讨论",
-                        "quote": quote,
-                        "source_id": ev_id,
-                    },
-                    "reason": f"来自群间见闻共聊后记的兴趣线索（{clean_sentiment}），需核对并严守固定性格红线。",
-                    "days": 30,
-                    "evidence_ids": [ev_id],
-                }
-                pref_data = candidate(pref_raw, [evidence_event], None)
-                if policy_allowed(pref_data):
-                    pref_data["source_kind"] = "horizons_reflection"
-                    pref_mode = "human" if self.mode("preference") == "human" else "llm_then_human"
-                    prop = self.store.propose(pref_data, pref_mode, "plugin:dynamics_horizons")
-                    proposal_ids.append(prop["id"])
+                parsed_delta = Decimal(str(experience_delta))
+                aff_delta = (
+                    max(Decimal("-20"), min(Decimal("20"), parsed_delta))
+                    if parsed_delta.is_finite()
+                    else default_delta
+                )
             except Exception:
-                pass
+                aff_delta = default_delta
+        else:
+            aff_delta = default_delta
 
-            # 2) Conservative affection clue candidate when positive & character identity verified
-            if clean_sentiment == "positive" and self.config.get("affection_enabled", True) and char_scope:
+        proposal_ids: list[str] = []
+        per_member_proposals: dict[str, list[str]] = {}
+        guard_reasons: dict[str, str] = {}
+        char_scope = self.character_scopes.get((clean_scope, persona)) or {}
+        quote = clean_summary or (
+            f"一起参与了「{clean_topic}」共读讨论" if is_co_reading else f"共同讨论了「{clean_topic}」"
+        )
+        condition_label = "共读陪伴" if is_co_reading else "见闻讨论"
+        source_kind = "co_reading_reflection" if is_co_reading else "horizons_reflection"
+
+        if eligible_members and persona and clean_sentiment in {"positive", "negative"}:
+            for idx, m in enumerate(eligible_members):
+                m_props: list[str] = []
+                ev_id = record["id"] if idx == 0 else f"{record['id']}:{m}"
+                evidence_event = {
+                    "id": ev_id,
+                    "scope": clean_scope,
+                    "persona": persona,
+                    "member": m,
+                    "message_id": ev_id,
+                    "turn_id": ev_id,
+                    "kind": source_kind,
+                    "baseline": source_kind,
+                    "host_version": source_kind,
+                    "baseline_threshold": 0,
+                    "text": quote,
+                    "timestamp": record["created"],
+                    "context": {
+                        "source_verified": True,
+                        "character_scope": dict(char_scope) if isinstance(char_scope, dict) else {},
+                    },
+                }
+
+                # 1) Structured preference candidate entering review queue
                 try:
-                    prev_aff = (
-                        self.social.current_affection(clean_scope, persona, clean_member)
-                        if self.social is not None
-                        else None
-                    )
-                    aff_raw = {
-                        "category": "affection",
-                        "key": "bot_affection",
-                        "member": clean_member,
-                        "value": {"experience_delta": "2", "tone": 0.25},
-                        "reason": f"群间见闻共聊主题「{clean_topic}」带来正向互动线索，待复审确认。",
+                    stance = "like" if clean_sentiment == "positive" else "dislike"
+                    pref_raw = {
+                        "category": "preference",
+                        "key": clean_topic,
+                        "member": m,
+                        "value": {
+                            "topic": clean_topic,
+                            "stance": stance,
+                            "condition": condition_label,
+                            "quote": quote,
+                            "source_id": ev_id,
+                        },
+                        "reason": f"来自{condition_label}后记的兴趣线索（{clean_sentiment}），需核对并严守固定性格红线。",
                         "days": 30,
                         "evidence_ids": [ev_id],
                     }
-                    aff_data = candidate(aff_raw, [evidence_event], prev_aff)
-                    if policy_allowed(aff_data):
-                        aff_data["source_kind"] = "horizons_reflection"
-                        aff_data["auto_guard_reason"] = "horizons_reflection"
-                        aff_mode = "human" if self.mode("affection") == "human" else "llm_then_human"
-                        aff_prop = self.store.propose(aff_data, aff_mode, "plugin:dynamics_horizons")
-                        proposal_ids.append(aff_prop["id"])
+                    pref_data = candidate(pref_raw, [evidence_event], None)
+                    if policy_allowed(pref_data):
+                        pref_data["source_kind"] = source_kind
+                        pref_mode = "human" if self.mode("preference") == "human" else "llm_then_human"
+                        prop = self.store.propose(pref_data, pref_mode, "plugin:dynamics_horizons")
+                        proposal_ids.append(prop["id"])
+                        m_props.append(prop["id"])
                 except Exception:
                     pass
+
+                # 2) Affection candidate routed through auto_guard & review queue
+                if clean_sentiment == "positive" and self.config.get("affection_enabled", True) and char_scope:
+                    try:
+                        prev_aff = (
+                            self.social.current_affection(clean_scope, persona, m)
+                            if self.social is not None
+                            else None
+                        )
+                        aff_raw = {
+                            "category": "affection",
+                            "key": "bot_affection",
+                            "member": m,
+                            "value": {"experience_delta": str(aff_delta), "tone": 0.3 if is_co_reading else 0.25},
+                            "reason": f"{condition_label}主题「{clean_topic}」带来正向互动线索，待护栏复审确认。",
+                            "days": 30,
+                            "evidence_ids": [ev_id],
+                        }
+                        aff_data = candidate(aff_raw, [evidence_event], prev_aff)
+                        if policy_allowed(aff_data):
+                            computed_guard = self.affection_guard_reason(aff_data)
+                            final_guard = computed_guard or source_kind
+                            aff_data["source_kind"] = source_kind
+                            aff_data["auto_guard_reason"] = final_guard
+                            guard_reasons[m] = final_guard
+                            aff_mode = "human" if self.mode("affection") == "human" else "llm_then_human"
+                            aff_prop = self.store.propose(aff_data, aff_mode, "plugin:dynamics_horizons")
+                            proposal_ids.append(aff_prop["id"])
+                            m_props.append(aff_prop["id"])
+                    except Exception:
+                        pass
+
+                # 3) Multi-member co-reading shared-interest relationship clue
+                if is_co_reading and len(eligible_members) >= 2 and clean_sentiment == "positive":
+                    try:
+                        peers = [p for p in eligible_members if p != m][:4]
+                        rel_raw = {
+                            "category": "relationship",
+                            "key": f"共读同好:{clean_topic[:24]}",
+                            "member": m,
+                            "value": f"与群友（{', '.join(peers)}）共同完成「{clean_topic}」共读讨论：{quote[:160]}",
+                            "reason": "跨周共读陪伴完结带来的多成员同好线索，进入现有审查流。",
+                            "days": 30,
+                            "evidence_ids": [ev_id],
+                        }
+                        rel_data = candidate(rel_raw, [evidence_event], None)
+                        if policy_allowed(rel_data):
+                            rel_data["source_kind"] = source_kind
+                            rel_mode = "human" if self.mode("relationship") == "human" else "llm_then_human"
+                            rel_prop = self.store.propose(rel_data, rel_mode, "plugin:dynamics_horizons")
+                            proposal_ids.append(rel_prop["id"])
+                            m_props.append(rel_prop["id"])
+                    except Exception:
+                        pass
+
+                if m_props:
+                    per_member_proposals[m] = m_props
 
         return {
             "ok": True,
             "accepted": True,
             **record,
+            "affected_members": eligible_members,
+            "skipped_muted": skipped_muted,
             "proposal_ids": proposal_ids,
+            "per_member_proposals": per_member_proposals,
+            "guard_reasons": guard_reasons,
         }

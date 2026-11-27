@@ -277,6 +277,7 @@ class DynamicsLearning(Star):
         self.projection_error = ""
         self.legacy_kv_v1 = {"present": False, "count": 0}
         self._scope_config_version = 0
+        self.event_bus = None
 
     async def _detect_legacy_kv_v1(self):
         """Read-only check for residual v1.4.1 learning_*_v1 shared KV keys; never migrates or applies them."""
@@ -410,6 +411,11 @@ class DynamicsLearning(Star):
         await self.engine.social.initialize()
         await self.engine.apply_pending_affection()
         await self.engine.apply_approved_profiles()
+        from .core.event_bus import DynamicsEventBridge
+
+        self.event_bus = DynamicsEventBridge(self.engine, self.context, owner_id=PLUGIN)
+        self.engine.event_bus = self.event_bus
+        self.event_bus.attach()
         self.tasks = [
             asyncio.create_task(self.engine.consume()),
             asyncio.create_task(self.engine.automatic_reviews.run()),
@@ -879,12 +885,23 @@ class DynamicsLearning(Star):
         topic: str,
         summary: str,
         sentiment: str = "positive",
+        *,
+        participants: list[str] | tuple[str, ...] | None = None,
+        activity_kind: str = "",
+        experience_delta: float | int | str | None = None,
     ) -> dict:
-        """Record an interest/affection clue coming from a shared Dynamics Horizons discussion."""
+        """Record an interest/affection clue coming from a shared Dynamics Horizons or co-reading discussion."""
         if self.closed or not self.ready or self.engine is None:
             return {"ok": False, "accepted": False, "reason": "plugin_not_ready"}
         return self.engine.ingest_horizons_reflection(
-            umo, member_id, topic, summary, sentiment=sentiment
+            umo,
+            member_id,
+            topic,
+            summary,
+            sentiment=sentiment,
+            participants=participants,
+            activity_kind=activity_kind,
+            experience_delta=experience_delta,
         )
 
     def series_search_items(self, query: str, scope: str = "", limit: int = 8, persona: str = "") -> list[dict]:
@@ -1185,7 +1202,7 @@ class DynamicsLearning(Star):
             return False
 
     def get_culture_jargon_v1(self, *, scope, query="", limit=10):
-        """Read reviewed, current-persona jargon as discovery clues, never origin evidence."""
+        """Read reviewed, current-persona jargon with heat metrics, recent use count & first-seen timestamp."""
         import time
 
         empty = {"schema_version": 1, "scope": scope, "terms": []}
@@ -1196,8 +1213,8 @@ class DynamicsLearning(Star):
         persona = self.engine.current_personas.get(scope)
         if not persona or not isinstance(query, str) or len(query) > 16000:
             return empty
-        terms = []
         now = time.time()
+        matched_entries = []
         for entry in self.engine._entries_for(scope, persona):
             if (
                 entry["category"] != "jargon"
@@ -1207,10 +1224,29 @@ class DynamicsLearning(Star):
                 continue
             if query and not jargon_matches(entry["key"], query):
                 continue
-            terms.append({"name": entry["key"], "meaning": entry["value"], "revision": entry["revision"]})
-            if len(terms) >= max(1, min(20, int(limit))):
-                break
-        return {"schema_version": 1, "scope": scope, "terms": terms, "evidence": False}
+            matched_entries.append(entry)
+        metrics = self.engine.store.jargon_heat_metrics(scope, matched_entries)
+        tz = resolve_series_timezone(self.context)
+        terms = []
+        for entry in matched_entries:
+            m = metrics.get(entry["id"], {})
+            first_seen_at = float(m.get("first_seen_at") or entry.get("state_updated_at") or now)
+            heat_score = float(m.get("heat_score", 0.0))
+            recent_use = int(m.get("recent_use_count", 0))
+            terms.append(
+                {
+                    "name": entry["key"],
+                    "meaning": entry["value"],
+                    "revision": entry["revision"],
+                    "heat_score": heat_score,
+                    "recent_use_count": recent_use,
+                    "first_seen_at": first_seen_at,
+                    "first_seen_iso": _iso_timestamp(first_seen_at, tz=tz),
+                }
+            )
+        terms.sort(key=lambda t: (-t["heat_score"], -t["recent_use_count"], t["name"]))
+        max_items = max(1, min(20, int(limit)))
+        return {"schema_version": 1, "scope": scope, "terms": terms[:max_items], "evidence": False}
 
     def get_learning_context(self, **scope):
         return self.engine.context(**scope) if self.ready and self.engine and not self.closed else {}
@@ -2233,6 +2269,11 @@ class DynamicsLearning(Star):
         panel = getattr(self, "_series_panels", None)
         if panel:
             panel.close()
+        if self.event_bus is not None:
+            try:
+                self.event_bus.detach()
+            except Exception:
+                pass
         self.ready = False
         self.closed = True
         if self.engine:
